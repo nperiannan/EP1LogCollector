@@ -46,6 +46,7 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **🔐 Password Encryption**: AES-256-GCM encryption for secure password storage in config files
 - **🔒 Masked Password Input**: Secure password entry with hidden characters during input
 - **🌐 Dynamic Namespace Detection**: Intelligent XIQ namespace detection for multi-environment deployments
+- **📝 Session Logging**: Automatic session log file (`logger_info.txt`) that mirrors all terminal output for audit and troubleshooting
 - **🎯 Simplified Operation Modes**: Easy-to-use `--all`, `--logs-only`, `--sys-info`, `--version` command modes
 - Connect to AWS instances via a bastion host using SSH key authentication
 - Find and list log files based on customizable patterns with template support
@@ -1046,7 +1047,8 @@ The tool can automatically collect comprehensive debugging information from **Te
 ```
 my_log_collection_20250710_120000.tar.gz
 ├── Temporal/                                          # Temporal workflow data
-│   ├── workflow_list.txt                              # Full workflow listing
+│   ├── workflow_list.txt                              # Tabular workflow listing (human-readable)
+│   ├── workflow_list.json                             # JSON workflow listing (machine-parseable)
 │   ├── deploy-profile-Test_profile-20260105-141248.txt  # Per-workflow details
 │   └── deploy-profile-Prod_profile-20260105-150000.txt
 ├── General/                                           # System information
@@ -1133,7 +1135,7 @@ logCollection:
 ### How It Works
 
 1. **Pod Discovery**: Finds the running `temporal-admintools-*` pod in the `common` namespace
-2. **Workflow Listing**: Runs `temporal workflow list --namespace configuration` inside the admin pod
+2. **Workflow Listing**: Runs `temporal workflow list --namespace configuration` inside the admin pod (saved as tabular `workflow_list.txt` and JSON `workflow_list.json`)
 3. **Filtering**: Applies prefix filter and limits to the configured number of workflows
 4. **Per-Workflow Collection**: For each workflow ID, collects:
    - **Workflow Input**: Decoded JSON payload from the start event
@@ -1605,6 +1607,28 @@ This ensures that even with unreliable connections, you can successfully downloa
   - Set `deleteAfterCopy: true` in config.yaml
   - Check download completed successfully (no errors in log)
   - Use `logLevel: DEBUG` to see cleanup operations
+
+### Session Log File (`logger_info.txt`)
+
+Every run of the tool creates a **`logger_info.txt`** file in the current working directory that mirrors all terminal output. This is useful for:
+
+- **Audit trail**: Review exactly what happened during a collection run
+- **Troubleshooting**: Share the log file with others to diagnose issues
+- **Automation**: Parse the log file programmatically for CI/CD pipelines
+
+The file is created fresh each run with a session header:
+
+```
+================================================================================
+  EP1 Log Collector - Session Log
+  Started: 2025-07-10 12:00:00
+  Log Level: INFO
+================================================================================
+
+[INFO] Starting log collection...
+[INFO] Connected to bastion host...
+...
+```
 
 ### Best Practices
 

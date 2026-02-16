@@ -446,8 +446,8 @@ type Config struct {
 		TemporalWorkflowCollection struct {
 			Enabled           bool   `yaml:"enabled"`           // Enable temporal workflow data collection
 			WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`  // Filter by workflow ID prefix
-			NumberOfWorkflows int    `yaml:"numberOfWorkflows"`  // Number of workflows to collect (1-20)
-			Namespace         string `yaml:"namespace"`          // Temporal namespace (default: configuration)
+			NumberOfWorkflows int    `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
+			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
 		} `yaml:"temporalWorkflowCollection"`
 	} `yaml:"logCollection"`
 	// General system information collection
@@ -2556,10 +2556,12 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		return fmt.Errorf("failed to create session for pod discovery: %v", err)
 	}
 
-	podCmd := "kubectl get pods -n common --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print $1}'"
-	podOutput, err := podSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", podCmd))
+	podCmd := "kubectl get pods -n common --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print \\$1}'"
+	podOutput, err := podSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", podCmd))
 	podSession.Close()
 	if err != nil {
+		// Log the output for debugging, then return error
+		logger.Debug("Pod discovery command output: %s", strings.TrimSpace(string(podOutput)))
 		return fmt.Errorf("failed to discover temporal admin pod: %v", err)
 	}
 
@@ -2578,7 +2580,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 
 	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s --output json 2>/dev/null",
 		adminPod, temporalNamespace)
-	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", listCmd))
+	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
 	listSession.Close()
 	if err != nil {
 		// Try without --output json (plain text listing)
@@ -2589,7 +2591,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		}
 		listCmd2 := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s 2>/dev/null",
 			adminPod, temporalNamespace)
-		listOutput, err = listSession2.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", listCmd2))
+		listOutput, err = listSession2.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd2))
 		listSession2.Close()
 		if err != nil {
 			return fmt.Errorf("failed to list temporal workflows: %v\nOutput: %s", err, string(listOutput))
@@ -2734,7 +2736,12 @@ func executeTemporalCommand(awsClient *ssh.Client, command string) string {
 	}
 	defer session.Close()
 
-	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", command))
+	// Use heredoc with single-quoted delimiter to avoid ALL quoting issues.
+	// Commands contain nested single quotes (bash -c '...') and double quotes (jq expressions),
+	// so neither sudo su - -c '...' nor "..." wrapping works safely.
+	// <<'TEMPORAL_EOF' passes the command verbatim with zero shell expansion.
+	heredocCmd := fmt.Sprintf("sudo bash <<'TEMPORAL_EOF'\n%s\nTEMPORAL_EOF", command)
+	output, err := session.CombinedOutput(heredocCmd)
 	if err != nil {
 		// Still return output - it may contain useful partial data or error messages
 		if len(output) > 0 {

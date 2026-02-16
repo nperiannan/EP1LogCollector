@@ -73,11 +73,31 @@ func ParseLogLevel(level string) LogLevel {
 // Logger provides structured logging with timestamps
 type Logger struct {
 	minLevel LogLevel
+	logFile  *os.File
 }
 
 // NewLogger creates a new logger instance with the specified minimum log level
 func NewLogger(minLevel LogLevel) *Logger {
-	return &Logger{minLevel: minLevel}
+	l := &Logger{minLevel: minLevel}
+	// Create log file for capturing all output
+	f, err := os.OpenFile("logger_info.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		fmt.Printf("Warning: Could not create logger_info.txt: %v\n", err)
+	} else {
+		l.logFile = f
+		// Write header
+		header := fmt.Sprintf("# Fetchlogs Session Log\n# Started: %s\n# Log Level: %s\n%s\n\n",
+			time.Now().Format("2006-01-02 15:04:05"), minLevel.String(), strings.Repeat("-", 60))
+		f.WriteString(header)
+	}
+	return l
+}
+
+// Close closes the log file
+func (l *Logger) Close() {
+	if l.logFile != nil {
+		l.logFile.Close()
+	}
 }
 
 // Log prints a message with the specified log level
@@ -89,7 +109,12 @@ func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	message := fmt.Sprintf(format, args...)
-	fmt.Printf("[%s] [%s] %s\n", timestamp, level.String(), message)
+	line := fmt.Sprintf("[%s] [%s] %s\n", timestamp, level.String(), message)
+	fmt.Print(line)
+	// Also write to log file
+	if l.logFile != nil {
+		l.logFile.WriteString(line)
+	}
 }
 
 // Debug prints debug messages (only when debug mode is enabled)
@@ -3361,6 +3386,7 @@ func main() {
 	// Initialize the global logger with the log level setting
 	logLevelEnum := ParseLogLevel(*logLevel)
 	logger = NewLogger(logLevelEnum)
+	defer logger.Close()
 
 	// Log the selected operation mode
 	logger.Debug("Selected operation mode: %s", selectedMode)

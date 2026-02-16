@@ -1,0 +1,51 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output directories
+C:/Logs/
+Logs/
+
+# Backup directories
+backup/
+*.backup.*
+
+# Temporary files
+*.tmp
+*.temp
+*.part
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Go specific
+vendor/
+*.sum
+
+# Application specific
+*.tar.gz
+*.gz
+*_logs/
+*_templogs/
+
+# Sensitive files (keep template configs only)
+# Uncomment if you want to exclude config with credentials
+# config.yaml

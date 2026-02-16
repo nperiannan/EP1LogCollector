@@ -1,0 +1,105 @@
+# Global Configuration
+username: nperiannan
+environment: dl2r1
+
+# Bastion Server Configuration
+bastion:
+  host: usnc-awsgtwy-02.extremenetworks.com
+  port: 22
+  password: "ENC:uMIIy0Brlcem0uWMV7a0f7gVMZDrTVb8NtyFeaQsZHj6UZZn2z/e8RxZi38r"
+  # keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
+
+# AWS Server Configuration
+aws:
+  host: "{environment}-console.qa.xcloudiq.com"
+  keyPath: ~/.ssh/id_ed25519_26Q1
+
+# Log File Configuration
+logs:
+  pattern: /home/{username}/*.gz
+  outputDir: C:\Logs
+
+# General Options
+options:
+  autoRetry: true
+  numChunks: 8                      # Number of parallel download connections (1-10, default: 8)
+  logLevel: INFO
+  maxSSHSessions: 2                # Maximum concurrent SSH sessions per source (1-4, default: 1)
+  downloadMethod: "scp"             # Download method: "scp" (native SCP, 10x faster) or "sftp" (parallel SFTP). Default: scp
+
+# Kubernetes Log Collection Settings
+logCollection:
+  enabled: false                     # Enable/disable log collection
+  logFileName: app_log
+  tempDir: "{environment}_{username}_templogs"
+  useTimestamp: true
+  deleteAfterCopy: true
+  autoDeleteTempDir: true            # Auto-delete existing tempDir without prompting (false = prompt user)
+  timestampFormat: "20060102_150405"
+  customSources: []
+  # Time-based log collection (collect logs from last X time)
+  timeBasedCollection:
+    enabled: true                   # Enable time-based collection (false = collect full logs)
+    duration: ""                 # Duration like "15m", "30m", "1h", "2h" (leave empty for full logs)
+  # Log analysis and error detection
+  logAnalysis:
+    enabled: true                   # Enable automatic log analysis for errors/issues
+    outputFile: "log_analysis_summary.txt"  # Output file name for analysis results
+    errorPatterns:                  # Patterns to search for in collected logs (case-insensitive)
+      - "error"
+      - "panic"
+      - "failure"
+      - "failed"
+      - "exception"
+      - "fatal"
+      - "critical"
+      - "timeout"
+      - "connection refused"
+      - "unable to"
+      - "cannot"
+      - "permission denied"
+    maxMatches: 20                  # Maximum matches per log file to include in summary
+    contextLines: 2                 # Number of lines before/after each match to include
+
+# General System Information Collection
+generalInfo:
+  enabled: false
+  outputDir: "General"
+  commands:
+    - name: "nodes_detailed"
+      command: "kubectl get nodes -o wide"
+      description: "Get nodes with detailed information"
+    - name: "pods_current_namespace"
+      command: "kubectl get pods -n {environment} -o wide"
+      description: "Get pods in current environment namespace"
+    - name: "node_memory_cpu_info"
+      command: "kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.capacity.cpu,MEMORY:.status.capacity.memory"
+      description: "CPU and memory information of each node"
+    - name: "pods_all_namespaces"
+      command: "kubectl get pods --all-namespaces -o wide"
+      description: "Get pods in all namespaces"
+    - name: "nodes_cpu_usage"
+      command: "kubectl top node --sort-by=cpu"
+      description: "Get nodes with high CPU usage"
+    - name: "node_memory_usage"
+      command: "kubectl top node --sort-by=memory"
+      description: "Get nodes with high memory usage"
+    - name: "pods_cpu_memory_usage"
+      command: "kubectl top pod --all-namespaces --containers"
+      description: "Get pods with top cpu"
+
+# App Version Collection Settings
+appVersionCollection:
+  enabled: true                     # Enable/disable app version collection
+  outputFileName: "{environment}_app_versions_{timestamp}.txt"  # Output file name for version information
+  printToLog: true                  # Print version information to console/log output
+  namespaces:                       # Namespaces and pod prefixes to check for versions
+    - namespace: "common"
+      description: "Common services namespace"
+      podPrefixes: ["cas-api-service", "cls-api-service", "cns-api-service", "cs-configstate", "cs-configuration", "cs-metaflow-cacheupdater", "cs-tagging", "common-kafka", "temporal", "device-connector"]
+    - namespace: "{environment}"     # Dynamic: uses 'xiq' if the namespace exists, otherwise environment name (e.g., dl2r1)
+      description: "Environment-specific services (XIQ namespace)"
+      podPrefixes: ["hmweb", "teconfig", "copilot-flink", "default-kafka"]
+    - namespace: "nvo"
+      description: "NVO services namespace"
+      podPrefixes: ["nvo-edge", "nvo-network"]

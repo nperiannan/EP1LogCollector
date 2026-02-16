@@ -1,0 +1,3658 @@
+package main
+
+import (
+	"bufio"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
+)
+
+// LogLevel represents different logging levels
+type LogLevel int
+
+const (
+	DEBUG LogLevel = iota
+	INFO
+	WARN
+	ERROR
+)
+
+// String returns the string representation of the log level
+func (l LogLevel) String() string {
+	switch l {
+	case DEBUG:
+		return "DEBUG"
+	case INFO:
+		return "INFO"
+	case WARN:
+		return "WARN"
+	case ERROR:
+		return "ERROR"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// ParseLogLevel converts a string to LogLevel
+func ParseLogLevel(level string) LogLevel {
+	switch strings.ToUpper(level) {
+	case "DEBUG":
+		return DEBUG
+	case "INFO":
+		return INFO
+	case "WARN", "WARNING":
+		return WARN
+	case "ERROR", "ERR":
+		return ERROR
+	default:
+		return INFO // Default to INFO level
+	}
+}
+
+// Logger provides structured logging with timestamps
+type Logger struct {
+	minLevel LogLevel
+}
+
+// NewLogger creates a new logger instance with the specified minimum log level
+func NewLogger(minLevel LogLevel) *Logger {
+	return &Logger{minLevel: minLevel}
+}
+
+// Log prints a message with the specified log level
+func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
+	// Only print if the message level is >= minimum level
+	if level < l.minLevel {
+		return
+	}
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	message := fmt.Sprintf(format, args...)
+	fmt.Printf("[%s] [%s] %s\n", timestamp, level.String(), message)
+}
+
+// Debug prints debug messages (only when debug mode is enabled)
+func (l *Logger) Debug(format string, args ...interface{}) {
+	l.Log(DEBUG, format, args...)
+}
+
+// Info prints info messages
+func (l *Logger) Info(format string, args ...interface{}) {
+	l.Log(INFO, format, args...)
+}
+
+// Warn prints warning messages
+func (l *Logger) Warn(format string, args ...interface{}) {
+	l.Log(WARN, format, args...)
+}
+
+// Error prints error messages
+func (l *Logger) Error(format string, args ...interface{}) {
+	l.Log(ERROR, format, args...)
+}
+
+// Global logger instance
+var logger *Logger
+
+// ChunkInfo tracks the status of a file chunk during parallel download
+type ChunkInfo struct {
+	Index       int    // Chunk index
+	StartOffset int64  // Start position in the file
+	EndOffset   int64  // End position in the file
+	TempFile    string // Path to temporary file for this chunk
+	Error       error  // Error if chunk download failed
+}
+
+// ConnectionParams holds parameters needed to create independent SSH connections
+type ConnectionParams struct {
+	BastionClient     *ssh.Client
+	AWSHost           string
+	KeyPath           string
+	PreferredUsername string
+}
+
+// SSHConnectionPool manages a pool of SSH connections to avoid session limits
+type SSHConnectionPool struct {
+	connections chan *ssh.Client
+	params      ConnectionParams
+	poolSize    int
+	mu          sync.Mutex
+	closed      bool
+}
+
+// NewSSHConnectionPool creates a new connection pool
+func NewSSHConnectionPool(params ConnectionParams, poolSize int) (*SSHConnectionPool, error) {
+	pool := &SSHConnectionPool{
+		connections: make(chan *ssh.Client, poolSize),
+		params:      params,
+		poolSize:    poolSize,
+	}
+
+	// Pre-populate the pool with connections
+	for i := 0; i < poolSize; i++ {
+		conn, err := sshConnectAWSViaBastionWithLogging(params.BastionClient, params.AWSHost, params.KeyPath, params.PreferredUsername, false)
+		if err != nil {
+			// Close any connections we already created
+			pool.Close()
+			return nil, fmt.Errorf("failed to create connection %d: %v", i, err)
+		}
+		pool.connections <- conn
+	}
+
+	return pool, nil
+}
+
+// Get retrieves a connection from the pool
+func (p *SSHConnectionPool) Get() (*ssh.Client, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("connection pool is closed")
+	}
+	p.mu.Unlock()
+
+	select {
+	case conn := <-p.connections:
+		// Test if connection is still alive
+		session, err := conn.NewSession()
+		if err != nil {
+			// Connection is dead, create a new one
+			logger.Debug("🔄 Recreating dead SSH connection in pool")
+			newConn, newErr := sshConnectAWSViaBastionWithLogging(p.params.BastionClient, p.params.AWSHost, p.params.KeyPath, p.params.PreferredUsername, false)
+			if newErr != nil {
+				return nil, fmt.Errorf("failed to recreate connection: %v", newErr)
+			}
+			return newConn, nil
+		}
+		session.Close()
+		return conn, nil
+	default:
+		// Pool is empty, create a temporary connection
+		logger.Debug("🔄 Creating temporary SSH connection (pool exhausted)")
+		return sshConnectAWSViaBastionWithLogging(p.params.BastionClient, p.params.AWSHost, p.params.KeyPath, p.params.PreferredUsername, false)
+	}
+}
+
+// Put returns a connection to the pool
+func (p *SSHConnectionPool) Put(conn *ssh.Client) {
+	if conn == nil {
+		return
+	}
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		conn.Close()
+		return
+	}
+	p.mu.Unlock()
+
+	select {
+	case p.connections <- conn:
+		// Successfully returned to pool
+	default:
+		// Pool is full, close the connection
+		conn.Close()
+	}
+}
+
+// Close closes all connections in the pool
+func (p *SSHConnectionPool) Close() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	p.mu.Unlock()
+
+	close(p.connections)
+	for conn := range p.connections {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+}
+
+// LogCollectionConfig holds configuration for Kubernetes log collection
+type LogCollectionConfig struct {
+	LogFileName string   `yaml:"logFileName"`
+	UserID      string   `yaml:"userID"`
+	Namespaces  []string `yaml:"namespaces"`
+}
+
+// PodLogSource defines a source for collecting logs from Kubernetes pods
+type PodLogSource struct {
+	Namespace  string `yaml:"namespace"`
+	PodPrefix  string `yaml:"podPrefix"`
+	LogPath    string `yaml:"logPath"`
+	OutputName string `yaml:"outputName"`
+}
+
+// Default log collection sources matching the shell script
+var defaultLogSources = []PodLogSource{
+	// NVO namespace logs
+	{Namespace: "nvo", PodPrefix: "nvo-edge", LogPath: "/data/log/nvo-edge", OutputName: "server.log"},
+	{Namespace: "nvo", PodPrefix: "nvo-network", LogPath: "/data/log/nvo-network", OutputName: "server.log"},
+	{Namespace: "nvo", PodPrefix: "nvo-system", LogPath: "/data/log/nvo-system", OutputName: "server.log"},
+	// Environment namespace logs
+	{Namespace: "{environment}", PodPrefix: "hacr", LogPath: "/opt/hacr/logs", OutputName: "hac.log"},
+	{Namespace: "{environment}", PodPrefix: "teconfig", LogPath: "/opt/tomcat/logs", OutputName: "hm.log"},
+	// Common namespace logs
+	{Namespace: "common", PodPrefix: "hacr", LogPath: "/opt/hacr/logs", OutputName: "hac.log"},
+}
+
+// GeneralInfoCommand represents a command to collect general system information
+type GeneralInfoCommand struct {
+	Name        string `yaml:"name"`
+	Command     string `yaml:"command"`
+	Description string `yaml:"description"`
+}
+
+// AppVersionNamespace represents a namespace configuration for app version collection
+type AppVersionNamespace struct {
+	Namespace   string   `yaml:"namespace"`
+	Description string   `yaml:"description"`
+	PodPrefixes []string `yaml:"podPrefixes"`
+}
+
+// Configuration structure for the application
+type Config struct {
+	Username    string `yaml:"username"`    // Global username for all connections
+	Environment string `yaml:"environment"` // Environment identifier (e.g., dl1r1, g2r1)
+	Bastion     struct {
+		Host     string `yaml:"host"`
+		Port     int    `yaml:"port"`
+		Password string `yaml:"password"`
+	} `yaml:"bastion"`
+	AWS struct {
+		Host    string `yaml:"host"`
+		KeyPath string `yaml:"keyPath"`
+	} `yaml:"aws"`
+	Logs struct {
+		Pattern   string `yaml:"pattern"`
+		OutputDir string `yaml:"outputDir"`
+	} `yaml:"logs"`
+	Options struct {
+		AutoRetry      bool   `yaml:"autoRetry"`
+		NumChunks      int    `yaml:"numChunks"`
+		LogLevel       string `yaml:"logLevel"`       // Changed from debugMode to logLevel
+		MaxSSHSessions int    `yaml:"maxSSHSessions"` // Maximum concurrent SSH sessions per source
+	} `yaml:"options"`
+	// New section for log collection
+	LogCollection struct {
+		Enabled             bool           `yaml:"enabled"`
+		LogFileName         string         `yaml:"logFileName"`
+		CustomSources       []PodLogSource `yaml:"customSources"`
+		TempDir             string         `yaml:"tempDir"`
+		UseTimestamp        bool           `yaml:"useTimestamp"`
+		DeleteAfterCopy     bool           `yaml:"deleteAfterCopy"`
+		TimestampFormat     string         `yaml:"timestampFormat"`
+		TimeBasedCollection struct {
+			Enabled  bool   `yaml:"enabled"`  // Enable time-based collection
+			Duration string `yaml:"duration"` // Duration like "15m", "1h", "30m"
+		} `yaml:"timeBasedCollection"`
+		// Log analysis configuration
+		LogAnalysis struct {
+			Enabled       bool     `yaml:"enabled"`       // Enable/disable log analysis
+			OutputFile    string   `yaml:"outputFile"`    // Output file name for analysis results
+			ErrorPatterns []string `yaml:"errorPatterns"` // Patterns to search for in logs
+			MaxMatches    int      `yaml:"maxMatches"`    // Maximum matches per file to include
+			ContextLines  int      `yaml:"contextLines"`  // Number of context lines around matches
+		} `yaml:"logAnalysis"`
+	} `yaml:"logCollection"`
+	// General system information collection
+	GeneralInfo struct {
+		Enabled   bool                 `yaml:"enabled"`
+		OutputDir string               `yaml:"outputDir"`
+		Commands  []GeneralInfoCommand `yaml:"commands"`
+	} `yaml:"generalInfo"`
+	// Application version collection
+	AppVersionCollection struct {
+		Enabled        bool                  `yaml:"enabled"`
+		OutputFileName string                `yaml:"outputFileName"`
+		PrintToLog     bool                  `yaml:"printToLog"`
+		Namespaces     []AppVersionNamespace `yaml:"namespaces"`
+	} `yaml:"appVersionCollection"`
+}
+
+// LoadConfig loads the configuration from a YAML file
+func LoadConfig(configPath string) (*Config, error) {
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return &Config{}, nil // Return empty config if file doesn't exist
+	}
+
+	// Read the config file
+	data, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config file: %v", err)
+	}
+
+	// Parse the YAML config
+	var config Config
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("error parsing YAML config file: %v", err)
+	}
+
+	// Set default for MaxSSHSessions if not configured
+	if config.Options.MaxSSHSessions <= 0 {
+		config.Options.MaxSSHSessions = 1 // Conservative default
+	}
+
+	return &config, nil
+}
+
+func sshConnectBastion(username, password, host string, port int) (*ssh.Client, error) {
+	config := &ssh.ClientConfig{
+		User: username,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(password),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second, // Increased timeout for initial connection
+		// SSH performance optimizations
+		Config: ssh.Config{
+			Ciphers: []string{
+				"aes128-ctr", "aes192-ctr", "aes256-ctr", // Fast CTR mode ciphers
+				"aes128-gcm@openssh.com", "aes256-gcm@openssh.com", // GCM modes for performance
+			},
+			MACs: []string{
+				"hmac-sha2-256-etm@openssh.com", // Fast MAC algorithms
+				"hmac-sha2-256",
+				"hmac-sha1",
+			},
+		},
+	} // Format address properly for both IPv4 and IPv6
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+
+	// Establish TCP connection first for optimization
+	tcpConn, err := net.DialTimeout("tcp", addr, config.Timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// Optimize TCP connection
+	if tcp, ok := tcpConn.(*net.TCPConn); ok {
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(30 * time.Second)
+		tcp.SetNoDelay(true) // Disable Nagle's algorithm for lower latency
+	}
+
+	// Create SSH connection over optimized TCP connection
+	clientConn, chans, reqs, err := ssh.NewClientConn(tcpConn, addr, config)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
+	client := ssh.NewClient(clientConn, chans, reqs)
+	return client, nil
+}
+
+// Connect to AWS server from bastion using .ssh key
+func sshConnectAWSViaBastion(bastionClient *ssh.Client, awsHost, keyPath string, preferredUsername string) (*ssh.Client, error) {
+	return sshConnectAWSViaBastionWithLogging(bastionClient, awsHost, keyPath, preferredUsername, true)
+}
+
+// Connect to AWS server from bastion using .ssh key with optional verbose logging
+func sshConnectAWSViaBastionWithLogging(bastionClient *ssh.Client, awsHost, keyPath string, preferredUsername string, verboseLogging bool) (*ssh.Client, error) {
+	// Read private key from bastion
+	sess, err := bastionClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session on bastion: %v", err)
+	}
+	defer sess.Close()
+
+	if verboseLogging {
+		logger.Info("Reading key from %s...", keyPath)
+	} else {
+		logger.Debug("Reading key from %s...", keyPath)
+	}
+	keyBytes, err := sess.Output("cat " + keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file from bastion at %s: %v", keyPath, err)
+	}
+
+	// Try to parse the key, print debug info if it fails
+	key, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		// Check if it might be a permission error
+		if strings.Contains(err.Error(), "cannot decode encrypted private keys") {
+			return nil, fmt.Errorf("the key appears to be password-protected, which is not supported: %v", err)
+		}
+
+		// Print the first few characters of the key for debugging
+		keyPreview := string(keyBytes)
+		if len(keyPreview) > 100 {
+			keyPreview = keyPreview[:100] + "..."
+		}
+		return nil, fmt.Errorf("failed to parse private key: %v\nKey begins with: %s", err, keyPreview)
+	}
+
+	// Setup users to try
+	users := []string{"ec2-user", "ubuntu", "centos", "admin", "root"}
+
+	// Add the current bastion username as a possibility
+	currentUser, err := sess.Output("whoami")
+	if err == nil {
+		users = append([]string{strings.TrimSpace(string(currentUser))}, users...)
+	}
+
+	// If preferred username is provided, try it first
+	if preferredUsername != "" {
+		users = append([]string{preferredUsername}, users...)
+	}
+
+	var lastError error
+	for _, user := range users {
+		if verboseLogging {
+			logger.Info("Trying to connect as user '%s'...", user)
+		} else {
+			logger.Debug("Trying to connect as user '%s'...", user)
+		}
+
+		config := &ssh.ClientConfig{
+			User:            user,
+			Auth:            []ssh.AuthMethod{ssh.PublicKeys(key)},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			Timeout:         8 * time.Second, // Optimized timeout for faster connection failures
+			// SSH performance optimizations
+			Config: ssh.Config{
+				Ciphers: []string{
+					"aes128-ctr", "aes192-ctr", "aes256-ctr", // Fast CTR mode ciphers
+					"aes128-gcm@openssh.com", "aes256-gcm@openssh.com", // GCM modes for performance
+				},
+				MACs: []string{
+					"hmac-sha2-256-etm@openssh.com", // Fast MAC algorithms
+					"hmac-sha2-256",
+					"hmac-sha1",
+				},
+			},
+		}
+
+		// Create a tunnel from bastion to AWS host
+		conn, err := bastionClient.Dial("tcp", awsHost+":22")
+		if err != nil {
+			return nil, fmt.Errorf("failed to establish connection to %s:22: %v", awsHost, err)
+		}
+
+		// Optimize the tunneled connection if it's TCP
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			tcpConn.SetNoDelay(true) // Disable Nagle's algorithm for lower latency
+		}
+
+		clientConn, chans, reqs, err := ssh.NewClientConn(conn, awsHost+":22", config)
+		if err != nil {
+			lastError = err
+			logger.Debug("Authentication failed for user '%s': %v", user, err)
+			conn.Close() // Close the connection before trying the next user
+			continue
+		}
+
+		if verboseLogging {
+			logger.Info("Successfully connected as '%s'", user)
+		} else {
+			logger.Debug("Successfully connected as '%s'", user)
+		}
+
+		client := ssh.NewClient(clientConn, chans, reqs)
+		return client, nil
+	}
+
+	return nil, fmt.Errorf("failed to authenticate with any user: %v", lastError)
+}
+
+// collectKubernetesLogs executes the log collection process remotely on AWS
+func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir string, customSources []PodLogSource, useTimestamp bool, timestampFormat, environment, username string, collectInfo bool, generalInfoConfig struct {
+	Enabled   bool                 `yaml:"enabled"`
+	OutputDir string               `yaml:"outputDir"`
+	Commands  []GeneralInfoCommand `yaml:"commands"`
+}, timeBasedEnabled bool, timeDurationStr string, maxSSHSessions int, logAnalysisConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	OutputFile    string   `yaml:"outputFile"`
+	ErrorPatterns []string `yaml:"errorPatterns"`
+	MaxMatches    int      `yaml:"maxMatches"`
+	ContextLines  int      `yaml:"contextLines"`
+}) (string, error) {
+	// Start timing the log collection process
+	logCollectionStartTime := time.Now()
+	logger.Info("Starting Kubernetes log collection...")
+	logger.Debug("Received tempDir parameter: '%s'", tempDir)
+
+	// Parse time-based collection parameters
+	var sinceTime string
+	if timeBasedEnabled && timeDurationStr != "" {
+		duration, err := time.ParseDuration(timeDurationStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid time duration '%s': %v", timeDurationStr, err)
+		}
+
+		// Get current time from AWS server (not local machine)
+		logger.Info("⏰ Getting current time from AWS server for accurate time-based collection...")
+		awsCurrentTime, err := getAWSServerTime(awsClient)
+		if err != nil {
+			return "", fmt.Errorf("failed to get AWS server time: %v", err)
+		}
+
+		// Calculate the time to collect logs since (using AWS server time)
+		since := awsCurrentTime.Add(-duration)
+		sinceTime = since.Format("2006-01-02T15:04:05Z")
+		logger.Info("⏰ AWS server time: %s", awsCurrentTime.Format("2006-01-02T15:04:05Z"))
+		logger.Info("⏰ Time-based collection: collecting logs since %s (last %s)", sinceTime, timeDurationStr)
+
+		// Append time duration to filename for clarity
+		if useTimestamp {
+			finalLogFileName := fmt.Sprintf("%s_%s", logFileName, strings.ReplaceAll(timeDurationStr, "h", "hr"))
+			logFileName = finalLogFileName
+		} else {
+			logFileName = fmt.Sprintf("%s_%s", logFileName, strings.ReplaceAll(timeDurationStr, "h", "hr"))
+		}
+	} else {
+		logger.Info("📄 Full log collection enabled - collecting complete logs from all pods")
+	}
+
+	// Quick fix: correct tempDir pattern to match config expectation
+	if strings.HasSuffix(tempDir, "_temp_logs") {
+		tempDir = strings.Replace(tempDir, "_temp_logs", "_templogs", 1)
+		logger.Debug("Corrected tempDir to: '%s'", tempDir)
+	}
+
+	// Generate timestamped filename if requested
+	finalLogFileName := logFileName
+	if useTimestamp {
+		if timestampFormat == "" {
+			timestampFormat = "20060102_150405" // Default format: YYYYMMDD_HHMMSS
+		}
+		timestamp := time.Now().Format(timestampFormat)
+		finalLogFileName = fmt.Sprintf("%s_%s", logFileName, timestamp)
+		logger.Info("📝 Generated timestamped filename: %s", finalLogFileName)
+	}
+
+	// Use default sources if no custom sources provided
+	sources := defaultLogSources
+	if len(customSources) > 0 {
+		sources = customSources
+	}
+
+	// Apply template replacement to sources
+	for i := range sources {
+		sources[i].Namespace = strings.ReplaceAll(sources[i].Namespace, "{environment}", environment)
+		sources[i].Namespace = strings.ReplaceAll(sources[i].Namespace, "{username}", username)
+		sources[i].PodPrefix = strings.ReplaceAll(sources[i].PodPrefix, "{environment}", environment)
+		sources[i].PodPrefix = strings.ReplaceAll(sources[i].PodPrefix, "{username}", username)
+		sources[i].LogPath = strings.ReplaceAll(sources[i].LogPath, "{environment}", environment)
+		sources[i].LogPath = strings.ReplaceAll(sources[i].LogPath, "{username}", username)
+		sources[i].OutputName = strings.ReplaceAll(sources[i].OutputName, "{environment}", environment)
+		sources[i].OutputName = strings.ReplaceAll(sources[i].OutputName, "{username}", username)
+	}
+
+	// Create the log collection directory
+	// Use tempDir from config, fallback to default if empty
+	if tempDir == "" {
+		tempDir = fmt.Sprintf("%s_templogs", environment) // Default fallback using environment
+	}
+	logDir := fmt.Sprintf("%s/%s", tempDir, finalLogFileName)
+	logger.Info("Creating log directory: %s", logDir)
+
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// First ensure the tempDir exists
+	logger.Debug("Ensuring temp directory exists: %s", tempDir)
+	if err := executeCommandAsRoot(session, fmt.Sprintf("mkdir -p %s", tempDir)); err != nil {
+		return "", fmt.Errorf("failed to create temp directory %s: %v", tempDir, err)
+	}
+
+	// Create a new session for the full log directory structure
+	session1b, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session for log directory: %v", err)
+	}
+	defer session1b.Close()
+
+	// Create the full log directory structure as root
+	if err := executeCommandAsRoot(session1b, fmt.Sprintf("mkdir -p %s", logDir)); err != nil {
+		return "", fmt.Errorf("failed to create log directory %s: %v", logDir, err)
+	}
+
+	// Collect logs from each source in parallel
+	totalSources := len(sources)
+	logger.Info("Starting parallel log collection from %d sources...", totalSources)
+
+	// Create channels for results and wait group for synchronization
+	type logResult struct {
+		source PodLogSource
+		index  int
+		err    error
+	}
+
+	resultChan := make(chan logResult, totalSources)
+	var wg sync.WaitGroup
+
+	// Start parallel log collection
+	for i, source := range sources {
+		wg.Add(1)
+		go func(src PodLogSource, idx int) {
+			defer wg.Done()
+
+			logger.Info("Collecting logs from %s namespace, pod prefix: %s (%d/%d)",
+				src.Namespace, src.PodPrefix, idx+1, totalSources)
+
+			// Create independent SSH session for this collection
+			err := collectLogsFromSourceParallel(awsClient, src, logDir, timeBasedEnabled, sinceTime, maxSSHSessions)
+			resultChan <- logResult{source: src, index: idx, err: err}
+		}(source, i)
+	}
+
+	// Wait for all collections to complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	successCount := 0
+	for result := range resultChan {
+		if result.err != nil {
+			logger.Warn("Failed to collect logs from %s/%s: %v",
+				result.source.Namespace, result.source.PodPrefix, result.err)
+		} else {
+			successCount++
+		}
+	}
+
+	logger.Info("Log collection completed: %d/%d sources successful", successCount, totalSources)
+
+	// Debug: Show what files were actually collected
+	logger.Debug("🔍 Checking collected files in log directory...")
+	debugSession, err := awsClient.NewSession()
+	if err == nil {
+		defer debugSession.Close()
+		listCmd := fmt.Sprintf("find %s -type f -name '*.log' 2>/dev/null | head -20", logDir)
+		if debugOutput, debugErr := debugSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", listCmd)); debugErr == nil && len(debugOutput) > 0 {
+			logger.Debug("📁 Found log files: %s", strings.TrimSpace(string(debugOutput)))
+		} else {
+			logger.Debug("📁 No log files found in collected directory")
+			// Also check directory structure
+			dirCmd := fmt.Sprintf("find %s -type d 2>/dev/null", logDir)
+			if dirOutput, dirErr := debugSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", dirCmd)); dirErr == nil && len(dirOutput) > 0 {
+				logger.Debug("📂 Directory structure: %s", strings.TrimSpace(string(dirOutput)))
+			}
+		}
+	}
+
+	// Collect general system information before archiving (if enabled)
+	if collectInfo && generalInfoConfig.Enabled {
+		logger.Info("🔍 Starting general system information collection...")
+		err = collectGeneralInfo(awsClient, generalInfoConfig, environment, username, tempDir, finalLogFileName)
+		if err != nil {
+			logger.Warn("⚠️ General info collection failed: %v", err)
+			// Don't return here - continue with archive creation
+		}
+	}
+
+	// Perform log analysis if enabled (before archiving)
+	if logAnalysisConfig.Enabled {
+		logger.Info("🔍 Starting log analysis for error patterns...")
+		err = analyzeLogsForErrors(awsClient, logDir, logAnalysisConfig)
+		if err != nil {
+			logger.Warn("⚠️ Log analysis failed: %v", err)
+			// Don't return here - continue with archive creation
+		}
+	}
+
+	// Post-collection file operations - each operation uses a fresh session
+	logger.Info("Creating archive: %s.tar.gz", finalLogFileName)
+
+	// Create archive using a fresh session
+	archiveSession, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session for archive operations: %v", err)
+	}
+	defer archiveSession.Close()
+
+	archiveCmd := fmt.Sprintf("cd %s && tar -czf %s.tar.gz %s", tempDir, finalLogFileName, finalLogFileName)
+	if err := executeCommandAsRoot(archiveSession, archiveCmd); err != nil {
+		return "", fmt.Errorf("failed to create archive: %v", err)
+	}
+
+	// Get file size for informational purposes using a fresh session
+	var fileSize string
+	sizeSession, err := awsClient.NewSession()
+	if err == nil {
+		defer sizeSession.Close()
+		sizeCmd := fmt.Sprintf("ls -lh %s/%s.tar.gz | awk '{print $5}'", tempDir, finalLogFileName)
+		if output, err := sizeSession.Output(sizeCmd); err == nil {
+			fileSize = strings.TrimSpace(string(output))
+		}
+	}
+
+	logger.Info("Moving archive to /home/%s/", userID)
+	// Move archive to user directory using a fresh session
+	moveSession, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session for move operation: %v", err)
+	}
+	defer moveSession.Close()
+
+	moveCmd := fmt.Sprintf("mv %s/%s.tar.gz /home/%s/", tempDir, finalLogFileName, userID)
+	if err := executeCommandAsRoot(moveSession, moveCmd); err != nil {
+		return "", fmt.Errorf("failed to move archive: %v", err)
+	}
+
+	logger.Info("Setting permissions for archive file...")
+	// Set proper permissions for the archive file using a fresh session
+	chmodSession, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session for chmod operation: %v", err)
+	}
+	defer chmodSession.Close()
+
+	chmodCmd := fmt.Sprintf("chmod 644 /home/%s/%s.tar.gz", userID, finalLogFileName)
+	if err := executeCommandAsRoot(chmodSession, chmodCmd); err != nil {
+		logger.Warn("⚠️ Failed to set permissions for archive: %v (this may cause download issues)", err)
+	} else {
+		logger.Info("✅ Archive permissions set successfully")
+	}
+
+	// Cleanup temporary directory using a fresh session
+	logger.Info("Cleaning up temporary files...")
+	cleanupSession, err := awsClient.NewSession()
+	if err != nil {
+		logger.Warn("Failed to create session for cleanup: %v", err)
+	} else {
+		defer cleanupSession.Close()
+
+		// Remove the log collection subdirectory
+		cleanupCmd := fmt.Sprintf("rm -rf %s/%s", tempDir, finalLogFileName)
+		if err := executeCommandAsRoot(cleanupSession, cleanupCmd); err != nil {
+			logger.Warn("Failed to cleanup temporary directory: %v", err)
+		}
+	}
+
+	// Check if tempDir is empty and delete it using a fresh session
+	logger.Info("Checking if tempDir %s is empty and can be deleted...", tempDir)
+	checkSession, err := awsClient.NewSession()
+	if err != nil {
+		logger.Debug("Failed to create session for tempDir check: %v", err)
+	} else {
+		defer checkSession.Close()
+
+		// Check if directory is empty using a more reliable method
+		// Count non-hidden files and directories (excluding . and ..)
+		checkCmd := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1 | wc -l", tempDir)
+		output, err := checkSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", checkCmd))
+		if err != nil {
+			logger.Debug("Failed to check tempDir contents: %v", err)
+		} else {
+			itemCount := strings.TrimSpace(string(output))
+			logger.Debug("Items in tempDir %s: %s", tempDir, itemCount)
+
+			if itemCount == "0" {
+				// Directory is empty, safe to delete - use another fresh session
+				deleteSession, err := awsClient.NewSession()
+				if err != nil {
+					logger.Warn("Failed to create session for tempDir deletion: %v", err)
+				} else {
+					defer deleteSession.Close()
+					logger.Info("🗑️ tempDir %s is empty, deleting it...", tempDir)
+					deleteTempDirCmd := fmt.Sprintf("rmdir %s", tempDir) // Use rmdir for safety
+					if err := executeCommandAsRoot(deleteSession, deleteTempDirCmd); err != nil {
+						logger.Warn("⚠️ Failed to delete tempDir %s: %v", tempDir, err)
+					} else {
+						logger.Info("✅ Successfully deleted empty tempDir: %s", tempDir)
+					}
+				}
+			} else {
+				logger.Info("⚠️ tempDir %s is not empty (%s items), skipping deletion for safety", tempDir, itemCount)
+			}
+		}
+	}
+
+	// Calculate and display log collection time
+	logCollectionDuration := time.Since(logCollectionStartTime)
+	logger.Info("✅ Log collection completed successfully! (took %s)", logCollectionDuration.Round(time.Millisecond))
+	if fileSize != "" {
+		logger.Info("📁 Archive created: /home/%s/%s.tar.gz (Size: %s)", userID, finalLogFileName, fileSize)
+	} else {
+		logger.Info("📁 Archive created: /home/%s/%s.tar.gz", userID, finalLogFileName)
+	}
+
+	// Store the final filename for later use (deletion after download)
+	return finalLogFileName, nil
+}
+
+// collectLogsFromSourceParallel collects logs from a specific pod source using an independent SSH session
+func collectLogsFromSourceParallel(awsClient *ssh.Client, source PodLogSource, logDir string, timeBasedEnabled bool, sinceTime string, maxSSHSessions int) error {
+	// Create single SSH session for this entire source collection
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// kubectl command to get pod names with timeout for faster response
+	getPodCmd := fmt.Sprintf("timeout 5 kubectl get pods -n %s --no-headers -o custom-columns=\":metadata.name\" | grep \"^%s\"",
+		source.Namespace, source.PodPrefix)
+
+	logger.Debug("Executing as root: %s", getPodCmd)
+	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", getPodCmd))
+	if err != nil {
+		return fmt.Errorf("failed to get pods: %v", err)
+	}
+
+	podNames := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(podNames) == 0 || (len(podNames) == 1 && podNames[0] == "") {
+		logger.Warn("No pods found for prefix %s in namespace %s", source.PodPrefix, source.Namespace)
+		return nil
+	}
+
+	logger.Debug("Found %d pods with prefix %s", len(podNames), source.PodPrefix)
+
+	// Handle time-based vs file-based collection
+	if timeBasedEnabled && sinceTime != "" {
+		logger.Info("📅 Using time-based collection for %s namespace (since %s)", source.Namespace, sinceTime)
+		return collectTimeBasedLogs(awsClient, source, logDir, podNames, sinceTime, maxSSHSessions)
+	} else {
+		logger.Debug("📁 Using file-based collection for %s namespace", source.Namespace)
+		return collectFileBased(awsClient, source, logDir, podNames, maxSSHSessions)
+	}
+}
+
+// collectTimeBasedLogs collects logs using kubectl logs with --since parameter
+func collectTimeBasedLogs(awsClient *ssh.Client, source PodLogSource, logDir string, podNames []string, sinceTime string, maxSSHSessions int) error {
+	// Create directories for logs
+	namespaceDir := fmt.Sprintf("%s/%s", logDir, source.Namespace)
+
+	session2, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for directories: %v", err)
+	}
+	defer session2.Close()
+
+	var batchCommands []string
+	for _, podName := range podNames {
+		if podName == "" {
+			continue
+		}
+		podName = strings.TrimSpace(podName)
+		podDir := fmt.Sprintf("%s/%s", namespaceDir, podName)
+		batchCommands = append(batchCommands, fmt.Sprintf("mkdir -p %s", podDir))
+	}
+
+	if len(batchCommands) > 0 {
+		createDirsCmd := strings.Join(batchCommands, " && ")
+		if err := executeCommandAsRoot(session2, createDirsCmd); err != nil {
+			logger.Warn("Failed to create some directories: %v", err)
+		}
+	}
+
+	// Collect logs from each pod using kubectl logs --since-time (CONFIGURABLE SSH management)
+	var podWg sync.WaitGroup
+
+	// Use configurable concurrency limit with safe defaults
+	if maxSSHSessions <= 0 || maxSSHSessions > 4 {
+		maxSSHSessions = 1 // Default to 1 if not configured or invalid
+	}
+	maxConcurrentPods := maxSSHSessions // Use configured value
+	semaphore := make(chan struct{}, maxConcurrentPods)
+
+	for _, podName := range podNames {
+		if podName == "" {
+			continue
+		}
+		podName = strings.TrimSpace(podName)
+
+		podWg.Add(1)
+		go func(pod string) {
+			defer podWg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Small delay to reduce SSH server pressure significantly
+			time.Sleep(time.Duration(200) * time.Millisecond)
+
+			logger.Debug("⏰ Collecting time-based logs from pod: %s", pod)
+
+			podDir := fmt.Sprintf("%s/%s", namespaceDir, pod)
+			var outputFile string
+
+			// Determine output filename based on pod type
+			switch {
+			case strings.HasPrefix(source.PodPrefix, "hacr") || source.PodPrefix == "hacr":
+				outputFile = fmt.Sprintf("%s/hac_%s.log", podDir, strings.ReplaceAll(sinceTime, ":", "-"))
+			case strings.HasPrefix(source.PodPrefix, "teconfig"):
+				outputFile = fmt.Sprintf("%s/hm_%s.log", podDir, strings.ReplaceAll(sinceTime, ":", "-"))
+			case strings.HasPrefix(source.PodPrefix, "nvo-"):
+				outputFile = fmt.Sprintf("%s/%s_%s.log", podDir, pod, strings.ReplaceAll(sinceTime, ":", "-"))
+			default:
+				outputFile = fmt.Sprintf("%s/%s_%s.log", podDir, pod, strings.ReplaceAll(sinceTime, ":", "-"))
+			}
+
+			// Create new session for kubectl logs command
+			session3, err := awsClient.NewSession()
+			if err != nil {
+				logger.Warn("Failed to create session for kubectl logs for pod %s: %v", pod, err)
+				return
+			}
+			defer session3.Close()
+
+			// Use kubectl logs with --since parameter
+			logsCmd := fmt.Sprintf("timeout 180 kubectl logs -n %s %s --since-time=%s", source.Namespace, pod, sinceTime)
+			logger.Debug("📋 Executing kubectl logs: %s", logsCmd)
+
+			// Execute and redirect output to file
+			fullCmd := fmt.Sprintf("%s > %s 2>&1", logsCmd, outputFile)
+			if err := executeCommandAsRoot(session3, fullCmd); err != nil {
+				logger.Warn("Failed to collect logs from pod %s: %v", pod, err)
+			} else {
+				logger.Debug("✅ Successfully collected time-based logs from %s", pod)
+			}
+		}(podName)
+	}
+
+	// Wait for all pod log collections to complete
+	podWg.Wait()
+
+	return nil
+}
+
+// collectFileBased handles traditional file-based log collection with parallel SSH connections
+func collectFileBased(awsClient *ssh.Client, source PodLogSource, logDir string, podNames []string, maxSSHSessions int) error {
+	// Create directories for logs
+	namespaceDir := fmt.Sprintf("%s/%s", logDir, source.Namespace)
+
+	session2, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for directories: %v", err)
+	}
+	defer session2.Close()
+
+	var batchCommands []string
+	for _, podName := range podNames {
+		if podName == "" {
+			continue
+		}
+		podName = strings.TrimSpace(podName)
+		podDir := fmt.Sprintf("%s/%s", namespaceDir, podName)
+		batchCommands = append(batchCommands, fmt.Sprintf("mkdir -p %s", podDir))
+	}
+
+	if len(batchCommands) > 0 {
+		createDirsCmd := strings.Join(batchCommands, " && ")
+		if err := executeCommandAsRoot(session2, createDirsCmd); err != nil {
+			logger.Warn("Failed to create some directories: %v", err)
+		}
+	}
+
+	// Copy logs from each pod using OPTIMIZED SSH connections with configurable session limit management
+	var podWg sync.WaitGroup
+
+	// Use configurable concurrency limit with safe defaults
+	if maxSSHSessions <= 0 || maxSSHSessions > 4 {
+		maxSSHSessions = 1 // Default to 1 if not configured or invalid
+	}
+	maxConcurrentPods := maxSSHSessions // Use configured value
+	semaphore := make(chan struct{}, maxConcurrentPods)
+
+	for _, podName := range podNames {
+		if podName == "" {
+			continue
+		}
+		podName = strings.TrimSpace(podName)
+
+		podWg.Add(1)
+		go func(pod string) {
+			defer podWg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Small delay to reduce SSH server pressure significantly
+			time.Sleep(time.Duration(200) * time.Millisecond)
+
+			logger.Debug("📁 Collecting file-based logs from pod: %s", pod)
+
+			// Determine the source and destination paths
+			var srcPath, dstPath string
+			podDir := fmt.Sprintf("%s/%s", namespaceDir, pod)
+
+			switch {
+			case strings.HasPrefix(source.PodPrefix, "hacr") || source.PodPrefix == "hacr":
+				srcPath = fmt.Sprintf("%s:/opt/hacr/logs/hac.log", pod)
+				dstPath = fmt.Sprintf("%s/hac.log", podDir)
+			case strings.HasPrefix(source.PodPrefix, "teconfig") || source.PodPrefix == "teconfig":
+				srcPath = fmt.Sprintf("%s:/opt/tomcat/logs/hm.log", pod)
+				dstPath = fmt.Sprintf("%s/hm.log", podDir)
+			case strings.HasPrefix(source.PodPrefix, "nvo-"):
+				srcPath = fmt.Sprintf("%s:%s/%s-server.log", pod, source.LogPath, pod)
+				dstPath = fmt.Sprintf("%s/%s-server.log", podDir, pod)
+			default:
+				srcPath = fmt.Sprintf("%s:%s/%s", pod, source.LogPath, source.OutputName)
+				dstPath = fmt.Sprintf("%s/%s", podDir, source.OutputName)
+			}
+
+			// Create independent SSH session for this pod's operations (consolidate to reduce session count)
+			session3, err := awsClient.NewSession()
+			if err != nil {
+				logger.Warn("Failed to create session for kubectl cp for pod %s: %v", pod, err)
+				return
+			}
+			defer session3.Close()
+
+			// kubectl cp command with timeout and retries for better performance
+			cpCmd := fmt.Sprintf("timeout 180 kubectl -n %s cp %s %s --retries=2", source.Namespace, srcPath, dstPath)
+			logger.Debug("📋 Executing kubectl cp: %s", cpCmd)
+
+			// Execute kubectl cp
+			output, err := session3.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", cpCmd))
+			if err != nil {
+				logger.Warn("❌ Failed to copy logs from pod %s: %v", pod, err)
+				if len(output) > 0 {
+					logger.Debug("kubectl cp output: %s", string(output))
+				}
+			} else {
+				// Verify the file was actually copied using the same session
+				verifyCmd := fmt.Sprintf("ls -la %s 2>/dev/null || echo 'File not found'", dstPath)
+				if verifyOutput, verifyErr := session3.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", verifyCmd)); verifyErr == nil {
+					if strings.Contains(string(verifyOutput), "File not found") {
+						logger.Warn("⚠️ Log file was not copied successfully for pod %s", pod)
+					} else {
+						logger.Debug("✅ Successfully copied logs from pod: %s", pod)
+						logger.Debug("File verification: %s", strings.TrimSpace(string(verifyOutput)))
+					}
+				}
+				if len(output) > 0 {
+					logger.Debug("kubectl cp output: %s", string(output))
+				}
+			}
+		}(podName)
+	}
+
+	// Wait for all pod log collections to complete
+	podWg.Wait()
+
+	return nil
+}
+
+// getAWSServerTime gets the current time from the AWS server for accurate time-based log collection
+func getAWSServerTime(awsClient *ssh.Client) (time.Time, error) {
+	// Create new session to get server time
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to create session for time query: %v", err)
+	}
+	defer session.Close()
+
+	// Get current time in UTC from AWS server using date command
+	timeCmd := "date -u '+%Y-%m-%dT%H:%M:%SZ'"
+	logger.Debug("Getting AWS server time: %s", timeCmd)
+
+	output, err := session.CombinedOutput(timeCmd)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get server time: %v", err)
+	}
+
+	// Parse the time string from server
+	timeStr := strings.TrimSpace(string(output))
+	logger.Debug("AWS server returned time: %s", timeStr)
+
+	serverTime, err := time.Parse("2006-01-02T15:04:05Z", timeStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse server time '%s': %v", timeStr, err)
+	}
+
+	logger.Debug("Parsed AWS server time: %s", serverTime.Format("2006-01-02T15:04:05Z"))
+	return serverTime, nil
+}
+
+// executeCommandAsRoot executes a command as root user using sudo su -
+func executeCommandAsRoot(session *ssh.Session, command string) error {
+	// Wrap the command to run as root
+	rootCommand := fmt.Sprintf("sudo su - -c '%s'", command)
+	logger.Debug("Executing as root: %s", rootCommand)
+
+	output, err := session.CombinedOutput(rootCommand)
+	if err != nil {
+		logger.Debug("Root command failed: %s\nOutput: %s", rootCommand, string(output))
+		return fmt.Errorf("root command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	if len(output) > 0 {
+		logger.Debug("Root command output: %s", string(output))
+	}
+
+	return nil
+}
+
+// deleteArchiveFromAWS deletes the archive file from AWS after successful download
+func deleteArchiveFromAWS(awsClient *ssh.Client, archivePath, environment string) error {
+	logger.Info("🗑️ Deleting source archive from %s: %s", environment, archivePath)
+
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for deletion: %v", err)
+	}
+	defer session.Close()
+
+	deleteCmd := fmt.Sprintf("rm -f %s", archivePath)
+	if err := executeCommandAsRoot(session, deleteCmd); err != nil {
+		return fmt.Errorf("failed to delete archive: %v", err)
+	}
+
+	logger.Info("✅ Successfully deleted source archive from %s", environment)
+	return nil
+}
+
+// Download file from AWS to bastion using SFTP with parallel download
+func downloadFileFromAWS(awsClient *ssh.Client, remotePath, localPath string, autoRetry bool, numChunks int, connParams *ConnectionParams) error {
+	// Record start time
+	startTime := time.Now()
+
+	// Use more chunks for better parallel performance
+	if numChunks <= 0 {
+		numChunks = 3 // Default to 3 chunks for good balance and reliability
+	}
+	if numChunks > 6 {
+		numChunks = 6 // Cap at 6 connections for optimal performance and stability
+	}
+
+	// Create an optimized SFTP client with conservative compatibility
+	sftpClient, err := sftp.NewClient(awsClient,
+		sftp.MaxPacket(32*1024), // 32KB packet size - compatible with most servers
+		// Note: Removed concurrent options for maximum compatibility
+	)
+	if err != nil {
+		return err
+	}
+	defer sftpClient.Close()
+
+	// Open source file to get information
+	srcFile, err := sftpClient.Open(remotePath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// Get file size
+	fileInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := fileInfo.Size()
+
+	// If file is small, use regular download (parallel overhead not worth it)
+	if fileSize < 1024*1024*20 { // Less than 20MB - use single threaded
+		logger.Info("Using single-threaded download for small file (%.2f MB)", float64(fileSize)/(1024*1024))
+		return downloadFileSimple(sftpClient, remotePath, localPath, fileSize)
+	}
+
+	logger.Info("Using parallel download with %d chunks for large file (%.2f MB)", numChunks, float64(fileSize)/(1024*1024))
+
+	// Print file size for debugging
+	logger.Debug("File size: %d bytes (%.2f MB)", fileSize, float64(fileSize)/(1024*1024))
+
+	// Generate temporary file path for downloading
+	tempFilePath := localPath + ".part"
+	// Remove any existing temp file that might be left from a previous failed download
+	if _, err := os.Stat(tempFilePath); err == nil {
+		os.Remove(tempFilePath)
+		logger.Debug("Removed existing temporary file: %s", tempFilePath)
+	}
+
+	// Create destination file with explicit permissions
+	dstFile, err := os.OpenFile(tempFilePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		dstFile.Close()
+		// Only remove the temp file if there was an error and we didn't rename it
+		if _, err := os.Stat(tempFilePath); err == nil {
+			os.Remove(tempFilePath)
+		}
+	}()
+
+	// Print details about the file we're creating
+	logger.Debug("Created temporary file: %s", tempFilePath)
+
+	// Pre-allocate the file to the required size
+	err = dstFile.Truncate(fileSize)
+	if err != nil {
+		return fmt.Errorf("failed to pre-allocate file: %v", err)
+	}
+
+	// Verify the file was pre-allocated correctly
+	preAllocSize, err := dstFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("failed to verify pre-allocation: %v", err)
+	}
+
+	if preAllocSize != fileSize {
+		return fmt.Errorf("pre-allocation failed: expected %d bytes, got %d bytes", fileSize, preAllocSize)
+	}
+
+	// Reset seek position to beginning of file
+	_, err = dstFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to reset file position: %v", err)
+	}
+
+	// Add a download verification marker at the beginning of the file to confirm data is being written
+	_, err = dstFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to seek to file start for marker: %v", err)
+	}
+
+	// Write a marker at the beginning (will be overwritten by real data)
+	markerText := []byte("DOWNLOAD_STARTED")
+	_, err = dstFile.Write(markerText)
+	if err != nil {
+		logger.Debug("Warning: Failed to write start marker: %v", err)
+	} else {
+		logger.Debug("Added start marker to file")
+	}
+
+	// Reset seek position back to beginning
+	_, err = dstFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to reset file position after marker: %v", err)
+	}
+
+	// Calculate chunk size
+	chunkSize := fileSize / int64(numChunks)
+
+	// Ensure chunk size is at least 1KB
+	if chunkSize < 1024 {
+		chunkSize = 1024
+		numChunks = int(fileSize / chunkSize)
+		if numChunks == 0 {
+			numChunks = 1
+		}
+	}
+	// Create chunk info array
+	chunks := make([]ChunkInfo, numChunks)
+	originalChunkCount := numChunks // Store original count for retry detection
+	for i := 0; i < numChunks; i++ {
+		startOffset := int64(i) * chunkSize
+		endOffset := startOffset + chunkSize
+
+		// Adjust the end offset for the last chunk
+		if i == numChunks-1 || endOffset > fileSize {
+			endOffset = fileSize
+		}
+
+		chunks[i] = ChunkInfo{
+			Index:       i,
+			StartOffset: startOffset,
+			EndOffset:   endOffset,
+			TempFile:    fmt.Sprintf("%s.part%d", tempFilePath, i), // Separate temp file for each chunk
+		}
+	} // Download the file in chunks to separate temp files
+	logger.Debug("Downloading to separate chunk files: %s.part*", tempFilePath)
+	err = downloadChunks(awsClient, remotePath, tempFilePath, fileSize, chunks, numChunks, originalChunkCount, connParams)
+	if err != nil {
+		logger.Error("Error during download: %v", err)
+
+		// Clean up any chunk files that were created
+		for _, chunk := range chunks {
+			if _, err := os.Stat(chunk.TempFile); err == nil {
+				os.Remove(chunk.TempFile)
+				logger.Debug("Cleaned up chunk file: %s", chunk.TempFile)
+			}
+		}
+
+		// Check if we have failed chunks that need retry
+		failedChunks := getFailedChunks(chunks)
+		if len(failedChunks) > 0 {
+			var shouldRetry bool
+
+			if autoRetry {
+				shouldRetry = true
+				fmt.Printf("\n%d of %d chunks failed to download. Auto-retrying...\n", len(failedChunks), len(chunks))
+			} else {
+				// Ask if user wants to retry failed chunks
+				reader := bufio.NewReader(os.Stdin)
+				fmt.Printf("\n%d of %d chunks failed to download. Retry failed chunks? (y/n): ", len(failedChunks), len(chunks))
+				response, _ := reader.ReadString('\n')
+				response = strings.TrimSpace(strings.ToLower(response))
+				shouldRetry = (response == "y" || response == "yes")
+			}
+
+			if shouldRetry {
+				// Retry just the failed chunks
+				fmt.Printf("Retrying %d failed chunks to separate chunk files: %s.part*\n", len(failedChunks), tempFilePath)
+				err = downloadChunks(awsClient, remotePath, tempFilePath, fileSize, failedChunks, numChunks, originalChunkCount, connParams)
+				if err != nil {
+					// Clean up chunk files on failure
+					for _, chunk := range chunks {
+						if _, err := os.Stat(chunk.TempFile); err == nil {
+							os.Remove(chunk.TempFile)
+						}
+					}
+					return fmt.Errorf("failed to download all chunks after retry: %v", err)
+				}
+
+				// Check if we still have failed chunks
+				failedChunks = getFailedChunks(chunks)
+				if len(failedChunks) > 0 {
+					return fmt.Errorf("download incomplete after retry, %d chunks still failed", len(failedChunks))
+				}
+				// Return a special success message
+				retryMessage := fmt.Sprintf("retry_success:File downloaded successfully after retrying %d chunks", len(failedChunks))
+
+				// Combine chunk files into final file
+				err = combineChunkFiles(chunks, tempFilePath, fileSize)
+				if err != nil {
+					// Clean up chunk files on failure
+					for _, chunk := range chunks {
+						if _, err := os.Stat(chunk.TempFile); err == nil {
+							os.Remove(chunk.TempFile)
+						}
+					}
+					return fmt.Errorf("failed to combine chunk files after retry: %v", err)
+				}
+
+				// Clean up chunk files after successful combination
+				for _, chunk := range chunks {
+					if _, err := os.Stat(chunk.TempFile); err == nil {
+						os.Remove(chunk.TempFile)
+						logger.Debug("Cleaned up chunk file: %s", chunk.TempFile)
+					}
+				}
+
+				// Verify file size
+				fi, err := dstFile.Stat()
+				if err == nil && fi.Size() != fileSize {
+					return fmt.Errorf("file size mismatch: expected %d bytes, got %d bytes", fileSize, fi.Size())
+				}
+
+				// Close the file before renaming
+				dstFile.Close()
+
+				// Move the temp file to the final destination
+				err = os.Rename(tempFilePath, localPath)
+				if err != nil {
+					return fmt.Errorf("failed to rename temporary file: %v", err)
+				}
+
+				// Print final progress and newline
+				fmt.Printf("\r\033[KParallel downloading %s [100%%] - Complete (after retry)\n", filepath.Base(remotePath))
+
+				return errors.New(retryMessage)
+			} else {
+				return fmt.Errorf("download incomplete, %d chunks failed", len(failedChunks))
+			}
+		}
+	}
+
+	// Combine chunk files into final file
+	logger.Debug("Combining chunk files into final file...")
+	err = combineChunkFiles(chunks, tempFilePath, fileSize)
+	if err != nil {
+		// Clean up chunk files on failure
+		for _, chunk := range chunks {
+			if _, err := os.Stat(chunk.TempFile); err == nil {
+				os.Remove(chunk.TempFile)
+			}
+		}
+		return fmt.Errorf("failed to combine chunk files: %v", err)
+	}
+
+	// Clean up chunk files after successful combination
+	for _, chunk := range chunks {
+		if _, err := os.Stat(chunk.TempFile); err == nil {
+			os.Remove(chunk.TempFile)
+			logger.Debug("Cleaned up chunk file: %s", chunk.TempFile)
+		}
+	}
+
+	// Check total bytes read across all chunks
+	var totalBytesExpected int64 = 0
+	for _, chunk := range chunks {
+		totalBytesExpected += (chunk.EndOffset - chunk.StartOffset)
+	}
+
+	if totalBytesExpected != fileSize {
+		return fmt.Errorf("chunk calculation error: expected %d bytes total, chunks add up to %d bytes",
+			fileSize, totalBytesExpected)
+	}
+
+	// Verify file size
+	fi, err := dstFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file stats: %v", err)
+	}
+
+	if fi.Size() != fileSize {
+		return fmt.Errorf("file size mismatch: expected %d bytes, got %d bytes", fileSize, fi.Size())
+	}
+
+	// Double-check file is not empty when it shouldn't be
+	if fileSize > 0 && fi.Size() == 0 {
+		return fmt.Errorf("file appears to be empty but should contain %d bytes", fileSize)
+	}
+
+	// Sync file to ensure all data is written to disk
+	err = dstFile.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync file to disk: %v", err)
+	}
+
+	// Close the file before renaming
+	dstFile.Close()
+
+	// Verify the file on disk after closing
+	fileOnDisk, err := os.Stat(tempFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to verify file on disk: %v", err)
+	}
+
+	if fileOnDisk.Size() != fileSize {
+		return fmt.Errorf("file size mismatch after closing: expected %d bytes, got %d bytes", fileSize, fileOnDisk.Size())
+	}
+
+	// Move the temp file to the final destination
+	err = os.Rename(tempFilePath, localPath)
+	if err != nil {
+		return fmt.Errorf("failed to rename temporary file: %v", err)
+	}
+	// Verify the renamed file
+	finalFile, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to verify final file: %v", err)
+	}
+
+	if finalFile.Size() != fileSize {
+		return fmt.Errorf("file size mismatch after renaming: expected %d bytes, got %d bytes", fileSize, finalFile.Size())
+	}
+	// Double-check file is not empty when it shouldn't be
+	if fileSize > 0 && finalFile.Size() == 0 {
+		return fmt.Errorf("final file appears to be empty but should contain %d bytes", fileSize)
+	}
+	// Perform thorough validation of file content
+	if err := performFinalVerification(localPath, fileSize); err != nil {
+		return fmt.Errorf("file validation failed: %v", err)
+	}
+
+	// Add diagnostic information about the downloaded file (only in debug mode)
+	logger.Debug("Diagnostic information:")
+	logger.Debug("- File path: %s", localPath)
+	logger.Debug("- Expected size: %d bytes (%.2f MB)", fileSize, float64(fileSize)/(1024*1024))
+
+	// Check if the final file exists and get its size
+	if finalFile, err := os.Stat(localPath); err == nil {
+		actualSize := finalFile.Size()
+		logger.Debug("- Actual size: %d bytes (%.2f MB)", actualSize, float64(actualSize)/(1024*1024))
+
+		if actualSize == 0 {
+			logger.Warn("⚠️ WARNING: File is empty! This indicates a download problem.")
+		} else if actualSize != fileSize {
+			logger.Warn("⚠️ WARNING: File size mismatch! Expected %d bytes but got %d bytes.", fileSize, actualSize)
+		} else {
+			logger.Debug("✅ File size verification passed.")
+		}
+	} else {
+		logger.Error("❌ ERROR: Could not stat final file: %v", err)
+	}
+
+	// As a final safety check, try to read some content from the beginning of the file
+	// This is to ensure the file actually has data and is not empty
+	if fileSize > 0 {
+		logger.Debug("Verifying file has content by reading the first few bytes...")
+		file, err := os.Open(localPath)
+		if err != nil {
+			logger.Warn("⚠️ WARNING: Failed to open file for content verification: %v", err)
+		} else {
+			defer file.Close()
+
+			// Read first 100 bytes or less
+			readSize := int64(100)
+			if fileSize < readSize {
+				readSize = fileSize
+			}
+
+			buf := make([]byte, readSize)
+			n, err := file.Read(buf)
+
+			if err != nil {
+				logger.Warn("⚠️ WARNING: Failed to read data from file: %v", err)
+			} else if n == 0 {
+				logger.Warn("⚠️ WARNING: File appears to be empty! Read 0 bytes.")
+			} else {
+				logger.Debug("✅ Verified file has content: Read %d bytes\n", n)
+
+				// For binary files, just print length; for text files, print a snippet
+				if readSize <= 20 {
+					logger.Debug("First %d bytes: %v\n", n, buf[:n])
+				} else {
+					logger.Debug("First 20 bytes: %v\n", buf[:20])
+				}
+			}
+		}
+	}
+
+	// Perform final verification of the file contents
+	if err := performFinalVerification(localPath, fileSize); err != nil {
+		return err
+	}
+
+	// Calculate and display download time
+	downloadDuration := time.Since(startTime)
+
+	// Format the duration in a human-readable way
+	var durationStr string
+	if downloadDuration.Hours() >= 1 {
+		durationStr = fmt.Sprintf("%.1f hours", downloadDuration.Hours())
+	} else if downloadDuration.Minutes() >= 1 {
+		durationStr = fmt.Sprintf("%.1f minutes", downloadDuration.Minutes())
+	} else {
+		durationStr = fmt.Sprintf("%.1f seconds", downloadDuration.Seconds())
+	}
+
+	// Display time taken with download speed
+	bytesPerSecond := float64(fileSize) / downloadDuration.Seconds()
+	var speedStr string
+	if bytesPerSecond >= 1024*1024 {
+		speedStr = fmt.Sprintf("%.2f MB/s", bytesPerSecond/(1024*1024))
+	} else if bytesPerSecond >= 1024 {
+		speedStr = fmt.Sprintf("%.2f KB/s", bytesPerSecond/1024)
+	} else {
+		speedStr = fmt.Sprintf("%.2f B/s", bytesPerSecond)
+	}
+
+	logger.Debug("Download completed in %s (avg. %s)", durationStr, speedStr)
+
+	return nil
+}
+
+// combineChunkFiles combines all chunk files into a single destination file
+func combineChunkFiles(chunks []ChunkInfo, tempFilePath string, expectedSize int64) error {
+	logger.Debug("Combining %d chunk files into %s", len(chunks), tempFilePath)
+
+	// Create the destination file
+	dstFile, err := os.OpenFile(tempFilePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %v", err)
+	}
+	defer dstFile.Close()
+
+	// Pre-allocate the file to the required size
+	err = dstFile.Truncate(expectedSize)
+	if err != nil {
+		return fmt.Errorf("failed to pre-allocate file: %v", err)
+	}
+
+	var totalCombined int64
+	buffer := make([]byte, 4*1024*1024) // 4MB buffer for combining - optimized for maximum performance
+
+	// Combine chunks in order
+	for _, chunk := range chunks {
+		logger.Debug("Combining chunk %d from file %s", chunk.Index, chunk.TempFile)
+
+		// Open chunk file
+		chunkFile, err := os.Open(chunk.TempFile)
+		if err != nil {
+			return fmt.Errorf("failed to open chunk file %s: %v", chunk.TempFile, err)
+		}
+
+		// Get chunk file size
+		chunkInfo, err := chunkFile.Stat()
+		if err != nil {
+			chunkFile.Close()
+			return fmt.Errorf("failed to stat chunk file %s: %v", chunk.TempFile, err)
+		}
+
+		expectedChunkSize := chunk.EndOffset - chunk.StartOffset
+		if chunkInfo.Size() != expectedChunkSize {
+			chunkFile.Close()
+			return fmt.Errorf("chunk %d size mismatch: expected %d bytes, got %d bytes",
+				chunk.Index, expectedChunkSize, chunkInfo.Size())
+		}
+
+		// Copy chunk data to destination file at correct offset
+		_, err = dstFile.Seek(chunk.StartOffset, io.SeekStart)
+		if err != nil {
+			chunkFile.Close()
+			return fmt.Errorf("failed to seek to offset %d: %v", chunk.StartOffset, err)
+		}
+
+		// Copy data in chunks
+		var chunkBytesCopied int64
+		for {
+			n, readErr := chunkFile.Read(buffer)
+			if readErr != nil && readErr != io.EOF {
+				chunkFile.Close()
+				return fmt.Errorf("failed to read from chunk file %s: %v", chunk.TempFile, readErr)
+			}
+
+			if n == 0 {
+				break
+			}
+
+			written, writeErr := dstFile.Write(buffer[:n])
+			if writeErr != nil {
+				chunkFile.Close()
+				return fmt.Errorf("failed to write chunk data: %v", writeErr)
+			}
+
+			if written != n {
+				chunkFile.Close()
+				return fmt.Errorf("partial write: wrote %d of %d bytes", written, n)
+			}
+
+			chunkBytesCopied += int64(written)
+		}
+
+		chunkFile.Close()
+		totalCombined += chunkBytesCopied
+
+		logger.Debug("Combined chunk %d: %d bytes", chunk.Index, chunkBytesCopied)
+	}
+
+	// Verify total size
+	if totalCombined != expectedSize {
+		return fmt.Errorf("combined file size mismatch: expected %d bytes, got %d bytes", expectedSize, totalCombined)
+	}
+
+	// Sync to disk
+	err = dstFile.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync combined file: %v", err)
+	}
+
+	logger.Debug("Successfully combined all chunks: %d bytes total", totalCombined)
+	return nil
+}
+
+// Get a list of chunks that failed to download
+func getFailedChunks(chunks []ChunkInfo) []ChunkInfo {
+	var failedChunks []ChunkInfo
+	for _, chunk := range chunks {
+		if chunk.Error != nil {
+			failedChunks = append(failedChunks, chunk)
+		}
+	}
+	return failedChunks
+}
+
+// Download chunks in parallel with independent connections to separate files
+func downloadChunks(_awsClient *ssh.Client, remotePath, _localPath string, fileSize int64, chunks []ChunkInfo, _numChunks int, originalChunkCount int, connParams *ConnectionParams) error {
+	// Explicitly mark unused parameters to silence linter warnings
+	_ = _awsClient // Not used - function creates independent SSH connections for each chunk
+	_ = _localPath // Not used - function uses chunk.TempFile paths
+	_ = _numChunks // Not used - function uses len(chunks)
+
+	// Initialize progress display
+	fmt.Printf("⠋ Downloading %s [0%%]", filepath.Base(remotePath))
+
+	// Set up variables for tracking progress
+	var totalBytesRead int64
+	var wg sync.WaitGroup
+
+	// Set up progress animation timer
+	progressTicker := time.NewTicker(200 * time.Millisecond)
+	animIndex := 0
+	animations := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+	// Start a goroutine to update the animation regularly
+	stopAnimation := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-progressTicker.C:
+				// Read the current bytes read using atomic operation
+				currentBytesRead := atomic.LoadInt64(&totalBytesRead)
+
+				// Handle potential zero fileSize to avoid division by zero
+				var percent int
+				if fileSize > 0 {
+					percent = int(float64(currentBytesRead) / float64(fileSize) * 100)
+				} else {
+					percent = 0
+				}
+
+				// Cap percent at 100
+				if percent > 100 {
+					percent = 100
+				}
+
+				animIndex = (animIndex + 1) % len(animations)
+
+				// Show bytes downloaded as well as percentage
+				fmt.Printf("\r\033[K%s Downloading %s [%d%%] %.2f/%.2f MB",
+					animations[animIndex],
+					filepath.Base(remotePath),
+					percent,
+					float64(currentBytesRead)/(1024*1024),
+					float64(fileSize)/(1024*1024))
+			case <-stopAnimation:
+				progressTicker.Stop()
+				return
+			}
+		}
+	}()
+
+	// Ensure the animation is stopped when we exit this function
+	defer func() {
+		select {
+		case <-stopAnimation:
+			// Channel already closed
+		default:
+			close(stopAnimation)
+		}
+		// Print final progress and newline
+		finalBytesRead := atomic.LoadInt64(&totalBytesRead)
+		fmt.Printf("\r\033[K⠿ Downloading %s [100%%] %.2f/%.2f MB - Complete\n",
+			filepath.Base(remotePath),
+			float64(finalBytesRead)/(1024*1024),
+			float64(fileSize)/(1024*1024))
+	}()
+
+	// For debugging, log chunk sizes
+	logger.Debug("Downloading %d chunks to separate files:", len(chunks))
+	for i, chunk := range chunks {
+		chunkSize := chunk.EndOffset - chunk.StartOffset
+		logger.Debug("Chunk %d: %.2f MB (bytes %d to %d) -> %s",
+			i,
+			float64(chunkSize)/(1024*1024),
+			chunk.StartOffset,
+			chunk.EndOffset,
+			chunk.TempFile)
+	}
+
+	// Determine if this is a retry operation
+	isRetryOperation := len(chunks) < originalChunkCount
+	logger.Debug("This is a retry operation: %v (chunks: %d, original: %d)",
+		isRetryOperation, len(chunks), originalChunkCount)
+
+	// Start parallel downloads
+	for i := range chunks {
+		wg.Add(1)
+
+		go func(chunk *ChunkInfo) {
+			defer wg.Done()
+
+			// Skip if this chunk has no data
+			if chunk.StartOffset >= fileSize {
+				logger.Debug("Skipping chunk %d (beyond file size)", chunk.Index)
+				return
+			}
+
+			// For retry operations only: skip chunks that have already been downloaded successfully
+			if isRetryOperation {
+				if _, err := os.Stat(chunk.TempFile); err == nil {
+					// Check if existing chunk file has correct size
+					chunkFileInfo, err := os.Stat(chunk.TempFile)
+					if err == nil {
+						expectedSize := chunk.EndOffset - chunk.StartOffset
+						if chunkFileInfo.Size() == expectedSize {
+							logger.Debug("Skipping chunk %d (already downloaded successfully)", chunk.Index)
+							return
+						}
+					}
+				}
+			}
+
+			// Reset error for retry
+			chunk.Error = nil
+
+			// Debug: log when a chunk starts downloading
+			logger.Debug("Starting chunk %d (%.2f MB) -> %s...",
+				chunk.Index,
+				float64(chunk.EndOffset-chunk.StartOffset)/(1024*1024),
+				chunk.TempFile)
+
+			// Add a small delay between chunk connections to prevent overwhelming the SSH server
+			time.Sleep(time.Duration(chunk.Index) * 100 * time.Millisecond)
+
+			// Create an independent SSH connection for this chunk (quiet mode)
+			logger.Debug("Creating independent SSH connection for chunk %d...", chunk.Index)
+			chunkSSHClient, err := sshConnectAWSViaBastionWithLogging(connParams.BastionClient, connParams.AWSHost, connParams.KeyPath, connParams.PreferredUsername, false)
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to create independent SSH connection: %v", chunk.Index, err)
+				return
+			}
+			defer chunkSSHClient.Close()
+
+			// Create optimized SFTP client for this independent connection
+			chunkClient, err := sftp.NewClient(chunkSSHClient,
+				sftp.MaxPacket(32*1024), // 32KB packet size - compatible with most servers
+				// Note: Removed concurrent options for maximum compatibility
+			)
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to create SFTP client: %v", chunk.Index, err)
+				return
+			}
+			defer chunkClient.Close()
+
+			// Open the remote file for this chunk
+			chunkFile, err := chunkClient.Open(remotePath)
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to open file: %v", chunk.Index, err)
+				return
+			}
+			defer chunkFile.Close()
+
+			// Seek to the start position
+			_, err = chunkFile.Seek(chunk.StartOffset, io.SeekStart)
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to seek in source file: %v", chunk.Index, err)
+				return
+			}
+
+			// Calculate how many bytes to read for this chunk
+			bytesToRead := chunk.EndOffset - chunk.StartOffset
+
+			// Create the chunk temp file
+			chunkTempFile, err := os.OpenFile(chunk.TempFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to create temp file %s: %v", chunk.Index, chunk.TempFile, err)
+				return
+			}
+			defer chunkTempFile.Close()
+
+			// Debug: log bytes to read for this chunk
+			logger.Debug("Chunk %d will read %d bytes (%.2f MB) to %s",
+				chunk.Index,
+				bytesToRead,
+				float64(bytesToRead)/(1024*1024),
+				chunk.TempFile)
+			// Create buffer for reading - optimized for maximum performance
+			buffer := make([]byte, 4*1024*1024) // 4MB buffer for maximum chunk download speed
+			bytesReadTotal := int64(0)
+
+			// Read and write chunk data
+			for bytesReadTotal < bytesToRead {
+				readSize := bytesToRead - bytesReadTotal
+				if readSize > int64(len(buffer)) {
+					readSize = int64(len(buffer))
+				}
+
+				n, err := chunkFile.Read(buffer[:readSize])
+				if err != nil && err != io.EOF {
+					chunk.Error = fmt.Errorf("chunk %d: read error: %v", chunk.Index, err)
+					return
+				}
+
+				if n == 0 {
+					// Hit EOF
+					if bytesReadTotal < bytesToRead {
+						chunk.Error = fmt.Errorf("chunk %d: unexpected EOF after reading %d of %d bytes",
+							chunk.Index, bytesReadTotal, bytesToRead)
+						logger.Warn("Chunk %d hit unexpected EOF! Only read %d of %d bytes",
+							chunk.Index, bytesReadTotal, bytesToRead)
+					}
+					break
+				}
+
+				// Write to chunk temp file
+				written, err := chunkTempFile.Write(buffer[:n])
+				if err != nil {
+					chunk.Error = fmt.Errorf("chunk %d: write error to temp file: %v", chunk.Index, err)
+					return
+				}
+
+				if written != n {
+					chunk.Error = fmt.Errorf("chunk %d: partial write to temp file: wrote %d of %d bytes", chunk.Index, written, n)
+					return
+				}
+
+				bytesReadTotal += int64(n)
+
+				// Update global progress in real-time
+				atomic.AddInt64(&totalBytesRead, int64(n))
+
+				// Debug output for large chunks
+				if bytesToRead > 10*1024*1024 && bytesReadTotal%(5*1024*1024) < int64(n) {
+					logger.Debug("Chunk %d: read progress %d/%d bytes (%.1f%%)",
+						chunk.Index, bytesReadTotal, bytesToRead,
+						float64(bytesReadTotal)/float64(bytesToRead)*100)
+				}
+			}
+
+			// Check if we read all expected bytes
+			if bytesReadTotal != bytesToRead {
+				chunk.Error = fmt.Errorf("chunk %d: incomplete read: expected %d bytes, got %d bytes",
+					chunk.Index, bytesToRead, bytesReadTotal)
+				return
+			}
+
+			// Sync chunk file to disk
+			err = chunkTempFile.Sync()
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to sync temp file: %v", chunk.Index, err)
+				return
+			}
+
+			// Verify chunk file size
+			chunkFileInfo, err := chunkTempFile.Stat()
+			if err != nil {
+				chunk.Error = fmt.Errorf("chunk %d: failed to stat temp file: %v", chunk.Index, err)
+				return
+			}
+
+			if chunkFileInfo.Size() != bytesToRead {
+				chunk.Error = fmt.Errorf("chunk %d: temp file size mismatch: expected %d bytes, got %d bytes",
+					chunk.Index, bytesToRead, chunkFileInfo.Size())
+				return
+			}
+
+			// Debug: log when a chunk completes
+			logger.Debug("Completed chunk %d: wrote %d bytes to %s",
+				chunk.Index, bytesReadTotal, chunk.TempFile)
+		}(&chunks[i])
+	}
+
+	// Wait for all downloads to complete
+	wg.Wait()
+
+	// Check for errors
+	failedChunks := getFailedChunks(chunks)
+	if len(failedChunks) > 0 {
+		// Prepare a detailed error message
+		errorMsg := fmt.Sprintf("%d of %d chunks failed to download:\n", len(failedChunks), len(chunks))
+		for _, chunk := range failedChunks {
+			bytesInChunk := chunk.EndOffset - chunk.StartOffset
+			errorMsg += fmt.Sprintf("  - %v (Chunk size: %.2f MB, Range: %d-%d, Temp file: %s)\n",
+				chunk.Error,
+				float64(bytesInChunk)/(1024*1024),
+				chunk.StartOffset,
+				chunk.EndOffset,
+				chunk.TempFile)
+		}
+		return errors.New(errorMsg)
+	}
+
+	// Verify all chunk files exist and have correct sizes
+	for _, chunk := range chunks {
+		chunkFileInfo, err := os.Stat(chunk.TempFile)
+		if err != nil {
+			return fmt.Errorf("chunk %d temp file missing: %v", chunk.Index, err)
+		}
+
+		expectedSize := chunk.EndOffset - chunk.StartOffset
+		if chunkFileInfo.Size() != expectedSize {
+			return fmt.Errorf("chunk %d temp file size mismatch: expected %d bytes, got %d bytes",
+				chunk.Index, expectedSize, chunkFileInfo.Size())
+		}
+
+		logger.Debug("Verified chunk %d temp file: %s (%d bytes)",
+			chunk.Index, chunk.TempFile, chunkFileInfo.Size())
+	}
+
+	logger.Debug("All %d chunks downloaded successfully to separate temp files", len(chunks))
+	return nil
+}
+
+// Simple single-threaded download for small files
+func downloadFileSimple(sftpClient *sftp.Client, remotePath, localPath string, fileSize int64) error {
+	// Record start time
+	startTime := time.Now()
+
+	// Open source file
+	srcFile, err := sftpClient.Open(remotePath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+	// Generate temporary file path
+	tempFilePath := localPath + ".part"
+
+	// Remove any existing temp file
+	if _, err := os.Stat(tempFilePath); err == nil {
+		os.Remove(tempFilePath)
+		logger.Debug("Removed existing temporary file: %s", tempFilePath)
+	}
+
+	// Create destination file with explicit permissions
+	dstFile, err := os.OpenFile(tempFilePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	// Pre-allocate file space for better performance (if file size is known)
+	if fileSize > 0 {
+		if err := dstFile.Truncate(fileSize); err != nil {
+			logger.Debug("Failed to pre-allocate file space: %v", err)
+		}
+	}
+
+	defer func() {
+		dstFile.Close()
+		// Only remove the temp file if there was an error and we didn't rename it
+		if _, err := os.Stat(tempFilePath); err == nil {
+			os.Remove(tempFilePath)
+		}
+	}()
+
+	// Print details about the file we're creating
+	logger.Debug("Created temporary file for simple download: %s", tempFilePath)
+
+	// Print file size information
+	logger.Debug("File size: %d bytes (%.2f MB)", fileSize, float64(fileSize)/(1024*1024))
+
+	// Create buffer for copying - optimized for maximum performance
+	buffer := make([]byte, 4*1024*1024) // 4MB buffer for maximum download speed
+	totalRead := int64(0)
+
+	// Set up progress animation timer - optimized frequency
+	progressTicker := time.NewTicker(150 * time.Millisecond) // Reduced from 200ms for smoother animation
+	animIndex := 0
+	animations := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+	// Initialize progress display
+	fmt.Printf("%s Downloading %s [0%%]", animations[animIndex], filepath.Base(remotePath))
+
+	// Start a goroutine to update the animation regularly
+	stopAnimation := make(chan bool)
+	var progressMutex sync.Mutex
+
+	go func() {
+		for {
+			select {
+			case <-progressTicker.C:
+				progressMutex.Lock()
+				// Handle potential zero fileSize to avoid division by zero
+				var percent int
+				if fileSize > 0 {
+					percent = int(float64(totalRead) / float64(fileSize) * 100)
+				} else {
+					// If fileSize is zero or negative, just show downloaded bytes
+					percent = 0
+				}
+
+				// Cap percent at 100
+				if percent > 100 {
+					percent = 100
+				}
+
+				animIndex = (animIndex + 1) % len(animations)
+
+				// Show bytes downloaded as well as percentage
+				fmt.Printf("\r\033[K%s Downloading %s [%d%%] %.2f/%.2f MB",
+					animations[animIndex],
+					filepath.Base(remotePath),
+					percent,
+					float64(totalRead)/(1024*1024),
+					float64(fileSize)/(1024*1024))
+				progressMutex.Unlock()
+			case <-stopAnimation:
+				progressTicker.Stop()
+				return
+			}
+		}
+	}()
+
+	// Ensure the animation is stopped when we exit this function
+	defer func() {
+		select {
+		case <-stopAnimation:
+			// Channel already closed
+		default:
+			close(stopAnimation)
+		}
+		// Print final progress and newline
+		fmt.Printf("\r\033[K⠿ Downloading %s [100%%] %.2f/%.2f MB - Complete\n",
+			filepath.Base(remotePath),
+			float64(totalRead)/(1024*1024),
+			float64(fileSize)/(1024*1024))
+	}()
+
+	for {
+		n, err := srcFile.Read(buffer)
+		if err != nil && err != io.EOF {
+			return err
+		}
+
+		if n == 0 {
+			break
+		}
+
+		// Write to destination file
+		bytesWritten, err := dstFile.Write(buffer[:n])
+		if err != nil {
+			return fmt.Errorf("write error: %v", err)
+		}
+
+		// Verify all bytes were written
+		if bytesWritten != n {
+			return fmt.Errorf("partial write error: wrote %d of %d bytes", bytesWritten, n)
+		}
+
+		// Update progress - no need to print it here, the animation goroutine handles that
+		progressMutex.Lock()
+		totalRead += int64(n)
+		progressMutex.Unlock()
+	}
+
+	// Verify total bytes read matches file size
+	if totalRead != fileSize {
+		return fmt.Errorf("incomplete download: expected %d bytes, got %d bytes", fileSize, totalRead)
+	}
+
+	// Sync file to ensure all data is written to disk
+	err = dstFile.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync file to disk: %v", err)
+	}
+	// Close the file before verifying
+	dstFile.Close()
+
+	// Verify the file on disk
+	fileInfo, err := os.Stat(tempFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to verify file on disk: %v", err)
+	}
+
+	if fileInfo.Size() != fileSize {
+		return fmt.Errorf("file size mismatch: expected %d bytes, got %d bytes", fileSize, fileInfo.Size())
+	}
+
+	// Double-check file is not empty when it shouldn't be
+	if fileSize > 0 && fileInfo.Size() == 0 {
+		return fmt.Errorf("file appears to be empty but should contain %d bytes", fileSize)
+	}
+
+	// Move the temp file to the final destination
+	err = os.Rename(tempFilePath, localPath)
+	if err != nil {
+		return fmt.Errorf("failed to rename temporary file: %v", err)
+	}
+
+	// Add diagnostic information about the downloaded file (only in debug mode)
+	logger.Debug("Diagnostic information:")
+	logger.Debug("- File path: %s", localPath)
+	logger.Debug("- Expected size: %d bytes (%.2f MB)", fileSize, float64(fileSize)/(1024*1024))
+
+	// Check if the final file exists and get its size
+	if finalFile, err := os.Stat(localPath); err == nil {
+		actualSize := finalFile.Size()
+		logger.Debug("- Actual size: %d bytes (%.2f MB)", actualSize, float64(actualSize)/(1024*1024))
+
+		if actualSize == 0 {
+			logger.Warn("⚠️ WARNING: File is empty! This indicates a download problem.")
+		} else if actualSize != fileSize {
+			logger.Warn("⚠️ WARNING: File size mismatch! Expected %d bytes but got %d bytes.", fileSize, actualSize)
+		} else {
+			logger.Debug("✅ File size verification passed.")
+		}
+	} else {
+		logger.Error("❌ ERROR: Could not stat final file: %v", err)
+	}
+
+	// As a final safety check, try to read some content from the beginning of the file
+	// This is to ensure the file actually has data and is not empty
+	if fileSize > 0 {
+		logger.Debug("Verifying file has content by reading the first few bytes...")
+		file, err := os.Open(localPath)
+		if err != nil {
+			logger.Warn("⚠️ WARNING: Failed to open file for content verification: %v", err)
+		} else {
+			defer file.Close()
+
+			// Read first 100 bytes or less
+			readSize := int64(100)
+			if fileSize < readSize {
+				readSize = fileSize
+			}
+
+			buf := make([]byte, readSize)
+			n, err := file.Read(buf)
+
+			if err != nil {
+				logger.Warn("⚠️ WARNING: Failed to read data from file: %v", err)
+			} else if n == 0 {
+				logger.Warn("⚠️ WARNING: File appears to be empty! Read 0 bytes.")
+			} else {
+				logger.Debug("✅ Verified file has content: Read %d bytes\n", n)
+
+				// For binary files, just print length; for text files, print a snippet
+				if readSize <= 20 {
+					logger.Debug("First %d bytes: %v\n", n, buf[:n])
+				} else {
+					logger.Debug("First 20 bytes: %v\n", buf[:20])
+				}
+			}
+		}
+	}
+
+	// Perform final verification of the file contents
+	if err := performFinalVerification(localPath, fileSize); err != nil {
+		return err
+	}
+
+	// Calculate and display download time
+	downloadDuration := time.Since(startTime)
+
+	// Format the duration in a human-readable way
+	var durationStr string
+	if downloadDuration.Hours() >= 1 {
+		durationStr = fmt.Sprintf("%.1f hours", downloadDuration.Hours())
+	} else if downloadDuration.Minutes() >= 1 {
+		durationStr = fmt.Sprintf("%.1f minutes", downloadDuration.Minutes())
+	} else {
+		durationStr = fmt.Sprintf("%.1f seconds", downloadDuration.Seconds())
+	}
+
+	// Display time taken with download speed
+	bytesPerSecond := float64(fileSize) / downloadDuration.Seconds()
+	var speedStr string
+	if bytesPerSecond >= 1024*1024 {
+		speedStr = fmt.Sprintf("%.2f MB/s", bytesPerSecond/(1024*1024))
+	} else if bytesPerSecond >= 1024 {
+		speedStr = fmt.Sprintf("%.2f KB/s", bytesPerSecond/1024)
+	} else {
+		speedStr = fmt.Sprintf("%.2f B/s", bytesPerSecond)
+	}
+
+	logger.Debug("Download completed in %s (avg. %s)", durationStr, speedStr)
+
+	return nil
+}
+
+// performFinalVerification does a thorough check of the downloaded file to ensure it has proper content
+func performFinalVerification(filePath string, expectedSize int64) error {
+	logger.Debug("Verifying %s...", filepath.Base(filePath))
+
+	// Try to open and read the file
+	verifyFile, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot open file for verification: %v", err)
+	}
+	defer verifyFile.Close()
+
+	// Check file size
+	stat, err := verifyFile.Stat()
+	if err != nil {
+		return fmt.Errorf("cannot stat file during verification: %v", err)
+	}
+
+	actualSize := stat.Size()
+	logger.Debug("- File size: %d bytes (%.2f MB)", actualSize, float64(actualSize)/(1024*1024))
+
+	if actualSize != expectedSize {
+		return fmt.Errorf("file size mismatch during verification: expected %d bytes, got %d bytes",
+			expectedSize, actualSize)
+	}
+	logger.Debug("✅ Size check passed")
+
+	// Skip content checks for very small files (likely empty)
+	// This is done by reading a larger sample from various parts of the file
+	zeroCheckPositions := []struct {
+		position int64
+		label    string
+	}{
+		{0, "start"},
+	}
+
+	// Add more positions for larger files
+	if actualSize > 1024*1024 { // For files > 1MB
+		zeroCheckPositions = append(zeroCheckPositions,
+			struct {
+				position int64
+				label    string
+			}{actualSize / 4, "25%"},
+			struct {
+				position int64
+				label    string
+			}{actualSize / 2, "50%"},
+			struct {
+				position int64
+				label    string
+			}{actualSize * 3 / 4, "75%"},
+			struct {
+				position int64
+				label    string
+			}{actualSize - 4096, "end"})
+	} else if actualSize > 4096 {
+		// For smaller files, just check start, middle, end
+		zeroCheckPositions = append(zeroCheckPositions,
+			struct {
+				position int64
+				label    string
+			}{actualSize / 2, "middle"},
+			struct {
+				position int64
+				label    string
+			}{actualSize - 1024, "end"})
+	}
+
+	// Check each position
+	suspiciousPositions := 0
+	for _, posInfo := range zeroCheckPositions {
+		// Make sure position is valid
+		if posInfo.position < 0 {
+			posInfo.position = 0
+		}
+		if posInfo.position >= actualSize {
+			posInfo.position = actualSize - 1
+		}
+
+		// Read sample
+		sampleSize := int64(4096)
+		if posInfo.position+sampleSize > actualSize {
+			sampleSize = actualSize - posInfo.position
+		}
+
+		sample := make([]byte, sampleSize)
+		_, err = verifyFile.ReadAt(sample, posInfo.position)
+		if err != nil && err != io.EOF {
+			logger.Debug("⚠️ Warning: Failed to read sample at %s position: %v", posInfo.label, err)
+			continue
+		}
+
+		// Count non-zero bytes
+		nonZeroCount := 0
+		for _, b := range sample {
+			if b != 0 {
+				nonZeroCount++
+			}
+		}
+
+		zeroPercentage := 100.0 - (float64(nonZeroCount) / float64(len(sample)) * 100.0)
+		logger.Debug("- %s position: %.1f%% zero bytes", posInfo.label, zeroPercentage)
+
+		if zeroPercentage > 95 {
+			suspiciousPositions++
+			logger.Debug("⚠️ WARNING: File appears to be mostly zeros at %s position (%.1f%% zeros)",
+				posInfo.label, zeroPercentage)
+		}
+	}
+
+	// If multiple positions have suspicious content, treat as an error
+	if suspiciousPositions > 0 && suspiciousPositions == len(zeroCheckPositions) {
+		return fmt.Errorf("file verification failed: content appears to be empty at all checked positions")
+	}
+
+	logger.Debug("✅ Content validation passed")
+	return nil
+}
+
+// collectGeneralInfo executes general system information commands and saves outputs to files on the remote server
+func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
+	Enabled   bool                 `yaml:"enabled"`
+	OutputDir string               `yaml:"outputDir"`
+	Commands  []GeneralInfoCommand `yaml:"commands"`
+}, environment, username, tempDir, finalLogFileName string) error {
+	if !generalInfoConfig.Enabled || len(generalInfoConfig.Commands) == 0 {
+		logger.Debug("General info collection is disabled or no commands configured")
+		return nil
+	}
+
+	logger.Info("🔍 Starting general system information collection...")
+
+	// Create the general info directory on the remote server inside the log collection directory
+	logDir := fmt.Sprintf("%s/%s", tempDir, finalLogFileName)
+	generalOutputDir := fmt.Sprintf("%s/%s", logDir, generalInfoConfig.OutputDir)
+
+	logger.Debug("TempDir: %s", tempDir)
+	logger.Debug("FinalLogFileName: %s", finalLogFileName)
+	logger.Debug("LogDir: %s", logDir)
+	logger.Debug("GeneralOutputDir: %s", generalOutputDir)
+
+	// Create the general info directory on remote server
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for general info directory: %v", err)
+	}
+	defer session.Close()
+
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", generalOutputDir)
+	if err := executeCommandAsRoot(session, mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create general info directory %s on remote server: %v", generalOutputDir, err)
+	}
+
+	logger.Info("📁 Created general info directory on remote server: %s", generalOutputDir)
+
+	// Add timestamp to filenames if desired
+	timestamp := time.Now().Format("20060102_150405")
+
+	successCount := 0
+	totalCommands := len(generalInfoConfig.Commands)
+
+	for i, cmd := range generalInfoConfig.Commands {
+		logger.Info("Executing command %d/%d: %s", i+1, totalCommands, cmd.Name)
+
+		// Apply template replacement to the command
+		command := cmd.Command
+		command = strings.ReplaceAll(command, "{environment}", environment)
+		command = strings.ReplaceAll(command, "{username}", username)
+
+		// Create session for this command
+		cmdSession, err := awsClient.NewSession()
+		if err != nil {
+			logger.Error("Failed to create session for command '%s': %v", cmd.Name, err)
+			continue
+		}
+
+		// Execute the command as root
+		logger.Debug("Executing: %s", command)
+		output, err := cmdSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", command))
+		cmdSession.Close()
+
+		if err != nil {
+			logger.Warn("⚠️ Command '%s' failed: %v", cmd.Name, err)
+			// Still save the output (might contain partial results or error info)
+		}
+
+		// Create filename from command name (sanitize for filesystem)
+		filename := sanitizeFilename(cmd.Name) + "_" + timestamp + ".txt"
+		filePath := fmt.Sprintf("%s/%s", generalOutputDir, filename)
+
+		// Prepare file content with metadata
+		fileContent := "# General System Information\n"
+		fileContent += fmt.Sprintf("# Command: %s\n", cmd.Command)
+		fileContent += fmt.Sprintf("# Description: %s\n", cmd.Description)
+		fileContent += fmt.Sprintf("# Executed on: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+		fileContent += fmt.Sprintf("# Environment: %s\n", environment)
+		fileContent += fmt.Sprintf("# Status: %s\n", func() string {
+			if err != nil {
+				return "Failed"
+			}
+			return "Success"
+		}())
+		fileContent += fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60))
+
+		if err != nil {
+			fileContent += fmt.Sprintf("ERROR: %v\n\n", err)
+		}
+
+		fileContent += string(output)
+
+		// Write to file on remote server using a new session
+		writeSession, writeErr := awsClient.NewSession()
+		if writeErr != nil {
+			logger.Error("❌ Failed to create session for writing file %s: %v", filename, writeErr)
+			continue
+		}
+
+		// Use cat to write the content to the remote file
+		writeCmd := fmt.Sprintf("cat > %s << 'EOF'\n%sEOF", filePath, fileContent)
+		if writeErr := executeCommandAsRoot(writeSession, writeCmd); writeErr != nil {
+			logger.Error("❌ Failed to write file %s on remote server: %v", filename, writeErr)
+			writeSession.Close()
+			continue
+		}
+		writeSession.Close()
+
+		// Verify file was created and get its size
+		verifySession, verifyErr := awsClient.NewSession()
+		if verifyErr == nil {
+			sizeCmd := fmt.Sprintf("ls -la %s 2>/dev/null | awk '{print $5}' || echo '0'", filePath)
+			if sizeOutput, sizeErr := verifySession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", sizeCmd)); sizeErr == nil {
+				fileSize := strings.TrimSpace(string(sizeOutput))
+				if err != nil {
+					logger.Warn("⚠️ Saved %s (%s bytes) on remote server - command failed but output captured", filename, fileSize)
+				} else {
+					logger.Debug("✅ Saved %s (%s bytes) on remote server", filename, fileSize)
+					successCount++
+				}
+			} else {
+				if err == nil {
+					successCount++
+				}
+				logger.Debug("✅ Saved %s on remote server", filename)
+			}
+			verifySession.Close()
+		} else {
+			if err == nil {
+				successCount++
+			}
+			logger.Debug("✅ Saved %s on remote server", filename)
+		}
+	}
+
+	logger.Info("📋 General info collection completed: %d/%d commands successful", successCount, totalCommands)
+	logger.Info("📁 General info files saved to remote directory: %s", generalOutputDir)
+
+	return nil
+}
+
+// sanitizeFilename removes or replaces characters that are not suitable for filenames
+func sanitizeFilename(name string) string {
+	// Replace spaces and other problematic characters
+	filename := strings.ReplaceAll(name, " ", "_")
+	filename = strings.ReplaceAll(filename, "/", "_")
+	filename = strings.ReplaceAll(filename, "\\", "_")
+	filename = strings.ReplaceAll(filename, ":", "_")
+	filename = strings.ReplaceAll(filename, "*", "_")
+	filename = strings.ReplaceAll(filename, "?", "_")
+	filename = strings.ReplaceAll(filename, "\"", "_")
+	filename = strings.ReplaceAll(filename, "<", "_")
+	filename = strings.ReplaceAll(filename, ">", "_")
+	filename = strings.ReplaceAll(filename, "|", "_")
+
+	// Remove any double underscores and trim
+	for strings.Contains(filename, "__") {
+		filename = strings.ReplaceAll(filename, "__", "_")
+	}
+	filename = strings.Trim(filename, "_")
+
+	// Ensure filename is not empty
+	if filename == "" {
+		filename = "unnamed_command"
+	}
+
+	return filename
+}
+
+// collectAppVersionsStandalone collects application version information and saves it locally
+func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
+	if !config.AppVersionCollection.Enabled {
+		logger.Info("App version collection is disabled in config")
+		return nil
+	}
+
+	logger.Info("📱 Starting standalone application version collection...")
+
+	// First, let's check what namespaces are available
+	logger.Info("🔍 Checking available namespaces...")
+	nsSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for namespace check: %v", err)
+	}
+	nsCmd := "kubectl get namespaces --no-headers | awk '{print \\$1}'"
+	nsOutput, err := nsSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", nsCmd))
+	nsSession.Close()
+
+	if err != nil {
+		logger.Warn("⚠️ Failed to get namespaces: %v", err)
+		logger.Debug("Namespace command output: %s", string(nsOutput))
+	} else {
+		availableNamespaces := strings.Split(strings.TrimSpace(string(nsOutput)), "\n")
+		logger.Info("📋 Available namespaces: %v", availableNamespaces)
+	}
+
+	// Apply template replacement to output filename
+	outputFileName := config.AppVersionCollection.OutputFileName
+	outputFileName = strings.ReplaceAll(outputFileName, "{environment}", config.Environment)
+	outputFileName = strings.ReplaceAll(outputFileName, "{username}", config.Username)
+
+	// Use the output directory from logs config or current directory
+	outputDir := config.Logs.OutputDir
+	if outputDir == "" {
+		outputDir = "."
+	}
+
+	// Create local output file path
+	localFilePath := filepath.Join(outputDir, outputFileName)
+
+	logger.Info("📁 Output file will be saved to: %s", localFilePath)
+
+	// Prepare the header content like the format in the user request
+	timestamp := time.Now().Format("Mon Jan 2 15:04:05 MST 2006")
+	envName := strings.ToUpper(config.Environment)
+	content := fmt.Sprintf("### %s Cloud testbed ###\n\n", envName)
+	content += fmt.Sprintf("Date and Time: %s\n\n", timestamp)
+	content += fmt.Sprintf("### %s RDC components versions ###\n", envName)
+	content += "+----------------+---------------------------------------------------+---------------------+\n"
+	content += "|  Namespace     |  Pod                                              |  Version            |\n"
+	content += "+----------------+---------------------------------------------------+---------------------+\n"
+
+	var allVersionInfo []string
+	totalPods := 0
+	successCount := 0
+
+	// Process each namespace
+	for _, ns := range config.AppVersionCollection.Namespaces {
+		// Apply template replacement to namespace
+		namespace := ns.Namespace
+		namespace = strings.ReplaceAll(namespace, "{environment}", config.Environment)
+		namespace = strings.ReplaceAll(namespace, "{username}", config.Username)
+
+		logger.Info("🔍 Checking namespace: %s (%s)", namespace, ns.Description)
+
+		// Process each pod prefix in the namespace
+		for _, podPrefix := range ns.PodPrefixes {
+			// Apply template replacement to pod prefix
+			prefix := podPrefix
+			prefix = strings.ReplaceAll(prefix, "{environment}", config.Environment)
+			prefix = strings.ReplaceAll(prefix, "{username}", config.Username)
+
+			logger.Debug("Looking for pods with prefix: %s in namespace: %s", prefix, namespace)
+
+			// Create a new session for each kubectl command to avoid "Stdout already set" errors
+			session, err := awsClient.NewSession()
+			if err != nil {
+				logger.Warn("⚠️ Failed to create session for namespace %s with prefix %s: %v", namespace, prefix, err)
+				continue
+			}
+
+			// Get pods matching the prefix with timeout for better performance - faster timeout
+			listPodsCmd := fmt.Sprintf("timeout 15 kubectl get pods -n %s --no-headers | grep '^%s' | awk '{print \\$1}'", namespace, prefix)
+			logger.Debug("Executing: sudo su - -c \"%s\"", listPodsCmd)
+			podsOutput, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listPodsCmd))
+			session.Close()
+
+			if err != nil {
+				logger.Warn("⚠️ Failed to list pods in namespace %s with prefix %s: %v", namespace, prefix, err)
+				logger.Debug("Command output: %s", string(podsOutput))
+				continue
+			}
+
+			pods := strings.Split(strings.TrimSpace(string(podsOutput)), "\n")
+			if len(pods) == 1 && pods[0] == "" {
+				logger.Debug("No pods found with prefix %s in namespace %s", prefix, namespace)
+				continue
+			}
+
+			// Only get version info from the first pod of each prefix type (representative)
+			if len(pods) > 0 && pods[0] != "" {
+				podName := strings.TrimSpace(pods[0])
+				logger.Debug("Getting version info for representative pod: %s (found %d total pods with prefix %s)", podName, len(pods), prefix)
+
+				totalPods++
+
+				// Create a new session for each describe command
+				describeSession, err := awsClient.NewSession()
+				if err != nil {
+					logger.Warn("⚠️ Failed to create session for describing pod %s: %v", podName, err)
+					continue
+				}
+
+				// Get image information from pod description using specific grep patterns
+				var describeCmd string
+
+				// Use specific grep patterns based on pod name to extract version information
+				switch {
+				case strings.HasPrefix(podName, "cs-perfmonitor"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*perfmonitor:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "hmweb"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*hm-webapp:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "teconfig"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*task-engine:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "nvo-edge"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*edge:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "nvo-network"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*network:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "cas-api-service"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*cas-api-service:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "cls-api-service"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*cls-api-service:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "cns-api-service"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*cns-api-service:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "cs-configstate"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*configstate:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "cs-metaflow-cacheupdater"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*metaflow-cacheupdater:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "cs-tagging"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*tagging:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				case strings.HasPrefix(podName, "device-connector"):
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image: .*device-connector:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				default:
+					// Fallback to generic image extraction for unknown pod types
+					describeCmd = fmt.Sprintf("kubectl describe pod %s -n %s | grep 'Image:' | head -1 | awk -F':' '{print \\$NF}' | tr -d ' '", podName, namespace)
+				}
+
+				logger.Debug("Using kubectl command: %s", describeCmd)
+				imageOutput, err := describeSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", describeCmd))
+				describeSession.Close()
+
+				var version string
+				if err != nil {
+					logger.Warn("⚠️ Failed to describe pod %s: %v", podName, err)
+					logger.Debug("Command output: %s", string(imageOutput))
+					version = "ERROR"
+				} else {
+					imageInfo := strings.TrimSpace(string(imageOutput))
+					logger.Debug("Raw image output for %s: '%s'", podName, imageInfo)
+					if imageInfo == "" {
+						version = "Unknown"
+					} else {
+						version = imageInfo
+					}
+				}
+
+				// Format the table row
+				versionLine := fmt.Sprintf("|  %-13s |  %-48s |  %-18s |", namespace, podName, version)
+				allVersionInfo = append(allVersionInfo, versionLine)
+				successCount++
+
+				logger.Debug("✅ Retrieved version for %s: %s", podName, version)
+			}
+		}
+	}
+
+	// Add all version info to content
+	for _, line := range allVersionInfo {
+		content += line + "\n"
+	}
+
+	// Close the table
+	content += "+----------------+---------------------------------------------------+---------------------+\n"
+
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory %s: %v", outputDir, err)
+	}
+
+	// Write to local file
+	if err := ioutil.WriteFile(localFilePath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write app versions file %s: %v", localFilePath, err)
+	}
+
+	// Get file info for logging
+	fileInfo, err := os.Stat(localFilePath)
+	var fileSize string
+	if err == nil {
+		fileSize = fmt.Sprintf("%d bytes", fileInfo.Size())
+	} else {
+		fileSize = "unknown size"
+	}
+
+	logger.Info("📱 App versions saved to: %s (%s)", localFilePath, fileSize)
+
+	// Print to log if requested
+	if config.AppVersionCollection.PrintToLog {
+		logger.Info("📱 Application Version Information:")
+		logger.Info("%s", strings.Repeat("=", 80))
+		lines := strings.Split(content, "\n")
+		for _, line := range lines {
+			if line != "" {
+				logger.Info("%s", line)
+			}
+		}
+		logger.Info("%s", strings.Repeat("=", 80))
+	}
+
+	logger.Info("📱 Standalone app version collection completed: %d/%d pods processed successfully", successCount, totalPods)
+	logger.Info("📁 Version information saved locally to: %s", localFilePath)
+
+	return nil
+}
+
+// LogMatch represents a single pattern match in a log file
+type LogMatch struct {
+	File        string   // Log file path
+	LineNumber  int      // Line number where match was found
+	Pattern     string   // The pattern that matched
+	MatchedLine string   // The actual line that matched
+	Context     []string // Context lines around the match
+}
+
+// analyzeLogsForErrors searches through collected log files for configured error patterns
+// and generates a summary file with the findings
+func analyzeLogsForErrors(awsClient *ssh.Client, logDir string, logAnalysisConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	OutputFile    string   `yaml:"outputFile"`
+	ErrorPatterns []string `yaml:"errorPatterns"`
+	MaxMatches    int      `yaml:"maxMatches"`
+	ContextLines  int      `yaml:"contextLines"`
+}) error {
+	if !logAnalysisConfig.Enabled {
+		logger.Debug("Log analysis is disabled, skipping...")
+		return nil
+	}
+
+	if len(logAnalysisConfig.ErrorPatterns) == 0 {
+		logger.Debug("No error patterns configured, skipping log analysis...")
+		return nil
+	}
+
+	logger.Info("🔍 Analyzing collected logs for error patterns...")
+	logger.Debug("Log directory: %s", logDir)
+	logger.Debug("Error patterns: %v", logAnalysisConfig.ErrorPatterns)
+
+	// Create a session to execute commands on AWS
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for log analysis: %v", err)
+	}
+	defer session.Close()
+
+	// Find all log files in the log directory
+	findCmd := fmt.Sprintf("find %s -type f \\( -name '*.log' -o -name '*.txt' -o -name '*.out' \\) 2>/dev/null", logDir)
+	logger.Debug("Finding log files: %s", findCmd)
+
+	output, err := session.CombinedOutput(findCmd)
+	if err != nil {
+		return fmt.Errorf("failed to find log files: %v", err)
+	}
+
+	logFiles := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(logFiles) == 0 || (len(logFiles) == 1 && logFiles[0] == "") {
+		logger.Info("No log files found for analysis")
+		return nil
+	}
+
+	logger.Info("Found %d log files to analyze", len(logFiles))
+
+	// Collect all matches
+	var allMatches []LogMatch
+	totalMatches := 0
+
+	// Process each log file
+	for _, logFile := range logFiles {
+		if strings.TrimSpace(logFile) == "" {
+			continue
+		}
+
+		fileMatches, err := analyzeLogFile(awsClient, logFile, logAnalysisConfig.ErrorPatterns,
+			logAnalysisConfig.MaxMatches, logAnalysisConfig.ContextLines)
+		if err != nil {
+			logger.Warn("Failed to analyze file %s: %v", logFile, err)
+			continue
+		}
+
+		if len(fileMatches) > 0 {
+			logger.Debug("Found %d matches in %s", len(fileMatches), logFile)
+			allMatches = append(allMatches, fileMatches...)
+			totalMatches += len(fileMatches)
+		}
+	}
+
+	// Generate summary file
+	outputPath := fmt.Sprintf("%s/%s", logDir, logAnalysisConfig.OutputFile)
+	err = generateAnalysisSummary(awsClient, outputPath, allMatches, logAnalysisConfig.ErrorPatterns)
+	if err != nil {
+		return fmt.Errorf("failed to generate analysis summary: %v", err)
+	}
+
+	logger.Info("✅ Log analysis completed: %d total matches found across %d files", totalMatches, len(logFiles))
+	logger.Info("📊 Analysis summary saved to: %s", outputPath)
+
+	return nil
+}
+
+// analyzeLogFile searches a single log file for error patterns and returns matches
+func analyzeLogFile(awsClient *ssh.Client, logFilePath string, patterns []string, maxMatches, contextLines int) ([]LogMatch, error) {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	var matches []LogMatch
+	matchCount := 0
+
+	// Build grep command for all patterns (case-insensitive)
+	patternStr := strings.Join(patterns, "\\|")
+	grepCmd := fmt.Sprintf("grep -i -n '%s' '%s' 2>/dev/null || true", patternStr, logFilePath)
+
+	logger.Debug("Searching file %s with command: %s", logFilePath, grepCmd)
+
+	output, err := session.CombinedOutput(grepCmd)
+	if err != nil {
+		// grep returns non-zero when no matches found, which is not an error
+		logger.Debug("grep command failed (no matches?): %v", err)
+		return matches, nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return matches, nil // No matches found
+	}
+
+	// Process each match line
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		if matchCount >= maxMatches {
+			logger.Debug("Reached max matches (%d) for file %s", maxMatches, logFilePath)
+			break
+		}
+
+		// Parse grep output (format: line_number:matched_line)
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		lineNum, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+
+		matchedLine := parts[1]
+
+		// Find which pattern matched
+		matchedPattern := ""
+		lowerLine := strings.ToLower(matchedLine)
+		for _, pattern := range patterns {
+			if strings.Contains(lowerLine, strings.ToLower(pattern)) {
+				matchedPattern = pattern
+				break
+			}
+		}
+
+		// Get context lines if requested
+		var contextLinesArray []string
+		if contextLines > 0 {
+			contextLinesArray, _ = getContextLines(awsClient, logFilePath, lineNum, contextLines)
+		}
+
+		match := LogMatch{
+			File:        logFilePath,
+			LineNumber:  lineNum,
+			Pattern:     matchedPattern,
+			MatchedLine: matchedLine,
+			Context:     contextLinesArray,
+		}
+
+		matches = append(matches, match)
+		matchCount++
+	}
+
+	return matches, nil
+}
+
+// getContextLines retrieves context lines around a specific line number in a file
+func getContextLines(awsClient *ssh.Client, filePath string, lineNum, contextLines int) ([]string, error) {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.Close()
+
+	// Calculate start and end line numbers
+	startLine := lineNum - contextLines
+	if startLine < 1 {
+		startLine = 1
+	}
+	endLine := lineNum + contextLines
+
+	// Use sed to extract the line range
+	sedCmd := fmt.Sprintf("sed -n '%d,%dp' '%s' 2>/dev/null || true", startLine, endLine, filePath)
+
+	output, err := session.CombinedOutput(sedCmd)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	return lines, nil
+}
+
+// generateAnalysisSummary creates a summary file with all the analysis results
+func generateAnalysisSummary(awsClient *ssh.Client, outputPath string, matches []LogMatch, patterns []string) error {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// Build summary content
+	var summaryContent strings.Builder
+
+	// Header
+	summaryContent.WriteString("===============================================================================\n")
+	summaryContent.WriteString("                          LOG ANALYSIS SUMMARY\n")
+	summaryContent.WriteString("===============================================================================\n")
+	summaryContent.WriteString(fmt.Sprintf("Generated: %s\n", time.Now().Format("2006-01-02 15:04:05 UTC")))
+	summaryContent.WriteString(fmt.Sprintf("Total matches found: %d\n", len(matches)))
+	summaryContent.WriteString(fmt.Sprintf("Error patterns searched: %s\n", strings.Join(patterns, ", ")))
+	summaryContent.WriteString("===============================================================================\n\n")
+
+	if len(matches) == 0 {
+		summaryContent.WriteString("🎉 No error patterns found in the analyzed log files.\n")
+		summaryContent.WriteString("This indicates the logs are clean of the specified error conditions.\n\n")
+	} else {
+		// Group matches by file for better organization
+		fileMatches := make(map[string][]LogMatch)
+		for _, match := range matches {
+			fileMatches[match.File] = append(fileMatches[match.File], match)
+		}
+
+		// Pattern summary
+		patternCounts := make(map[string]int)
+		for _, match := range matches {
+			patternCounts[match.Pattern]++
+		}
+
+		summaryContent.WriteString("PATTERN FREQUENCY:\n")
+		summaryContent.WriteString("-----------------\n")
+		for pattern, count := range patternCounts {
+			summaryContent.WriteString(fmt.Sprintf("  %-20s: %d matches\n", pattern, count))
+		}
+		summaryContent.WriteString("\n")
+
+		// Detailed matches by file
+		summaryContent.WriteString("DETAILED MATCHES:\n")
+		summaryContent.WriteString("-----------------\n\n")
+
+		for filePath, fileMatchList := range fileMatches {
+			summaryContent.WriteString(fmt.Sprintf("📁 FILE: %s\n", filePath))
+			summaryContent.WriteString(fmt.Sprintf("   Matches: %d\n", len(fileMatchList)))
+			summaryContent.WriteString("   " + strings.Repeat("-", 70) + "\n")
+
+			for i, match := range fileMatchList {
+				summaryContent.WriteString(fmt.Sprintf("   Match #%d (Line %d, Pattern: '%s'):\n", i+1, match.LineNumber, match.Pattern))
+				summaryContent.WriteString(fmt.Sprintf("   >>> %s\n", match.MatchedLine))
+
+				if len(match.Context) > 0 {
+					summaryContent.WriteString("   Context:\n")
+					for j, contextLine := range match.Context {
+						prefix := "       "
+						if j == len(match.Context)/2 { // Middle line (the match itself)
+							prefix = "   >>> "
+						}
+						summaryContent.WriteString(fmt.Sprintf("%s%s\n", prefix, contextLine))
+					}
+				}
+				summaryContent.WriteString("\n")
+			}
+			summaryContent.WriteString("\n")
+		}
+	}
+
+	summaryContent.WriteString("===============================================================================\n")
+	summaryContent.WriteString("End of Log Analysis Summary\n")
+	summaryContent.WriteString("===============================================================================\n")
+
+	// Write the summary to a file on the AWS server
+	tempFile := fmt.Sprintf("/tmp/log_analysis_summary_%d.txt", time.Now().Unix())
+
+	// Create the summary file content locally first
+	writeCmd := fmt.Sprintf("cat > '%s' << 'EOF'\n%sEOF", tempFile, summaryContent.String())
+
+	err = session.Run(writeCmd)
+	if err != nil {
+		return fmt.Errorf("failed to create summary file: %v", err)
+	}
+
+	// Move the file to the final location
+	moveCmd := fmt.Sprintf("mv '%s' '%s'", tempFile, outputPath)
+
+	session2, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create second session: %v", err)
+	}
+	defer session2.Close()
+
+	err = session2.Run(moveCmd)
+	if err != nil {
+		return fmt.Errorf("failed to move summary file to final location: %v", err)
+	}
+
+	return nil
+}
+
+func main() {
+	// Define command-line flags
+	configFile := flag.String("config", "config.yaml", "Path to configuration file")
+	username := flag.String("user", "", "SSH username for bastion host")
+	password := flag.String("pass", "", "SSH password for bastion host")
+	bastionHost := flag.String("bastion", "", "Bastion host address (e.g., 1.2.3.4)")
+	bastionPort := flag.Int("port", 0, "SSH port for bastion host")
+	keyPath := flag.String("key", "", "Path to SSH key on bastion")
+	awsHost := flag.String("aws", "", "AWS host to connect to")
+	awsUsername := flag.String("awsuser", "", "Username for AWS host")
+	logPattern := flag.String("logs", "", "Log file pattern to search for")
+	outputDir := flag.String("outdir", "", "Local directory to save log files")
+	interactive := flag.Bool("interactive", false, "Run in interactive mode")
+	listOnly := flag.Bool("list", false, "Only list log files")
+
+	// Define flags with default values (will be updated from config)
+	autoRetry := flag.Bool("auto-retry", false, "Automatically retry failed download chunks")
+	numChunks := flag.Int("num-chunks", 3, "Number of chunks for parallel downloads (max 6 for optimal performance and stability)")
+	logLevel := flag.String("log-level", "INFO", "Set log level (DEBUG, INFO, WARN, ERROR)")
+
+	// New flags for log collection
+	collectLogsFlag := flag.Bool("collect-logs", true, "Collect logs from Kubernetes pods before downloading")
+	collectInfo := flag.Bool("collect-info", true, "Collect general system information (requires log collection to be enabled)")
+	logFileName := flag.String("log-name", "", "Name for the log collection (without extension)")
+	userID := flag.String("user-id", "", "User ID for log collection (defaults to bastion username)")
+	timeDuration := flag.String("time-duration", "", "Collect logs from last X time (e.g., '15m', '30m', '1h', '2h'). Use '0' or 'disabled' to force full logs. Leave empty to use config setting")
+
+	// Handle collect-versions flag with proper config hierarchy
+	collectVersionsFlag := flag.Bool("collect-versions", false, "Collect ONLY application version information (standalone mode) - skips log collection")
+
+	flag.Parse()
+
+	// Load configuration from file
+	config, err := LoadConfig(*configFile)
+	if err != nil {
+		logger.Warn("Warning: Failed to load config file: %v", err)
+		config = &Config{} // Use empty config if loading fails
+	}
+
+	// Determine if collect-versions was explicitly set via command line
+	collectVersionsExplicitlySet := false
+	collectLogsExplicitlySet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "collect-versions" {
+			collectVersionsExplicitlySet = true
+		}
+		if f.Name == "collect-logs" {
+			collectLogsExplicitlySet = true
+		}
+	})
+
+	// Apply configuration hierarchy: config.yaml value unless explicitly overridden by command line
+	var collectVersions bool
+	if collectVersionsExplicitlySet {
+		// Command line argument takes precedence
+		collectVersions = *collectVersionsFlag
+	} else {
+		// Use config file value as default
+		collectVersions = config.AppVersionCollection.Enabled
+	}
+
+	var collectLogs bool
+	if collectLogsExplicitlySet {
+		// Command line argument takes precedence
+		collectLogs = *collectLogsFlag
+	} else {
+		// Use config file value as default (with fallback to true if not specified)
+		if config.LogCollection.Enabled {
+			collectLogs = config.LogCollection.Enabled
+		} else {
+			collectLogs = true // Default fallback if not specified in config
+		}
+	}
+
+	// Apply config defaults if flags weren't explicitly set
+	// We check if the flag values are still at their defaults
+	if *autoRetry == false && config.Options.AutoRetry {
+		*autoRetry = config.Options.AutoRetry
+	}
+	if *numChunks == 5 && config.Options.NumChunks > 0 && config.Options.NumChunks != 5 {
+		*numChunks = config.Options.NumChunks
+	}
+	if *logLevel == "INFO" && config.Options.LogLevel != "" && config.Options.LogLevel != "INFO" {
+		*logLevel = config.Options.LogLevel
+	}
+
+	// Merge log collection settings
+	if *logFileName == "" && config.LogCollection.LogFileName != "" {
+		*logFileName = config.LogCollection.LogFileName
+	}
+	if *userID == "" {
+		*userID = config.Username // Use global username as default
+	}
+
+	// Default log collection settings if not specified
+	if collectLogs && *logFileName == "" {
+		*logFileName = "logs_nvo_hac" // Default from shell script
+	}
+	if collectLogs && *userID == "" {
+		*userID = *username // Use bastion username as default
+	}
+
+	// Initialize the global logger with the log level setting
+	logLevelEnum := ParseLogLevel(*logLevel)
+	logger = NewLogger(logLevelEnum)
+
+	// Debug logging for configuration hierarchy (after logger is initialized)
+	if collectVersionsExplicitlySet {
+		logger.Debug("Using command-line value for collect-versions: %v", collectVersions)
+	} else {
+		logger.Debug("Using config file value for collect-versions: %v", collectVersions)
+	}
+
+	if collectLogsExplicitlySet {
+		logger.Debug("Using command-line value for collect-logs: %v", collectLogs)
+	} else {
+		logger.Debug("Using config file value for collect-logs: %v", collectLogs)
+	}
+
+	// Merge command line arguments with config file
+	// Command line arguments take precedence over config file values
+	if *username == "" {
+		*username = config.Username
+	}
+	if *password == "" {
+		*password = config.Bastion.Password
+	}
+	if *bastionHost == "" {
+		*bastionHost = config.Bastion.Host
+	}
+	if *bastionPort == 0 {
+		if config.Bastion.Port != 0 {
+			*bastionPort = config.Bastion.Port
+		} else {
+			*bastionPort = 22 // Default
+		}
+	}
+	if *keyPath == "" {
+		if config.AWS.KeyPath != "" {
+			*keyPath = config.AWS.KeyPath
+		} else {
+			*keyPath = "~/.ssh/id_rsa" // Default
+		}
+	}
+	if *awsHost == "" {
+		// Replace template placeholders in AWS host
+		host := config.AWS.Host
+		host = strings.ReplaceAll(host, "{username}", config.Username)
+		host = strings.ReplaceAll(host, "{environment}", config.Environment)
+		*awsHost = host
+	}
+	if *awsUsername == "" {
+		*awsUsername = config.Username
+	}
+	if *logPattern == "" {
+		if config.Logs.Pattern != "" {
+
+			// Replace template placeholders with actual values
+			pattern := config.Logs.Pattern
+			pattern = strings.ReplaceAll(pattern, "{username}", config.Username)
+			pattern = strings.ReplaceAll(pattern, "{environment}", config.Environment)
+			*logPattern = pattern
+		} else {
+			*logPattern = "/var/log/*.log /var/log/*.gz" // Default
+		}
+	}
+	if *outputDir == "" {
+		if config.Logs.OutputDir != "" {
+			*outputDir = config.Logs.OutputDir
+		} else {
+			*outputDir = "." // Default to current directory
+		}
+	}
+	// Apply template replacement to tempDir
+	logger.Debug("Original config.LogCollection.TempDir: '%s'", config.LogCollection.TempDir)
+	if config.LogCollection.TempDir != "" {
+		logger.Debug("Before template replacement: TempDir = '%s'", config.LogCollection.TempDir)
+		config.LogCollection.TempDir = strings.ReplaceAll(config.LogCollection.TempDir, "{username}", config.Username)
+		config.LogCollection.TempDir = strings.ReplaceAll(config.LogCollection.TempDir, "{environment}", config.Environment)
+		logger.Debug("After template replacement: TempDir = '%s'", config.LogCollection.TempDir)
+	} else {
+		logger.Debug("TempDir is empty in config")
+	}
+	logger.Debug("Final TempDir value passed to collectKubernetesLogs: '%s'", config.LogCollection.TempDir)
+
+	// Interactive mode prompt for missing info
+	if *interactive {
+		reader := bufio.NewReader(os.Stdin)
+
+		if *username == "" {
+			fmt.Print("Enter bastion username: ")
+			*username, _ = reader.ReadString('\n')
+			*username = strings.TrimSpace(*username)
+		}
+
+		if *password == "" {
+			fmt.Print("Enter bastion password: ")
+			*password, _ = reader.ReadString('\n')
+			*password = strings.TrimSpace(*password)
+		}
+
+		if *bastionHost == "" {
+			fmt.Print("Enter bastion host: ")
+			*bastionHost, _ = reader.ReadString('\n')
+			*bastionHost = strings.TrimSpace(*bastionHost)
+		}
+
+		if *awsHost == "" {
+			fmt.Print("Enter AWS host: ")
+			*awsHost, _ = reader.ReadString('\n')
+			*awsHost = strings.TrimSpace(*awsHost)
+		}
+
+		if *awsUsername == "" {
+			fmt.Print("Enter AWS username (or leave blank to try multiple options): ")
+			*awsUsername, _ = reader.ReadString('\n')
+			*awsUsername = strings.TrimSpace(*awsUsername)
+		}
+	}
+
+	// Validate required parameters
+	if *username == "" || *password == "" || *bastionHost == "" {
+		fmt.Println("Error: Missing required parameters")
+		fmt.Println("Required: -user, -pass, -bastion")
+		fmt.Println("These can be provided via command-line flags or config file")
+		flag.PrintDefaults()
+		return
+	}
+
+	// Validate AWS host
+	if *awsHost == "" {
+		fmt.Println("Error: AWS host is required")
+		fmt.Println("Use -aws flag or config file to specify the AWS host")
+		return
+	}
+
+	// Check if any operations are requested before attempting connections
+	if !collectLogs && !collectVersions && !*listOnly {
+		fmt.Println("No operations requested. Use one of the following flags:")
+		fmt.Println("  -collect-logs=true     : Collect logs from Kubernetes pods")
+		fmt.Println("  -collect-versions=true : Collect application version information")
+		fmt.Println("  -list=true            : List available log files")
+		fmt.Println("Or enable operations in config.yaml (appVersionCollection.enabled: true)")
+		return
+	}
+
+	// Connect to bastion
+	logger.Info("Connecting to bastion host %s", *bastionHost)
+	bastionClient, err := sshConnectBastion(*username, *password, *bastionHost, *bastionPort)
+	if err != nil {
+		logger.Error("Failed to connect to bastion: %v", err)
+		return
+	}
+	defer bastionClient.Close()
+	logger.Info("Successfully connected to bastion")
+
+	// Connect to AWS host
+	logger.Info("Connecting to AWS server %s via bastion...", *awsHost)
+	awsClient, err := sshConnectAWSViaBastion(bastionClient, *awsHost, *keyPath, *awsUsername)
+	if err != nil {
+		logger.Error("Failed to connect to AWS server: %v", err)
+		return
+	}
+	defer awsClient.Close()
+	logger.Info("Successfully connected to AWS server: %s", *awsHost)
+
+	// If only version collection is requested, do standalone version collection
+	if collectVersions && !collectLogs {
+		logger.Info("📱 Running in standalone version collection mode...")
+		err = collectAppVersionsStandalone(awsClient, config)
+		if err != nil {
+			logger.Error("Failed to collect app versions: %v", err)
+			return
+		}
+		logger.Info("✅ Standalone version collection completed successfully!")
+		return // Exit after standalone version collection
+	}
+
+	// Perform log collection if requested
+	var finalArchiveName string
+	if collectLogs {
+		logger.Info("🚀 Starting log collection process...")
+
+		// Determine time-based collection settings
+		timeBasedEnabled := false
+		timeDurationStr := ""
+
+		// Check command-line flag first
+		if *timeDuration != "" {
+			// Special handling for explicit disable values
+			if *timeDuration == "0" || *timeDuration == "disabled" || *timeDuration == "false" {
+				timeBasedEnabled = false
+				timeDurationStr = ""
+				logger.Info("⏰ Time-based collection explicitly disabled via command line")
+			} else {
+				timeBasedEnabled = true
+				timeDurationStr = *timeDuration
+				logger.Info("⏰ Time-based collection enabled via command line: %s", timeDurationStr)
+			}
+		} else if config.LogCollection.TimeBasedCollection.Enabled {
+			// Use config settings if no command-line flag
+			timeBasedEnabled = true
+			timeDurationStr = config.LogCollection.TimeBasedCollection.Duration
+			logger.Info("⏰ Time-based collection enabled via config: %s", timeDurationStr)
+		}
+
+		// Start timing the entire log collection and archive creation process
+		overallStartTime := time.Now()
+
+		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, *collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.LogAnalysis)
+		if err != nil {
+			logger.Error("Failed to collect logs: %v", err)
+			return
+		}
+
+		// Display overall timing
+		overallDuration := time.Since(overallStartTime)
+		logger.Info("🎯 Overall log collection and archiving completed in: %s", overallDuration.Round(time.Millisecond))
+
+		// Update the log pattern to look for the newly created archive
+		archivePattern := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
+		*logPattern = archivePattern
+		logger.Info("Updated log pattern to: %s", *logPattern)
+
+		// Give the system a moment to complete file operations
+		logger.Info("Waiting for file system operations to complete...")
+		time.Sleep(2 * time.Second)
+	}
+
+	// List log files on AWS server
+	logger.Info("Fetching log files...")
+	session, err := awsClient.NewSession()
+	if err != nil {
+		logger.Error("Failed to create session: %v", err)
+		return
+	}
+	defer session.Close()
+
+	var logFiles []string
+	output, err := session.Output("ls " + *logPattern + " 2>/dev/null || echo ''")
+	if err != nil {
+		logger.Debug("No existing log files found matching pattern %s: %v", *logPattern, err)
+		// Don't return here - continue to allow log collection or other operations
+		logFiles = []string{}
+		fmt.Println("No existing log files found. Logs will be collected from Kubernetes.")
+	} else {
+		logFiles = strings.Split(strings.TrimSpace(string(output)), "\n")
+		if len(logFiles) == 0 || (len(logFiles) == 1 && logFiles[0] == "") {
+			logFiles = []string{} // Reset to empty if no valid files
+			fmt.Println("No log files found matching pattern:", *logPattern)
+			fmt.Println("Logs will be collected from Kubernetes.")
+		} else {
+			fmt.Println("Available log files:")
+			fmt.Println("--------------------")
+			for i, file := range logFiles {
+				fmt.Printf("%d. %s\n", i+1, file)
+			}
+		}
+	}
+
+	if *listOnly {
+		return
+	}
+
+	// Select log files to download
+	var selectedLogFiles []string
+	if *interactive {
+		fmt.Println("Enter log file numbers to download (comma-separated, or 'all' for all files):")
+		reader := bufio.NewReader(os.Stdin)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		if input == "all" {
+			selectedLogFiles = logFiles
+		} else {
+			selections := strings.Split(input, ",")
+			for _, s := range selections {
+				s = strings.TrimSpace(s)
+				idx, err := strconv.Atoi(s)
+				if err != nil || idx < 1 || idx > len(logFiles) {
+					logger.Warn("Invalid selection: %s", s)
+					continue
+				}
+				selectedLogFiles = append(selectedLogFiles, logFiles[idx-1])
+			}
+		}
+	} else {
+		selectedLogFiles = logFiles
+	}
+
+	if len(selectedLogFiles) == 0 {
+		fmt.Println("No log files selected for download")
+		return
+	}
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+		fmt.Println("Failed to create output directory:", err)
+		return
+	}
+	// Download selected log files
+	totalFiles := len(selectedLogFiles)
+	logger.Info("Starting download of %d file(s) to %s", totalFiles, *outputDir)
+	fmt.Println(strings.Repeat("-", 50))
+
+	successCount := 0
+	failCount := 0
+	retrySuccessCount := 0
+
+	// Variables to collect download summary information
+	var downloadedFiles []string
+	var downloadSpeeds []string
+
+	for i, remotePath := range selectedLogFiles {
+		filename := remotePath[strings.LastIndex(remotePath, "/")+1:]
+		localPath := filepath.Join(*outputDir, filename)
+		logger.Info("Starting download %d of %d: %s", i+1, totalFiles, filename)
+
+		// Get initial file size for display
+		sftpClient, statErr := sftp.NewClient(awsClient)
+		if statErr == nil {
+			remoteFileInfo, statErr := sftpClient.Stat(remotePath)
+			if statErr == nil {
+				remoteFileSize := remoteFileInfo.Size()
+				logger.Debug("File size: %d bytes (%.2f MB)", remoteFileSize, float64(remoteFileSize)/(1024*1024))
+			}
+			sftpClient.Close()
+		}
+
+		// Create a temporary file path for download
+		tempFilePath := localPath + ".part"
+		logger.Debug("Created temporary file: %s", tempFilePath)
+		logger.Debug("Added start marker to file\n")
+		logger.Debug("Downloading to temporary file: %s", tempFilePath)
+
+		// Create connection parameters for parallel downloads
+		connParams := &ConnectionParams{
+			BastionClient:     bastionClient,
+			AWSHost:           *awsHost,
+			KeyPath:           *keyPath,
+			PreferredUsername: *awsUsername,
+		}
+
+		// Record download start time for summary
+		downloadStartTime := time.Now()
+		err := downloadFileFromAWS(awsClient, remotePath, localPath, *autoRetry, *numChunks, connParams)
+		downloadDuration := time.Since(downloadStartTime)
+
+		if err != nil {
+			// Check if this is a retry success but with some warning
+			if strings.Contains(err.Error(), "retry_success:") {
+				// Extract the real message
+				message := strings.TrimPrefix(err.Error(), "retry_success:")
+				logger.Warn("⚠️ %s", message)
+				retrySuccessCount++
+			} else {
+				logger.Error("❌ Error: %s", err)
+				failCount++
+				continue
+			}
+		}
+
+		// Get file size for display
+		fileInfo, err := os.Stat(localPath)
+		var fileSize string
+		var fileSizeBytes int64
+		if err == nil {
+			fileSizeBytes = fileInfo.Size()
+			if fileSizeBytes == 0 {
+				logger.Warn("⚠️ Warning: Downloaded file has zero bytes!")
+			}
+
+			if fileSizeBytes < 1024 {
+				fileSize = fmt.Sprintf("%d B", fileSizeBytes)
+			} else if fileSizeBytes < 1024*1024 {
+				fileSize = fmt.Sprintf("%.2f KB", float64(fileSizeBytes)/1024)
+			} else if fileSizeBytes < 1024*1024*1024 {
+				fileSize = fmt.Sprintf("%.2f MB", float64(fileSizeBytes)/(1024*1024))
+			} else {
+				fileSize = fmt.Sprintf("%.2f GB", float64(fileSizeBytes)/(1024*1024*1024))
+			}
+		} else {
+			fileSize = "unknown size"
+			logger.Warn("Cannot verify file size: %v", err)
+		}
+
+		// Calculate download speed and timing for summary
+		var durationStr, speedStr string
+		if downloadDuration.Hours() >= 1 {
+			durationStr = fmt.Sprintf("%.1f hours", downloadDuration.Hours())
+		} else if downloadDuration.Minutes() >= 1 {
+			durationStr = fmt.Sprintf("%.1f minutes", downloadDuration.Minutes())
+		} else {
+			durationStr = fmt.Sprintf("%.1f seconds", downloadDuration.Seconds())
+		}
+
+		if fileSizeBytes > 0 {
+			bytesPerSecond := float64(fileSizeBytes) / downloadDuration.Seconds()
+			if bytesPerSecond >= 1024*1024 {
+				speedStr = fmt.Sprintf("%.2f MB/s", bytesPerSecond/(1024*1024))
+			} else if bytesPerSecond >= 1024 {
+				speedStr = fmt.Sprintf("%.2f KB/s", bytesPerSecond/1024)
+			} else {
+				speedStr = fmt.Sprintf("%.2f B/s", bytesPerSecond)
+			}
+		} else {
+			speedStr = "unknown speed"
+		}
+
+		// Store download information for summary instead of logging immediately
+		downloadedFiles = append(downloadedFiles, fmt.Sprintf("%s (%s)", filename, fileSize))
+		downloadSpeeds = append(downloadSpeeds, fmt.Sprintf("Download completed in %s (avg. %s)", durationStr, speedStr))
+		logger.Debug("✅ Successfully saved %s (%s)", filename, fileSize)
+		successCount++
+	}
+
+	// Delete source archive if log collection was performed and deletion is enabled
+	if collectLogs && finalArchiveName != "" && config.LogCollection.DeleteAfterCopy && successCount > 0 {
+		archiveToDelete := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
+		logger.Info("🔄 Post-download cleanup enabled, deleting source archive...")
+		if err := deleteArchiveFromAWS(awsClient, archiveToDelete, config.Environment); err != nil {
+			logger.Warn("⚠️ Failed to delete source archive: %v", err)
+		}
+		// Note: tempDir cleanup is now handled immediately after archive creation in collectKubernetesLogs()
+	}
+
+	logger.Info("Download Summary:")
+	logger.Info("-----------------")
+	logger.Info("Total files: %d", totalFiles)
+	if retrySuccessCount > 0 {
+		logger.Info("Successful: %d (%d with retries)", successCount, retrySuccessCount)
+	} else {
+		logger.Info("Successful: %d", successCount)
+	}
+	if failCount > 0 {
+		logger.Info("Failed: %d", failCount)
+	}
+
+	// Show individual downloaded files
+	if len(downloadedFiles) > 0 {
+		logger.Info("Downloaded files:")
+		for i, fileInfo := range downloadedFiles {
+			logger.Info("✅ Successfully saved %s", fileInfo)
+			if i < len(downloadSpeeds) {
+				logger.Info("%s", downloadSpeeds[i])
+			}
+		}
+	}
+
+	// Include downloaded file names in the output directory message
+	if successCount > 0 {
+		if successCount == 1 && len(selectedLogFiles) == 1 {
+			// Single file downloaded
+			filename := selectedLogFiles[0][strings.LastIndex(selectedLogFiles[0], "/")+1:]
+			logger.Info("Output directory: %s (downloaded: %s)", *outputDir, filename)
+		} else {
+			// Multiple files downloaded - show directory and count
+			logger.Info("Output directory: %s (%d files downloaded)", *outputDir, successCount)
+		}
+	} else {
+		logger.Info("Output directory: %s", *outputDir)
+	}
+	fmt.Println("\nDownload complete!")
+}

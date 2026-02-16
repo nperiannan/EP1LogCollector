@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -14,7 +16,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -474,6 +478,13 @@ type Config struct {
 			NumberOfWorkflows int    `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
 			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
 		} `yaml:"temporalWorkflowCollection"`
+		LogAnalysis struct {
+			Enabled       bool     `yaml:"enabled"`       // Enable automatic log analysis
+			OutputFile    string   `yaml:"outputFile"`    // Output file name for analysis report
+			ErrorPatterns []string `yaml:"errorPatterns"` // Patterns to search for (case-insensitive)
+			MaxMatches    int      `yaml:"maxMatches"`    // Max matches per log file
+			ContextLines  int      `yaml:"contextLines"`  // Lines before/after each match
+		} `yaml:"logAnalysis"`
 	} `yaml:"logCollection"`
 	// General system information collection
 	GeneralInfo struct {
@@ -2974,6 +2985,750 @@ func sanitizeFilename(name string) string {
 	return filename
 }
 
+// ============================================================================
+// Log Analytics Feature - Analyze downloaded log archives for errors/issues
+// ============================================================================
+
+// LogMatch represents a single error/pattern match found in a log file
+type LogMatch struct {
+	FileName    string   // Name of the log file
+	LineNumber  int      // 1-based line number of the match
+	MatchedLine string   // The actual line that matched
+	Pattern     string   // The pattern that matched
+	BeforeLines []string // Context lines before the match
+	AfterLines  []string // Context lines after the match
+}
+
+// CorrelatedIssue represents a group of related errors found across multiple files
+type CorrelatedIssue struct {
+	Pattern     string   // Common pattern or keyword
+	Files       []string // Files where this pattern was found
+	TotalCount  int      // Total occurrences across all files
+	Severity    string   // Estimated severity: CRITICAL, HIGH, MEDIUM, LOW
+	Description string   // Auto-generated description of the issue
+}
+
+// FileAnalysisSummary holds analysis results for a single file
+type FileAnalysisSummary struct {
+	FileName     string
+	TotalMatches int
+	Matches      []LogMatch
+	PatternCounts map[string]int // count per pattern
+}
+
+// analyzeDownloadedLogs extracts a downloaded .tar.gz archive and analyzes all log files
+// for error patterns, correlates issues across files, and generates a comprehensive report
+func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	OutputFile    string   `yaml:"outputFile"`
+	ErrorPatterns []string `yaml:"errorPatterns"`
+	MaxMatches    int      `yaml:"maxMatches"`
+	ContextLines  int      `yaml:"contextLines"`
+}) error {
+	if !logAnalysisConfig.Enabled {
+		logger.Debug("Log analysis is disabled")
+		return nil
+	}
+
+	logger.Info("=" + strings.Repeat("=", 69))
+	logger.Info("  LOG ANALYTICS - Analyzing downloaded archive for errors & issues")
+	logger.Info("=" + strings.Repeat("=", 69))
+
+	// Set defaults
+	if logAnalysisConfig.OutputFile == "" {
+		logAnalysisConfig.OutputFile = "log_analytics_report.txt"
+	}
+	if logAnalysisConfig.MaxMatches <= 0 {
+		logAnalysisConfig.MaxMatches = 20
+	}
+	if logAnalysisConfig.ContextLines < 0 {
+		logAnalysisConfig.ContextLines = 2
+	}
+	if len(logAnalysisConfig.ErrorPatterns) == 0 {
+		logAnalysisConfig.ErrorPatterns = []string{"error", "panic", "failure", "failed", "exception", "fatal", "critical", "timeout"}
+	}
+
+	// Compile regex patterns (case-insensitive)
+	var compiledPatterns []*regexp.Regexp
+	for _, pattern := range logAnalysisConfig.ErrorPatterns {
+		re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(pattern))
+		if err != nil {
+			logger.Warn("Invalid error pattern '%s', skipping: %v", pattern, err)
+			continue
+		}
+		compiledPatterns = append(compiledPatterns, re)
+	}
+	if len(compiledPatterns) == 0 {
+		return fmt.Errorf("no valid error patterns compiled")
+	}
+
+	logger.Info("Analyzing with %d error patterns, %d context lines before/after",
+		len(compiledPatterns), logAnalysisConfig.ContextLines)
+	logger.Info("Patterns: %s", strings.Join(logAnalysisConfig.ErrorPatterns, ", "))
+
+	// Step 1: Extract the archive to a temporary directory
+	extractDir, err := extractTarGz(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to extract archive for analysis: %v", err)
+	}
+	defer os.RemoveAll(extractDir)
+	logger.Info("Extracted archive to temporary directory for analysis")
+
+	// Step 2: Discover all log/text files in the extracted archive
+	var logFiles []string
+	err = filepath.Walk(extractDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip files we can't access
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// Analyze text-based files: .log, .txt, .json, .yaml, .yml, .xml, .csv, and files without extension
+		ext := strings.ToLower(filepath.Ext(path))
+		switch ext {
+		case ".log", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".out", ".err", "":
+			logFiles = append(logFiles, path)
+		default:
+			// Check if it might be a text file by reading a small portion
+			if isLikelyTextFile(path) {
+				logFiles = append(logFiles, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to walk extracted files: %v", err)
+	}
+
+	if len(logFiles) == 0 {
+		logger.Warn("No log/text files found in the archive to analyze")
+		return nil
+	}
+	logger.Info("Found %d file(s) to analyze", len(logFiles))
+
+	// Step 3: Analyze each file for error patterns
+	var allSummaries []FileAnalysisSummary
+	globalPatternCounts := make(map[string]int)             // pattern -> total count across all files
+	patternFileMap := make(map[string]map[string]int)       // pattern -> file -> count
+	totalMatchesFound := 0
+
+	for _, filePath := range logFiles {
+		relPath, _ := filepath.Rel(extractDir, filePath)
+		summary := analyzeFileForPatterns(filePath, relPath, compiledPatterns,
+			logAnalysisConfig.ErrorPatterns, logAnalysisConfig.MaxMatches, logAnalysisConfig.ContextLines)
+
+		if summary.TotalMatches > 0 {
+			allSummaries = append(allSummaries, summary)
+			totalMatchesFound += summary.TotalMatches
+
+			// Aggregate pattern counts
+			for pattern, count := range summary.PatternCounts {
+				globalPatternCounts[pattern] += count
+				if patternFileMap[pattern] == nil {
+					patternFileMap[pattern] = make(map[string]int)
+				}
+				patternFileMap[pattern][summary.FileName] = count
+			}
+		}
+	}
+
+	logger.Info("Analysis complete: %d total matches across %d file(s)", totalMatchesFound, len(allSummaries))
+
+	// Step 4: Correlate errors across files
+	correlatedIssues := correlateErrors(allSummaries, globalPatternCounts, patternFileMap)
+
+	// Store patternFileMap for report generator
+	globalPatternFileMap = patternFileMap
+
+	// Step 5: Generate the report
+	reportPath := filepath.Join(outputDir, logAnalysisConfig.OutputFile)
+	err = generateAnalyticsReport(reportPath, allSummaries, correlatedIssues,
+		globalPatternCounts, logAnalysisConfig, totalMatchesFound, archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to generate analytics report: %v", err)
+	}
+
+	logger.Info("Log analytics report generated: %s", reportPath)
+
+	// Print a summary to the console
+	printAnalyticsSummary(allSummaries, correlatedIssues, totalMatchesFound)
+
+	return nil
+}
+
+// extractTarGz extracts a .tar.gz archive to a temporary directory and returns the path
+func extractTarGz(archivePath string) (string, error) {
+	// Create temp directory for extraction
+	extractDir, err := ioutil.TempDir("", "log_analysis_")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp dir: %v", err)
+	}
+
+	// Open the archive
+	file, err := os.Open(archivePath)
+	if err != nil {
+		os.RemoveAll(extractDir)
+		return "", fmt.Errorf("failed to open archive: %v", err)
+	}
+	defer file.Close()
+
+	// Create gzip reader
+	gzReader, err := gzip.NewReader(file)
+	if err != nil {
+		os.RemoveAll(extractDir)
+		return "", fmt.Errorf("failed to create gzip reader: %v", err)
+	}
+	defer gzReader.Close()
+
+	// Create tar reader
+	tarReader := tar.NewReader(gzReader)
+
+	// Extract all files
+	fileCount := 0
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			os.RemoveAll(extractDir)
+			return "", fmt.Errorf("error reading tar: %v", err)
+		}
+
+		// Sanitize the path to prevent directory traversal attacks
+		targetPath := filepath.Join(extractDir, header.Name)
+		if !strings.HasPrefix(filepath.Clean(targetPath), filepath.Clean(extractDir)) {
+			logger.Warn("Skipping suspicious path in archive: %s", header.Name)
+			continue
+		}
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				logger.Warn("Failed to create directory %s: %v", targetPath, err)
+			}
+		case tar.TypeReg:
+			// Ensure parent directory exists
+			parentDir := filepath.Dir(targetPath)
+			if err := os.MkdirAll(parentDir, 0755); err != nil {
+				logger.Warn("Failed to create parent dir %s: %v", parentDir, err)
+				continue
+			}
+
+			outFile, err := os.Create(targetPath)
+			if err != nil {
+				logger.Warn("Failed to create file %s: %v", targetPath, err)
+				continue
+			}
+
+			// Limit extraction size per file (100 MB)
+			limited := io.LimitReader(tarReader, 100*1024*1024)
+			if _, err := io.Copy(outFile, limited); err != nil {
+				outFile.Close()
+				logger.Warn("Failed to extract %s: %v", targetPath, err)
+				continue
+			}
+			outFile.Close()
+			fileCount++
+		}
+	}
+
+	logger.Debug("Extracted %d files from archive", fileCount)
+	return extractDir, nil
+}
+
+// isLikelyTextFile checks if a file is likely a text file by reading its first 512 bytes
+func isLikelyTextFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return false
+	}
+	if n == 0 {
+		return false
+	}
+	buf = buf[:n]
+
+	// Check for binary content (null bytes or too many non-printable chars)
+	nonPrintable := 0
+	for _, b := range buf {
+		if b == 0 {
+			return false // Null byte = binary
+		}
+		if b < 32 && b != '\n' && b != '\r' && b != '\t' {
+			nonPrintable++
+		}
+	}
+	return float64(nonPrintable)/float64(n) < 0.1
+}
+
+// analyzeFileForPatterns scans a file for error patterns and returns matches with context
+func analyzeFileForPatterns(filePath, displayName string, compiledPatterns []*regexp.Regexp,
+	patternNames []string, maxMatches, contextLines int) FileAnalysisSummary {
+
+	summary := FileAnalysisSummary{
+		FileName:      displayName,
+		PatternCounts: make(map[string]int),
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		logger.Debug("Cannot open file for analysis: %s: %v", displayName, err)
+		return summary
+	}
+	defer file.Close()
+
+	// Read all lines into memory for context extraction
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	if len(lines) == 0 {
+		return summary
+	}
+
+	// Scan for pattern matches
+	matchCount := 0
+	for lineIdx, line := range lines {
+		if matchCount >= maxMatches {
+			break
+		}
+
+		for patIdx, re := range compiledPatterns {
+			if re.MatchString(line) {
+				patternName := patternNames[patIdx]
+
+				// Extract context lines
+				var beforeLines []string
+				var afterLines []string
+
+				startBefore := lineIdx - contextLines
+				if startBefore < 0 {
+					startBefore = 0
+				}
+				for i := startBefore; i < lineIdx; i++ {
+					beforeLines = append(beforeLines, lines[i])
+				}
+
+				endAfter := lineIdx + contextLines + 1
+				if endAfter > len(lines) {
+					endAfter = len(lines)
+				}
+				for i := lineIdx + 1; i < endAfter; i++ {
+					afterLines = append(afterLines, lines[i])
+				}
+
+				match := LogMatch{
+					FileName:    displayName,
+					LineNumber:  lineIdx + 1, // 1-based
+					MatchedLine: line,
+					Pattern:     patternName,
+					BeforeLines: beforeLines,
+					AfterLines:  afterLines,
+				}
+
+				summary.Matches = append(summary.Matches, match)
+				summary.PatternCounts[patternName]++
+				matchCount++
+
+				break // Only count each line once (first matching pattern wins)
+			}
+		}
+	}
+
+	summary.TotalMatches = len(summary.Matches)
+	return summary
+}
+
+// correlateErrors finds patterns that appear across multiple files and estimates severity
+func correlateErrors(summaries []FileAnalysisSummary, globalPatternCounts map[string]int,
+	patternFileMap map[string]map[string]int) []CorrelatedIssue {
+
+	var issues []CorrelatedIssue
+
+	// Sort patterns by total count (most frequent first)
+	type patternCount struct {
+		pattern string
+		count   int
+	}
+	var sortedPatterns []patternCount
+	for pattern, count := range globalPatternCounts {
+		sortedPatterns = append(sortedPatterns, patternCount{pattern, count})
+	}
+	sort.Slice(sortedPatterns, func(i, j int) bool {
+		return sortedPatterns[i].count > sortedPatterns[j].count
+	})
+
+	for _, pc := range sortedPatterns {
+		pattern := pc.pattern
+		fileMap := patternFileMap[pattern]
+
+		// Collect files where this pattern appears
+		var files []string
+		for f := range fileMap {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+
+		// Determine severity based on pattern and frequency
+		severity := determineSeverity(pattern, pc.count, len(files))
+
+		// Generate description
+		description := generateIssueDescription(pattern, pc.count, files)
+
+		issue := CorrelatedIssue{
+			Pattern:     pattern,
+			Files:       files,
+			TotalCount:  pc.count,
+			Severity:    severity,
+			Description: description,
+		}
+		issues = append(issues, issue)
+	}
+
+	return issues
+}
+
+// determineSeverity estimates the severity of an issue based on pattern and frequency
+func determineSeverity(pattern string, totalCount, fileCount int) string {
+	patternLower := strings.ToLower(pattern)
+
+	// Critical patterns
+	switch patternLower {
+	case "panic", "fatal", "critical":
+		return "CRITICAL"
+	}
+
+	// High severity patterns
+	switch patternLower {
+	case "exception", "permission denied":
+		return "HIGH"
+	}
+
+	// If a pattern appears across many files, it's likely more severe
+	if fileCount >= 3 && totalCount >= 10 {
+		if patternLower == "error" || patternLower == "failure" || patternLower == "failed" {
+			return "HIGH"
+		}
+	}
+
+	// Medium severity
+	switch patternLower {
+	case "error", "failure", "failed", "unable to", "cannot":
+		return "MEDIUM"
+	case "timeout", "connection refused":
+		return "MEDIUM"
+	}
+
+	return "LOW"
+}
+
+// generateIssueDescription creates a human-readable description for a correlated issue
+func generateIssueDescription(pattern string, totalCount int, files []string) string {
+	fileStr := strings.Join(files, ", ")
+	if len(files) > 3 {
+		fileStr = strings.Join(files[:3], ", ") + fmt.Sprintf(" and %d more", len(files)-3)
+	}
+
+	if len(files) > 1 {
+		return fmt.Sprintf("Pattern '%s' found %d times across %d files (%s). "+
+			"This cross-file occurrence suggests a systemic issue that may have cascading effects.",
+			pattern, totalCount, len(files), fileStr)
+	}
+	return fmt.Sprintf("Pattern '%s' found %d times in %s.",
+		pattern, totalCount, fileStr)
+}
+
+// generateAnalyticsReport writes the comprehensive log analytics report to a file
+func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
+	correlatedIssues []CorrelatedIssue, globalPatternCounts map[string]int,
+	config struct {
+		Enabled       bool     `yaml:"enabled"`
+		OutputFile    string   `yaml:"outputFile"`
+		ErrorPatterns []string `yaml:"errorPatterns"`
+		MaxMatches    int      `yaml:"maxMatches"`
+		ContextLines  int      `yaml:"contextLines"`
+	}, totalMatches int, archivePath string) error {
+
+	file, err := os.Create(reportPath)
+	if err != nil {
+		return fmt.Errorf("failed to create report file: %v", err)
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
+	defer w.Flush()
+
+	// Header
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintln(w, "  LOG ANALYTICS REPORT")
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintf(w, "  Generated:     %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(w, "  Archive:       %s\n", filepath.Base(archivePath))
+	fmt.Fprintf(w, "  Patterns:      %s\n", strings.Join(config.ErrorPatterns, ", "))
+	fmt.Fprintf(w, "  Context Lines: %d before / %d after\n", config.ContextLines, config.ContextLines)
+	fmt.Fprintf(w, "  Max Matches:   %d per file\n", config.MaxMatches)
+	fmt.Fprintf(w, "  Files Analyzed: %d with matches out of total scanned\n", len(summaries))
+	fmt.Fprintf(w, "  Total Matches: %d\n", totalMatches)
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintln(w)
+
+	// ---- SECTION 1: EXECUTIVE SUMMARY ----
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w, "  SECTION 1: EXECUTIVE SUMMARY")
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w)
+
+	if totalMatches == 0 {
+		fmt.Fprintln(w, "  No unexpected log messages found. All logs appear clean.")
+		fmt.Fprintln(w)
+		return nil
+	}
+
+	// Count by severity
+	severityCounts := map[string]int{"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+	for _, issue := range correlatedIssues {
+		severityCounts[issue.Severity] += issue.TotalCount
+	}
+
+	fmt.Fprintf(w, "  CRITICAL:  %d occurrences\n", severityCounts["CRITICAL"])
+	fmt.Fprintf(w, "  HIGH:      %d occurrences\n", severityCounts["HIGH"])
+	fmt.Fprintf(w, "  MEDIUM:    %d occurrences\n", severityCounts["MEDIUM"])
+	fmt.Fprintf(w, "  LOW:       %d occurrences\n", severityCounts["LOW"])
+	fmt.Fprintln(w)
+
+	// Top issues
+	fmt.Fprintln(w, "  Top Issues:")
+	for i, issue := range correlatedIssues {
+		if i >= 5 {
+			break
+		}
+		crossFileIndicator := ""
+		if len(issue.Files) > 1 {
+			crossFileIndicator = fmt.Sprintf(" [CROSS-FILE: %d files]", len(issue.Files))
+		}
+		fmt.Fprintf(w, "    %d. [%s] '%s' - %d occurrences%s\n",
+			i+1, issue.Severity, issue.Pattern, issue.TotalCount, crossFileIndicator)
+	}
+	fmt.Fprintln(w)
+
+	// ---- SECTION 2: CORRELATED ISSUES (CROSS-FILE) ----
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w, "  SECTION 2: CORRELATED ISSUES (Cross-File Error Analysis)")
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w)
+
+	crossFileIssues := 0
+	for _, issue := range correlatedIssues {
+		if len(issue.Files) <= 1 {
+			continue
+		}
+		crossFileIssues++
+		fmt.Fprintf(w, "  CORRELATED ISSUE #%d\n", crossFileIssues)
+		fmt.Fprintf(w, "  Pattern:    '%s'\n", issue.Pattern)
+		fmt.Fprintf(w, "  Severity:   %s\n", issue.Severity)
+		fmt.Fprintf(w, "  Occurrences: %d total across %d files\n", issue.TotalCount, len(issue.Files))
+		fmt.Fprintln(w, "  Affected Files:")
+		for _, f := range issue.Files {
+			fmt.Fprintf(w, "    - %s\n", f)
+		}
+		fmt.Fprintf(w, "  Assessment: %s\n", issue.Description)
+		fmt.Fprintln(w, "  "+strings.Repeat("-", 70))
+		fmt.Fprintln(w)
+	}
+
+	if crossFileIssues == 0 {
+		fmt.Fprintln(w, "  No cross-file correlated issues detected.")
+		fmt.Fprintln(w, "  Errors appear to be isolated to individual files.")
+		fmt.Fprintln(w)
+	}
+
+	// ---- SECTION 3: PER-FILE ANALYSIS WITH CONTEXT ----
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w, "  SECTION 3: PER-FILE ANALYSIS (With Before/After Context)")
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w)
+
+	// Sort summaries by total matches (most first)
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].TotalMatches > summaries[j].TotalMatches
+	})
+
+	for fileIdx, summary := range summaries {
+		fmt.Fprintf(w, "  FILE %d: %s\n", fileIdx+1, summary.FileName)
+		fmt.Fprintf(w, "  Total Matches: %d\n", summary.TotalMatches)
+
+		// Pattern breakdown for this file
+		fmt.Fprintln(w, "  Pattern Breakdown:")
+		for pattern, count := range summary.PatternCounts {
+			fmt.Fprintf(w, "    - '%s': %d\n", pattern, count)
+		}
+		fmt.Fprintln(w, "  "+strings.Repeat("-", 70))
+		fmt.Fprintln(w)
+
+		// Each match with before/after context
+		for matchIdx, match := range summary.Matches {
+			fmt.Fprintf(w, "    Match %d/%d [Pattern: '%s'] at Line %d:\n",
+				matchIdx+1, summary.TotalMatches, match.Pattern, match.LineNumber)
+			fmt.Fprintln(w)
+
+			// Before context
+			if len(match.BeforeLines) > 0 {
+				fmt.Fprintln(w, "      --- BEFORE ---")
+				for i, line := range match.BeforeLines {
+					beforeLineNum := match.LineNumber - len(match.BeforeLines) + i
+					fmt.Fprintf(w, "      %4d | %s\n", beforeLineNum, truncateLine(line, 200))
+				}
+			}
+
+			// The matched line (highlighted)
+			fmt.Fprintln(w, "      >>> MATCHED LINE <<<")
+			fmt.Fprintf(w, "      %4d | %s\n", match.LineNumber, truncateLine(match.MatchedLine, 200))
+
+			// After context
+			if len(match.AfterLines) > 0 {
+				fmt.Fprintln(w, "      --- AFTER ---")
+				for i, line := range match.AfterLines {
+					afterLineNum := match.LineNumber + 1 + i
+					fmt.Fprintf(w, "      %4d | %s\n", afterLineNum, truncateLine(line, 200))
+				}
+			}
+
+			fmt.Fprintln(w)
+		}
+
+		fmt.Fprintln(w, "  "+strings.Repeat("=", 70))
+		fmt.Fprintln(w)
+	}
+
+	// ---- SECTION 4: PATTERN FREQUENCY TABLE ----
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w, "  SECTION 4: PATTERN FREQUENCY TABLE")
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w)
+
+	// Sort by count
+	type patternEntry struct {
+		pattern string
+		count   int
+		files   int
+	}
+	var patternTable []patternEntry
+	for pattern, count := range globalPatternCounts {
+		fileCount := 0
+		if fm, ok := globalPatternFileMap[pattern]; ok {
+			fileCount = len(fm)
+		}
+		patternTable = append(patternTable, patternEntry{pattern, count, fileCount})
+	}
+	sort.Slice(patternTable, func(i, j int) bool {
+		return patternTable[i].count > patternTable[j].count
+	})
+
+	fmt.Fprintf(w, "  %-25s %10s %10s\n", "PATTERN", "COUNT", "FILES")
+	fmt.Fprintf(w, "  %-25s %10s %10s\n", strings.Repeat("-", 25), strings.Repeat("-", 10), strings.Repeat("-", 10))
+	for _, entry := range patternTable {
+		fmt.Fprintf(w, "  %-25s %10d %10d\n", entry.pattern, entry.count, entry.files)
+	}
+	fmt.Fprintln(w)
+
+	// ---- SECTION 5: FILES WITHOUT ISSUES ----
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w, "  SECTION 5: RECOMMENDATION")
+	fmt.Fprintln(w, strings.Repeat("*", 80))
+	fmt.Fprintln(w)
+
+	if severityCounts["CRITICAL"] > 0 {
+		fmt.Fprintln(w, "  ⚠ CRITICAL issues detected! Immediate investigation required.")
+		fmt.Fprintln(w, "  Focus on 'panic' and 'fatal' errors first - these indicate application crashes.")
+		fmt.Fprintln(w)
+	}
+	if crossFileIssues > 0 {
+		fmt.Fprintln(w, "  Cross-file correlated issues detected. These errors appear in multiple log files")
+		fmt.Fprintln(w, "  simultaneously, suggesting a systemic problem (e.g., infrastructure, connectivity,")
+		fmt.Fprintln(w, "  or deployment issue) rather than an isolated bug.")
+		fmt.Fprintln(w)
+	}
+	if severityCounts["CRITICAL"] == 0 && severityCounts["HIGH"] == 0 && crossFileIssues == 0 {
+		fmt.Fprintln(w, "  No critical or cross-file issues detected. The errors found appear to be")
+		fmt.Fprintln(w, "  isolated and low-severity. Review individual file sections above for details.")
+		fmt.Fprintln(w)
+	}
+
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintln(w, "  END OF LOG ANALYTICS REPORT")
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+
+	return nil
+}
+
+// globalPatternFileMap is used by the report generator to access pattern-file mapping
+var globalPatternFileMap map[string]map[string]int
+
+// truncateLine truncates a line to the given max length
+func truncateLine(line string, maxLen int) string {
+	if len(line) <= maxLen {
+		return line
+	}
+	return line[:maxLen] + "..."
+}
+
+// printAnalyticsSummary outputs a concise summary to the console
+func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []CorrelatedIssue, totalMatches int) {
+	logger.Info("=" + strings.Repeat("=", 50))
+	logger.Info("  LOG ANALYTICS SUMMARY")
+	logger.Info("=" + strings.Repeat("=", 50))
+
+	if totalMatches == 0 {
+		logger.Info("  No issues found - all logs appear clean!")
+		return
+	}
+
+	logger.Info("  Total unexpected messages found: %d", totalMatches)
+	logger.Info("  Files with issues: %d", len(summaries))
+
+	// Count cross-file issues
+	crossFileCount := 0
+	for _, issue := range correlatedIssues {
+		if len(issue.Files) > 1 {
+			crossFileCount++
+		}
+	}
+	if crossFileCount > 0 {
+		logger.Info("  Cross-file correlated issues: %d", crossFileCount)
+	}
+
+	// Show severity breakdown
+	severityCounts := map[string]int{}
+	for _, issue := range correlatedIssues {
+		severityCounts[issue.Severity] += issue.TotalCount
+	}
+	if severityCounts["CRITICAL"] > 0 {
+		logger.Warn("  ⚠ CRITICAL: %d occurrences", severityCounts["CRITICAL"])
+	}
+	if severityCounts["HIGH"] > 0 {
+		logger.Warn("  HIGH: %d occurrences", severityCounts["HIGH"])
+	}
+
+	// Show top 3 affected files
+	logger.Info("  Top affected files:")
+	for i, s := range summaries {
+		if i >= 3 {
+			break
+		}
+		logger.Info("    %d. %s (%d matches)", i+1, s.FileName, s.TotalMatches)
+	}
+}
+
 // collectAppVersionsStandalone collects application version information and saves it locally
 func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 	if !config.AppVersionCollection.Enabled {
@@ -4027,5 +4782,22 @@ func main() {
 	} else {
 		logger.Info("Output directory: %s", *outputDir)
 	}
+
+	// Run log analytics on downloaded archives if enabled
+	if config.LogCollection.LogAnalysis.Enabled && successCount > 0 {
+		logger.Info("")
+		for _, remotePath := range selectedLogFiles {
+			filename := remotePath[strings.LastIndex(remotePath, "/")+1:]
+			localPath := filepath.Join(*outputDir, filename)
+
+			// Only analyze .tar.gz archives
+			if strings.HasSuffix(localPath, ".tar.gz") {
+				if err := analyzeDownloadedLogs(localPath, *outputDir, config.LogCollection.LogAnalysis); err != nil {
+					logger.Warn("Log analysis failed for %s: %v", filename, err)
+				}
+			}
+		}
+	}
+
 	fmt.Println("\nDownload complete!")
 }

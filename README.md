@@ -38,7 +38,7 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 
 - **🔄 End-to-End Kubernetes Log Collection**: Remotely collect logs from Kubernetes pods, create timestamped archives, and download automatically
 - **📊 General System Information Collection**: Automatically collect kubectl and system command outputs for comprehensive operational snapshots with per-command output files
-- **🔍 Intelligent Log Analysis**: Automated analysis of collected logs with configurable error pattern detection and summary report generation
+- **🔍 Intelligent Log Analytics**: Post-download analysis of collected logs with configurable error patterns, cross-file correlation, severity classification, before/after context, and comprehensive `log_analytics_report.txt` generation
 - **📋 Application Version Collection**: Standalone feature to collect and format application version information from Kubernetes clusters
 - **🗑️ Smart Archive Management**: Automatic cleanup of remote archives after successful download with configurable retention
 - **⚡ High-Performance Native SCP Downloads**: 2-step optimized architecture with native SCP achieving 2-4 MB/s (10x faster than SFTP)
@@ -802,17 +802,18 @@ logCollection:
   timestampFormat: "20060102_150405"
 ```
 
-## 🔍 **Intelligent Log Analysis (NEW)**
+## 🔍 **Intelligent Log Analytics**
 
-The tool now includes automated log analysis capabilities that search through collected log files for configurable error patterns and generate comprehensive summary reports. This feature helps quickly identify issues and problematic patterns across all collected logs.
+After downloading log archives, the tool automatically extracts and analyzes all log files for error patterns, correlates issues across files, and generates a comprehensive **`log_analytics_report.txt`** in the output directory. This helps quickly identify systemic problems vs. isolated errors.
 
 ### Key Features
 
 - **🎯 Pattern-Based Detection**: Configurable search patterns for common error conditions (error, panic, failure, etc.)
-- **📊 Comprehensive Reporting**: Detailed summary with pattern frequency analysis and contextual information
-- **🔄 Automatic Integration**: Runs automatically during log collection before archiving
-- **📝 Contextual Output**: Includes surrounding lines for better understanding of issues
-- **🎨 Organized Results**: Groups findings by log file with clear formatting and statistics
+- **📊 Cross-File Correlation**: Identifies patterns that appear across multiple log files, indicating systemic issues
+- **🔗 Before/After Context**: Shows configurable lines before and after each match for full context
+- **📈 Severity Classification**: Automatically classifies findings as CRITICAL, HIGH, MEDIUM, or LOW
+- **📋 Executive Summary**: Quick overview with severity counts and top issues
+- **📁 Per-File Breakdown**: Detailed match listing per file with line numbers and context
 
 ### Configuration
 
@@ -820,7 +821,7 @@ The tool now includes automated log analysis capabilities that search through co
 logCollection:
   logAnalysis:
     enabled: true                   # Enable automatic log analysis
-    outputFile: "log_analysis_summary.txt"  # Output file name for analysis results
+    outputFile: "log_analytics_report.txt"  # Report file name in output directory
     errorPatterns:                  # Patterns to search for (case-insensitive)
       - "error"
       - "panic" 
@@ -838,74 +839,113 @@ logCollection:
     contextLines: 2                 # Lines before/after each match for context
 ```
 
-### Generated Output
+### Generated Report Structure
 
-The analysis generates a comprehensive summary file (`log_analysis_summary.txt`) within the archive containing:
+The report (`log_analytics_report.txt`) is saved in your output directory and contains 5 sections:
 
-**Header Section:**
+**Section 1 - Executive Summary:**
 ```
-===============================================================================
-                          LOG ANALYSIS SUMMARY
-===============================================================================
-Generated: 2025-07-09 05:24:37 UTC
-Total matches found: 15
-Error patterns searched: error, panic, failure, failed, exception, ...
-===============================================================================
-```
+================================================================================
+  LOG ANALYTICS REPORT
+================================================================================
+  Generated:     2025-07-10 12:00:00
+  Archive:       app_log_20250710_120000.tar.gz
+  Patterns:      error, panic, failure, failed, exception, fatal, ...
+  Context Lines: 2 before / 2 after
+  Files Analyzed: 8 with matches out of total scanned
+  Total Matches: 47
 
-**Pattern Frequency Analysis:**
-```
-PATTERN FREQUENCY:
------------------
-  error               : 8 matches
-  failed              : 4 matches
-  timeout             : 2 matches
-  connection refused  : 1 match
-```
+  CRITICAL:  2 occurrences
+  HIGH:      12 occurrences
+  MEDIUM:    28 occurrences
+  LOW:       5 occurrences
 
-**Detailed Findings by File:**
-```
-📁 FILE: /logs/nvo/nvo-edge-pod1/server.log
-   Matches: 3
-   --------------------------------------------------------------------------
-   Match #1 (Line 1547, Pattern: 'error'):
-   >>> 2025-07-09 10:23:15 ERROR [NetworkManager] Connection timeout occurred
-   Context:
-       2025-07-09 10:23:14 INFO [NetworkManager] Attempting connection retry
-   >>> 2025-07-09 10:23:15 ERROR [NetworkManager] Connection timeout occurred  
-       2025-07-09 10:23:16 WARN [NetworkManager] Falling back to backup server
+  Top Issues:
+    1. [HIGH] 'error' - 25 occurrences [CROSS-FILE: 6 files]
+    2. [CRITICAL] 'panic' - 2 occurrences [CROSS-FILE: 2 files]
+    3. [MEDIUM] 'timeout' - 8 occurrences
 ```
 
-### Integration with Log Collection
+**Section 2 - Correlated Issues (Cross-File Analysis):**
+```
+  CORRELATED ISSUE #1
+  Pattern:    'error'
+  Severity:   HIGH
+  Occurrences: 25 total across 6 files
+  Affected Files:
+    - app_log/nvo-edge-pod1.log
+    - app_log/cs-configuration-pod2.log
+    - app_log/cas-api-service-pod1.log
+  Assessment: Pattern 'error' found 25 times across 6 files. This cross-file
+              occurrence suggests a systemic issue that may have cascading effects.
+```
 
-The log analysis runs automatically during the log collection process:
+**Section 3 - Per-File Analysis (With Before/After Context):**
+```
+  FILE 1: app_log/nvo-edge-pod1.log
+  Total Matches: 8
+  Pattern Breakdown:
+    - 'error': 5
+    - 'timeout': 3
 
-1. **📦 Log Collection**: Gathers logs from all configured pod sources
-2. **🔍 Pattern Analysis**: Searches collected logs for configured error patterns
-3. **📊 Summary Generation**: Creates detailed analysis report
-4. **🗜️ Archive Creation**: Includes both logs and analysis summary in the final archive
-5. **⬇️ Download**: Complete package with logs and analysis available locally
+    Match 1/8 [Pattern: 'error'] at Line 1547:
+
+      --- BEFORE ---
+      1545 | 2025-07-09 10:23:14 INFO [NetworkManager] Attempting connection retry
+      1546 | 2025-07-09 10:23:14 DEBUG [NetworkManager] Retry attempt 3 of 5
+      >>> MATCHED LINE <<<
+      1547 | 2025-07-09 10:23:15 ERROR [NetworkManager] Connection timeout occurred
+      --- AFTER ---
+      1548 | 2025-07-09 10:23:16 WARN [NetworkManager] Falling back to backup server
+      1549 | 2025-07-09 10:23:17 INFO [NetworkManager] Backup connection established
+```
+
+**Section 4 - Pattern Frequency Table:**
+```
+  PATTERN                       COUNT      FILES
+  -------------------------  ---------- ----------
+  error                             25          6
+  timeout                            8          3
+  failed                             7          2
+  panic                              2          2
+```
+
+**Section 5 - Recommendations:**
+```
+  Cross-file correlated issues detected. These errors appear in multiple log files
+  simultaneously, suggesting a systemic problem (e.g., infrastructure, connectivity,
+  or deployment issue) rather than an isolated bug.
+```
+
+### How It Works
+
+1. **⬇️ Download**: Archive is downloaded from the server to local output directory
+2. **📦 Extract**: Archive is extracted to a temporary directory for analysis
+3. **🔍 Scan**: Each log/text file is scanned line-by-line for configured error patterns
+4. **📝 Context Capture**: For each match, N lines before and after are captured (configurable `contextLines`)
+5. **🔗 Correlation**: Patterns found across multiple files are flagged as cross-file correlated issues
+6. **📊 Classification**: Each pattern is assigned a severity level based on type and frequency
+7. **📋 Report**: Comprehensive report generated in the output directory
+8. **🧹 Cleanup**: Temporary extraction directory is automatically removed
+
+### Severity Classification
+
+| Severity | Patterns | Criteria |
+|----------|----------|----------|
+| **CRITICAL** | `panic`, `fatal`, `critical` | Always critical — indicates crashes |
+| **HIGH** | `exception`, `permission denied` | Always high; also `error`/`failure` when across 3+ files with 10+ occurrences |
+| **MEDIUM** | `error`, `failure`, `failed`, `timeout`, `connection refused`, `unable to`, `cannot` | Standard error patterns |
+| **LOW** | Other patterns | Low frequency or impact |
 
 ### Usage Examples
 
 ```bash
-# Log collection with automatic analysis (default if enabled in config)
+# Log collection with automatic analysis (runs after download if enabled in config)
 .\fetchlogs.exe --all
 
-# Force log analysis even if disabled in config (via debug mode)
-.\fetchlogs.exe --all -log-level DEBUG
-
-# View analysis results after download
-# Extract archive and look for log_analysis_summary.txt
+# The report is generated in the output directory (e.g., C:\Logs\)
+# Look for: log_analytics_report.txt
 ```
-
-### Benefits
-
-- **🚀 Rapid Issue Identification**: Quickly spot problems across many log files
-- **📈 Pattern Recognition**: Identify recurring issues and failure patterns  
-- **⏱️ Time Savings**: No manual log file review needed for common error detection
-- **📋 Documentation**: Automatic generation of issue summary for incident reports
-- **🎯 Targeted Troubleshooting**: Focus investigation on files with actual problems
 
 ### When Analysis Helps
 
@@ -914,8 +954,9 @@ The log analysis runs automatically during the log collection process:
 - **Deployment Validation**: Verify no new errors introduced after deployments
 - **Performance Issues**: Identify timeout and connection problems
 - **Capacity Planning**: Spot resource-related error patterns
+- **Root Cause Analysis**: Cross-file correlation helps trace cascading failures
 
-**Note**: The analysis runs on the collected log files during the archive creation phase, ensuring the summary is always included in the downloaded archive alongside the actual log files.
+**Note**: The analysis runs locally after the archive is downloaded. The report is saved alongside the downloaded archive in your configured output directory.
 
 ## 📊 General System Information Collection
 

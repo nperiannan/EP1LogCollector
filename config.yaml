@@ -103,3 +103,64 @@ appVersionCollection:
     - namespace: "nvo"
       description: "NVO services namespace"
       podPrefixes: ["nvo-edge", "nvo-network"]
+
+# ============================================================================
+# Temporal Cheat Sheet
+# ============================================================================
+# These are bash aliases for debugging Temporal workflows when exec'd into
+# a Temporal admin pod. Copy and paste these commands into your bash session.
+# 
+# Usage:
+#   1. kubectl exec -it <temporal-admin-pod> -n common -- bash
+#   2. Copy/paste the aliases below
+#   3. Use them: tc-list, tc-input <workflow-id>, tc-output <workflow-id>, etc.
+# ============================================================================
+
+Temporal_Cheat_Sheet: |
+  # List all workflows in configuration namespace
+  alias tc-list='temporal workflow list --namespace configuration'
+
+  # Show workflow input (decoded from base64 and pretty-printed JSON)
+  alias tc-input='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"; }; f'
+
+  # Show workflow output (decoded from base64 and pretty-printed JSON)
+  alias tc-output='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"; }; f'
+
+  # Show both input and output for a workflow
+  alias tc-both='f(){ echo "=== INPUT ===" && tc-input "$1" && echo -e "\n=== OUTPUT ===" && tc-output "$1"; }; f'
+
+  # List all activities for a workflow with event IDs and types
+  alias tc-activities='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""; }; f'
+
+  # Show activity failure details for a specific activity by name
+  alias tc-activity-failure='f(){
+    SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+      jq -r --arg activityName "$2" \
+        ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
+    if [ -n "$SCHED_ID" ]; then
+      temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+      jq -r --arg sid "$SCHED_ID" \
+        ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | \
+      jq . 2>/dev/null || echo "No failure data found for activity $2";
+    else
+      echo "Activity $2 not found";
+    fi
+  }; f'
+
+  # Show activity input by activity name
+  alias tc-activity-input-by-name='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"$2\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity $2"; }; f'
+
+  # Show activity output by activity name
+  alias tc-activity-output='f(){
+    SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+      jq -r --arg activityName "$2" \
+        ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
+    if [ -n "$SCHED_ID" ]; then
+      temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+      jq -r --arg sid "$SCHED_ID" \
+        ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | \
+      base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity $2";
+    else
+      echo "Activity $2 not found";
+    fi
+  }; f'

@@ -1027,6 +1027,157 @@ ws4r1         hacr-def456             1/1     Running   0          3d
 
 The general system information is automatically included in the same archive as the log files, providing a comprehensive operational snapshot for troubleshooting and analysis. The collection happens **before** archive creation, ensuring all information is properly included in the downloaded file.
 
+## ⏳ Temporal Workflow Collection (NEW)
+
+The tool can automatically collect comprehensive debugging information from **Temporal workflows** by connecting to the Temporal admin pod in the Kubernetes cluster. For each workflow, it collects input, output, activity details, and failure information — saving everything into separate, well-organized files.
+
+### Key Features
+
+- **🔍 Automatic Pod Discovery**: Finds the running `temporal-admintools` pod in the `common` namespace
+- **📋 Workflow Listing**: Lists recent workflows with status, ID, type, and start time
+- **📥 Input/Output Collection**: Decodes base64-encoded workflow payloads and pretty-prints JSON
+- **⚙️ Activity Details**: Collects input, output, and failure data for every activity in each workflow
+- **🎯 Prefix Filtering**: Optionally filter workflows by ID prefix (e.g., `deploy-profile-`)
+- **📁 Per-Workflow Files**: Each workflow's complete data saved to a separate file in the `Temporal/` directory
+- **🗜️ Archive Integration**: Temporal data included in the same archive as logs and system info
+
+### Archive Structure
+
+```
+my_log_collection_20250710_120000.tar.gz
+├── Temporal/                                          # Temporal workflow data
+│   ├── workflow_list.txt                              # Full workflow listing
+│   ├── deploy-profile-Test_profile-20260105-141248.txt  # Per-workflow details
+│   └── deploy-profile-Prod_profile-20260105-150000.txt
+├── General/                                           # System information
+└── [log files from pods]                              # Pod log files
+```
+
+### Per-Workflow File Contents
+
+Each workflow file contains all collected data in a structured format:
+
+```
+# Temporal Workflow Details
+# Workflow ID: deploy-profile-Test_profile-20260105-141248
+# Namespace: configuration
+# Collected: 2025-07-10 12:00:00
+
+================================================================================
+  WORKFLOW INPUT
+================================================================================
+
+{
+  "batchId": "batch-abc123",
+  "profileName": "Test_profile",
+  ...
+}
+
+================================================================================
+  WORKFLOW OUTPUT
+================================================================================
+
+{
+  "batchStatus": { ... },
+  ...
+}
+
+================================================================================
+  ACTIVITIES
+================================================================================
+
+5  EVENT_TYPE_ACTIVITY_TASK_SCHEDULED  GetConfigurationFeatures
+8  EVENT_TYPE_ACTIVITY_TASK_SCHEDULED  PrepareDeviceRecipe
+11 EVENT_TYPE_ACTIVITY_TASK_SCHEDULED  ProvisionConfigurationFeatures
+
+--------------------------------------------------------------------------------
+  ACTIVITY INPUT: GetConfigurationFeatures
+--------------------------------------------------------------------------------
+
+{ ... }
+
+--------------------------------------------------------------------------------
+  ACTIVITY OUTPUT: GetConfigurationFeatures
+--------------------------------------------------------------------------------
+
+{ ... }
+
+--------------------------------------------------------------------------------
+  ACTIVITY FAILURE: GetConfigurationFeatures
+--------------------------------------------------------------------------------
+
+No failure data found for activity GetConfigurationFeatures
+```
+
+### Configuration
+
+```yaml
+logCollection:
+  # Temporal workflow information collection
+  temporalWorkflowCollection:
+    enabled: true                    # Enable/disable temporal workflow data collection
+    workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows)
+    numberOfWorkflows: 3            # Number of recent workflows to collect (1-20, default 3)
+    namespace: "configuration"      # Temporal namespace to query
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable/disable Temporal workflow collection |
+| `workflowIdPrefix` | string | `""` | Filter workflows by ID prefix (empty = all) |
+| `numberOfWorkflows` | int | `3` | Number of recent workflows to collect (1-20) |
+| `namespace` | string | `configuration` | Temporal namespace to query |
+
+### How It Works
+
+1. **Pod Discovery**: Finds the running `temporal-admintools-*` pod in the `common` namespace
+2. **Workflow Listing**: Runs `temporal workflow list --namespace configuration` inside the admin pod
+3. **Filtering**: Applies prefix filter and limits to the configured number of workflows
+4. **Per-Workflow Collection**: For each workflow ID, collects:
+   - **Workflow Input**: Decoded JSON payload from the start event
+   - **Workflow Output**: Decoded JSON result from the completion event
+   - **Activities List**: All activity events with IDs, types, and names
+   - **Per-Activity Details**: For each unique activity:
+     - Activity input (decoded JSON)
+     - Activity output (decoded JSON)
+     - Activity failure details (if any)
+5. **File Output**: Saves a comprehensive file per workflow in the `Temporal/` directory
+6. **Archive**: All temporal data is included in the final `.tar.gz` archive
+
+### Usage Examples
+
+```bash
+# Collect logs with temporal workflow data
+.\fetchlogs.exe --all
+# (temporal collection runs automatically if enabled in config.yaml)
+
+# Collect only from specific workflow prefix
+# Set workflowIdPrefix: "deploy-profile-" in config.yaml
+
+# Collect more workflows (up to 20)
+# Set numberOfWorkflows: 10 in config.yaml
+```
+
+### Temporal Cheat Sheet
+
+The config.yaml also includes a `Temporal_Cheat_Sheet` section with bash aliases for manual Temporal debugging. These are the same commands the automated collection uses internally:
+
+```bash
+# Manual usage: kubectl exec into the admin pod first
+kubectl exec -it <temporal-admin-pod> -n common -- bash
+
+# Then use the aliases:
+tc-list                                    # List all workflows
+tc-input <workflow-id>                     # Show workflow input
+tc-output <workflow-id>                    # Show workflow output
+tc-activities <workflow-id>                # List activities with event IDs
+tc-activity-input-by-name <wf-id> <name>  # Activity input by name
+tc-activity-output <wf-id> <name>         # Activity output by name
+tc-activity-failure <wf-id> <name>        # Activity failure details
+```
+
 ## 📋 Application Version Collection
 
 The tool provides a standalone feature to collect and display application version information from Kubernetes clusters in a formatted output, perfect for documenting deployment states and troubleshooting version-related issues.

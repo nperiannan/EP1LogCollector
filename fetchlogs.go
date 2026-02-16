@@ -443,6 +443,12 @@ type Config struct {
 			Enabled  bool   `yaml:"enabled"`  // Enable time-based collection
 			Duration string `yaml:"duration"` // Duration like "15m", "1h", "30m"
 		} `yaml:"timeBasedCollection"`
+		TemporalWorkflowCollection struct {
+			Enabled           bool   `yaml:"enabled"`           // Enable temporal workflow data collection
+			WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`  // Filter by workflow ID prefix
+			NumberOfWorkflows int    `yaml:"numberOfWorkflows"`  // Number of workflows to collect (1-20)
+			Namespace         string `yaml:"namespace"`          // Temporal namespace (default: configuration)
+		} `yaml:"temporalWorkflowCollection"`
 	} `yaml:"logCollection"`
 	// General system information collection
 	GeneralInfo struct {
@@ -653,7 +659,12 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	Enabled   bool                 `yaml:"enabled"`
 	OutputDir string               `yaml:"outputDir"`
 	Commands  []GeneralInfoCommand `yaml:"commands"`
-}, timeBasedEnabled bool, timeDurationStr string, maxSSHSessions int, autoDeleteTempDir bool) (string, error) {
+}, timeBasedEnabled bool, timeDurationStr string, maxSSHSessions int, autoDeleteTempDir bool, temporalConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`
+	NumberOfWorkflows int    `yaml:"numberOfWorkflows"`
+	Namespace         string `yaml:"namespace"`
+}) (string, error) {
 	// Start timing the log collection process
 	logCollectionStartTime := time.Now()
 	logger.Info("Starting Kubernetes log collection...")
@@ -924,6 +935,16 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 		err = collectGeneralInfo(awsClient, generalInfoConfig, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("General info collection failed: %v", err)
+			// Don't return here - continue with archive creation
+		}
+	}
+
+	// Collect Temporal workflow information before archiving (if enabled)
+	if temporalConfig.Enabled {
+		logger.Info("Starting Temporal workflow information collection...")
+		err = collectTemporalWorkflowInfo(awsClient, temporalConfig, environment, username, tempDir, finalLogFileName)
+		if err != nil {
+			logger.Warn("Temporal workflow collection failed: %v", err)
 			// Don't return here - continue with archive creation
 		}
 	}
@@ -2485,6 +2506,355 @@ func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 	return nil
 }
 
+// collectTemporalWorkflowInfo collects Temporal workflow debugging information from the admin pod
+func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`
+	NumberOfWorkflows int    `yaml:"numberOfWorkflows"`
+	Namespace         string `yaml:"namespace"`
+}, environment, username, tempDir, finalLogFileName string) error {
+	if !temporalConfig.Enabled {
+		logger.Debug("Temporal workflow collection is disabled")
+		return nil
+	}
+
+	logger.Info("Starting Temporal workflow information collection...")
+
+	// Set defaults
+	temporalNamespace := temporalConfig.Namespace
+	if temporalNamespace == "" {
+		temporalNamespace = "configuration"
+	}
+	numberOfWorkflows := temporalConfig.NumberOfWorkflows
+	if numberOfWorkflows <= 0 {
+		numberOfWorkflows = 3
+	}
+	if numberOfWorkflows > 20 {
+		numberOfWorkflows = 20
+	}
+
+	// Create the Temporal output directory on the remote server inside the log collection directory
+	logDir := fmt.Sprintf("%s/%s", tempDir, finalLogFileName)
+	temporalOutputDir := fmt.Sprintf("%s/Temporal", logDir)
+
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for temporal directory: %v", err)
+	}
+	defer session.Close()
+
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", temporalOutputDir)
+	if err := executeCommandAsRoot(session, mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create temporal directory: %v", err)
+	}
+	logger.Info("Created Temporal output directory: %s", temporalOutputDir)
+
+	// Step 1: Find the temporal admin pod
+	logger.Info("Discovering Temporal admin pod in 'common' namespace...")
+	podSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for pod discovery: %v", err)
+	}
+
+	podCmd := "kubectl get pods -n common --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print $1}'"
+	podOutput, err := podSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", podCmd))
+	podSession.Close()
+	if err != nil {
+		return fmt.Errorf("failed to discover temporal admin pod: %v", err)
+	}
+
+	adminPod := strings.TrimSpace(string(podOutput))
+	if adminPod == "" {
+		return fmt.Errorf("no running temporal-admintools pod found in 'common' namespace")
+	}
+	logger.Info("Found Temporal admin pod: %s", adminPod)
+
+	// Step 2: List workflows
+	logger.Info("Listing workflows in namespace '%s'...", temporalNamespace)
+	listSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for workflow listing: %v", err)
+	}
+
+	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s --output json 2>/dev/null",
+		adminPod, temporalNamespace)
+	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", listCmd))
+	listSession.Close()
+	if err != nil {
+		// Try without --output json (plain text listing)
+		logger.Debug("JSON listing failed, trying plain text listing...")
+		listSession2, err2 := awsClient.NewSession()
+		if err2 != nil {
+			return fmt.Errorf("failed to create session for workflow listing: %v", err2)
+		}
+		listCmd2 := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s 2>/dev/null",
+			adminPod, temporalNamespace)
+		listOutput, err = listSession2.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", listCmd2))
+		listSession2.Close()
+		if err != nil {
+			return fmt.Errorf("failed to list temporal workflows: %v\nOutput: %s", err, string(listOutput))
+		}
+	}
+
+	// Save the full workflow listing
+	writeFileToRemote(awsClient, fmt.Sprintf("%s/workflow_list.txt", temporalOutputDir),
+		fmt.Sprintf("# Temporal Workflow List\n# Namespace: %s\n# Collected: %s\n# Filter: %s\n%s\n\n%s",
+			temporalNamespace, time.Now().Format("2006-01-02 15:04:05"),
+			func() string {
+				if temporalConfig.WorkflowIdPrefix != "" {
+					return "prefix=" + temporalConfig.WorkflowIdPrefix
+				}
+				return "none"
+			}(),
+			strings.Repeat("-", 60),
+			string(listOutput)))
+
+	// Step 3: Extract workflow IDs from the listing
+	workflowIDs := extractWorkflowIDs(string(listOutput), temporalConfig.WorkflowIdPrefix, numberOfWorkflows)
+	if len(workflowIDs) == 0 {
+		logger.Warn("No workflow IDs found matching the criteria")
+		writeFileToRemote(awsClient, fmt.Sprintf("%s/no_workflows_found.txt", temporalOutputDir),
+			fmt.Sprintf("No workflows found matching criteria.\nPrefix filter: '%s'\nNamespace: %s\n",
+				temporalConfig.WorkflowIdPrefix, temporalNamespace))
+		return nil
+	}
+
+	logger.Info("Found %d workflow(s) to collect information for", len(workflowIDs))
+	for i, wfID := range workflowIDs {
+		logger.Info("  %d. %s", i+1, wfID)
+	}
+
+	// Step 4: For each workflow, collect detailed information
+	for i, workflowID := range workflowIDs {
+		logger.Info("Collecting data for workflow %d/%d: %s", i+1, len(workflowIDs), workflowID)
+
+		// Create a sanitized filename from workflow ID
+		safeWfID := sanitizeFilename(workflowID)
+		wfOutputFile := fmt.Sprintf("%s/%s.txt", temporalOutputDir, safeWfID)
+
+		var wfContent strings.Builder
+		wfContent.WriteString(fmt.Sprintf("# Temporal Workflow Details\n"))
+		wfContent.WriteString(fmt.Sprintf("# Workflow ID: %s\n", workflowID))
+		wfContent.WriteString(fmt.Sprintf("# Namespace: %s\n", temporalNamespace))
+		wfContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+		wfContent.WriteString(fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60)))
+
+		// 4a: Workflow Input
+		logger.Debug("  Collecting workflow input...")
+		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
+		wfContent.WriteString("  WORKFLOW INPUT\n")
+		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
+
+		inputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"'`,
+			adminPod, temporalNamespace, workflowID)
+		inputOutput := executeTemporalCommand(awsClient, inputCmd)
+		wfContent.WriteString(inputOutput + "\n\n")
+
+		// 4b: Workflow Output
+		logger.Debug("  Collecting workflow output...")
+		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
+		wfContent.WriteString("  WORKFLOW OUTPUT\n")
+		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
+
+		outputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"'`,
+			adminPod, temporalNamespace, workflowID)
+		outputOutput := executeTemporalCommand(awsClient, outputCmd)
+		wfContent.WriteString(outputOutput + "\n\n")
+
+		// 4c: List Activities
+		logger.Debug("  Collecting activity list...")
+		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
+		wfContent.WriteString("  ACTIVITIES\n")
+		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
+
+		activitiesCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""'`,
+			adminPod, temporalNamespace, workflowID)
+		activitiesOutput := executeTemporalCommand(awsClient, activitiesCmd)
+		wfContent.WriteString(activitiesOutput + "\n\n")
+
+		// 4d: Extract unique activity names and collect per-activity details
+		activityNames := extractActivityNames(activitiesOutput)
+		if len(activityNames) > 0 {
+			logger.Info("  Found %d unique activities: %v", len(activityNames), activityNames)
+
+			for _, activityName := range activityNames {
+				logger.Debug("  Collecting details for activity: %s", activityName)
+
+				// Activity Input
+				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n")
+				wfContent.WriteString(fmt.Sprintf("  ACTIVITY INPUT: %s\n", activityName))
+				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
+
+				actInputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"%s\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity %s"'`,
+					adminPod, temporalNamespace, workflowID, activityName, activityName)
+				actInputOutput := executeTemporalCommand(awsClient, actInputCmd)
+				wfContent.WriteString(actInputOutput + "\n\n")
+
+				// Activity Output
+				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n")
+				wfContent.WriteString(fmt.Sprintf("  ACTIVITY OUTPUT: %s\n", activityName))
+				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
+
+				actOutputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity %s"; else echo "Activity %s not found"; fi'`,
+					adminPod, temporalNamespace, workflowID, activityName,
+					temporalNamespace, workflowID, activityName, activityName)
+				actOutputOutput := executeTemporalCommand(awsClient, actOutputCmd)
+				wfContent.WriteString(actOutputOutput + "\n\n")
+
+				// Activity Failure
+				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n")
+				wfContent.WriteString(fmt.Sprintf("  ACTIVITY FAILURE: %s\n", activityName))
+				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
+
+				actFailureCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | jq . 2>/dev/null || echo "No failure data found for activity %s"; else echo "Activity %s not found"; fi'`,
+					adminPod, temporalNamespace, workflowID, activityName,
+					temporalNamespace, workflowID, activityName, activityName)
+				actFailureOutput := executeTemporalCommand(awsClient, actFailureCmd)
+				wfContent.WriteString(actFailureOutput + "\n\n")
+			}
+		} else {
+			wfContent.WriteString("No activities found for this workflow.\n\n")
+		}
+
+		// Write the complete workflow file
+		writeFileToRemote(awsClient, wfOutputFile, wfContent.String())
+		logger.Info("  Saved workflow data to: %s", wfOutputFile)
+	}
+
+	logger.Info("Temporal workflow collection completed: %d workflow(s) collected", len(workflowIDs))
+	logger.Info("Temporal data saved to remote directory: %s", temporalOutputDir)
+	return nil
+}
+
+// executeTemporalCommand runs a command via SSH and returns the output string
+func executeTemporalCommand(awsClient *ssh.Client, command string) string {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Sprintf("ERROR: Failed to create SSH session: %v", err)
+	}
+	defer session.Close()
+
+	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", command))
+	if err != nil {
+		// Still return output - it may contain useful partial data or error messages
+		if len(output) > 0 {
+			return string(output)
+		}
+		return fmt.Sprintf("ERROR: Command failed: %v", err)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// extractWorkflowIDs parses workflow listing output and extracts workflow IDs
+// Supports both JSON array output and plain text tabular output from `temporal workflow list`
+func extractWorkflowIDs(listOutput string, prefixFilter string, maxCount int) []string {
+	var workflowIDs []string
+	lines := strings.Split(strings.TrimSpace(listOutput), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Skip header lines
+		if strings.HasPrefix(line, "Status") || strings.HasPrefix(line, "------") || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Try to extract workflow ID from different formats:
+		// Format 1 (tabular): "Running  deploy-profile-Test_profile-20260105-141248  ..."
+		// Format 2 (tabular): "Completed  workflow-id  WorkflowType  2025-01-05T..."
+		// The workflow ID is typically the second field in the table
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			// Check if first field looks like a status
+			possibleStatus := strings.ToLower(fields[0])
+			if possibleStatus == "running" || possibleStatus == "completed" || possibleStatus == "failed" ||
+				possibleStatus == "canceled" || possibleStatus == "terminated" || possibleStatus == "timedout" ||
+				possibleStatus == "continueasnew" {
+				workflowID := fields[1]
+				// Apply prefix filter if specified
+				if prefixFilter != "" && !strings.HasPrefix(workflowID, prefixFilter) {
+					continue
+				}
+				workflowIDs = append(workflowIDs, workflowID)
+			}
+		}
+	}
+
+	// Limit to maxCount
+	if len(workflowIDs) > maxCount {
+		workflowIDs = workflowIDs[:maxCount]
+	}
+
+	return workflowIDs
+}
+
+// extractActivityNames parses the activities listing output and returns unique activity names
+func extractActivityNames(activitiesOutput string) []string {
+	seen := make(map[string]bool)
+	var names []string
+	lines := strings.Split(strings.TrimSpace(activitiesOutput), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "ERROR") {
+			continue
+		}
+
+		// Format: "eventId  eventType  activityName"
+		// e.g., "5  EVENT_TYPE_ACTIVITY_TASK_SCHEDULED  GetConfigurationFeatures"
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			// The activity name is the last field, but only for SCHEDULED events
+			eventType := fields[1]
+			if strings.Contains(eventType, "SCHEDULED") {
+				activityName := fields[len(fields)-1]
+				if activityName != "-" && activityName != "" && !seen[activityName] {
+					seen[activityName] = true
+					names = append(names, activityName)
+				}
+			}
+		}
+	}
+
+	return names
+}
+
+// writeFileToRemote writes content to a file on the remote server via SSH using stdin pipe
+func writeFileToRemote(awsClient *ssh.Client, filePath, content string) error {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		logger.Error("Failed to create session for writing file %s: %v", filePath, err)
+		return err
+	}
+	defer session.Close()
+
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %v", err)
+	}
+
+	writeCmd := fmt.Sprintf("sudo su - -c 'cat > %s'", filePath)
+	if err := session.Start(writeCmd); err != nil {
+		stdinPipe.Close()
+		return fmt.Errorf("failed to start write command: %v", err)
+	}
+
+	_, err = io.WriteString(stdinPipe, content)
+	stdinPipe.Close()
+	if err != nil {
+		return fmt.Errorf("failed to write content: %v", err)
+	}
+
+	if err := session.Wait(); err != nil {
+		return fmt.Errorf("failed to write file on remote server: %v", err)
+	}
+
+	return nil
+}
+
 // sanitizeFilename removes or replaces characters that are not suitable for filenames
 func sanitizeFilename(name string) string {
 	// Replace spaces and other problematic characters
@@ -3297,7 +3667,7 @@ func main() {
 		// Start timing the entire log collection and archive creation process
 		overallStartTime := time.Now()
 
-		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir)
+		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.TemporalWorkflowCollection)
 		if err != nil {
 			logger.Error("Failed to collect logs: %v", err)
 			return

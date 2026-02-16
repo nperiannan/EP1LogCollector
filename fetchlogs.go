@@ -104,6 +104,41 @@ func (l *Logger) Close() {
 	}
 }
 
+// CopyLogFileTo copies the logger_info.txt to the specified output directory
+func (l *Logger) CopyLogFileTo(outputDir string) {
+	if l.logFile == nil {
+		return
+	}
+	// Flush current content
+	l.logFile.Sync()
+
+	srcPath := l.logFile.Name()
+	dstPath := filepath.Join(outputDir, "logger_info.txt")
+
+	// Don't copy if source and destination are the same
+	absSrc, _ := filepath.Abs(srcPath)
+	absDst, _ := filepath.Abs(dstPath)
+	if absSrc == absDst {
+		return
+	}
+
+	src, err := os.Open(srcPath)
+	if err != nil {
+		fmt.Printf("Warning: Could not read logger_info.txt for copy: %v\n", err)
+		return
+	}
+	defer src.Close()
+
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		fmt.Printf("Warning: Could not create logger_info.txt in output dir: %v\n", err)
+		return
+	}
+	defer dst.Close()
+
+	io.Copy(dst, src)
+}
+
 // Log prints a message with the specified log level
 func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
 	// Only print if the message level is >= minimum level
@@ -479,11 +514,12 @@ type Config struct {
 			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
 		} `yaml:"temporalWorkflowCollection"`
 		LogAnalysis struct {
-			Enabled       bool     `yaml:"enabled"`       // Enable automatic log analysis
-			OutputFile    string   `yaml:"outputFile"`    // Output file name for analysis report
-			ErrorPatterns []string `yaml:"errorPatterns"` // Patterns to search for (case-insensitive)
-			MaxMatches    int      `yaml:"maxMatches"`    // Max matches per log file
-			ContextLines  int      `yaml:"contextLines"`  // Lines before/after each match
+			Enabled         bool     `yaml:"enabled"`         // Enable automatic log analysis
+			OutputFile      string   `yaml:"outputFile"`      // Output file name for analysis report
+			ErrorPatterns   []string `yaml:"errorPatterns"`   // Patterns to search for (case-insensitive)
+			ExcludeKeywords []string `yaml:"excludeKeywords"` // Keywords to exclude from matches (case-insensitive)
+			MaxMatches      int      `yaml:"maxMatches"`      // Max matches per log file
+			ContextLines    int      `yaml:"contextLines"`    // Lines before/after each match
 		} `yaml:"logAnalysis"`
 	} `yaml:"logCollection"`
 	// General system information collection
@@ -3019,11 +3055,12 @@ type FileAnalysisSummary struct {
 // analyzeDownloadedLogs extracts a downloaded .tar.gz archive and analyzes all log files
 // for error patterns, correlates issues across files, and generates a comprehensive report
 func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig struct {
-	Enabled       bool     `yaml:"enabled"`
-	OutputFile    string   `yaml:"outputFile"`
-	ErrorPatterns []string `yaml:"errorPatterns"`
-	MaxMatches    int      `yaml:"maxMatches"`
-	ContextLines  int      `yaml:"contextLines"`
+	Enabled         bool     `yaml:"enabled"`
+	OutputFile      string   `yaml:"outputFile"`
+	ErrorPatterns   []string `yaml:"errorPatterns"`
+	ExcludeKeywords []string `yaml:"excludeKeywords"`
+	MaxMatches      int      `yaml:"maxMatches"`
+	ContextLines    int      `yaml:"contextLines"`
 }) error {
 	if !logAnalysisConfig.Enabled {
 		logger.Debug("Log analysis is disabled")
@@ -3062,9 +3099,23 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 		return fmt.Errorf("no valid error patterns compiled")
 	}
 
-	logger.Info("Analyzing with %d error patterns, %d context lines before/after",
-		len(compiledPatterns), logAnalysisConfig.ContextLines)
+	// Compile exclude keyword patterns (case-insensitive)
+	var compiledExcludes []*regexp.Regexp
+	for _, exclude := range logAnalysisConfig.ExcludeKeywords {
+		re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(exclude))
+		if err != nil {
+			logger.Warn("Invalid exclude keyword '%s', skipping: %v", exclude, err)
+			continue
+		}
+		compiledExcludes = append(compiledExcludes, re)
+	}
+
+	logger.Info("Analyzing with %d error patterns, %d exclude keywords, %d context lines before/after",
+		len(compiledPatterns), len(compiledExcludes), logAnalysisConfig.ContextLines)
 	logger.Info("Patterns: %s", strings.Join(logAnalysisConfig.ErrorPatterns, ", "))
+	if len(logAnalysisConfig.ExcludeKeywords) > 0 {
+		logger.Info("Excludes: %s", strings.Join(logAnalysisConfig.ExcludeKeywords, ", "))
+	}
 
 	// Step 1: Extract the archive to a temporary directory
 	extractDir, err := extractTarGz(archivePath)
@@ -3114,7 +3165,7 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 
 	for _, filePath := range logFiles {
 		relPath, _ := filepath.Rel(extractDir, filePath)
-		summary := analyzeFileForPatterns(filePath, relPath, compiledPatterns,
+		summary := analyzeFileForPatterns(filePath, relPath, compiledPatterns, compiledExcludes,
 			logAnalysisConfig.ErrorPatterns, logAnalysisConfig.MaxMatches, logAnalysisConfig.ContextLines)
 
 		if summary.TotalMatches > 0 {
@@ -3141,7 +3192,21 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 	globalPatternFileMap = patternFileMap
 
 	// Step 5: Generate the report
-	reportPath := filepath.Join(outputDir, logAnalysisConfig.OutputFile)
+	// Derive report filename with timestamp from the archive name
+	// e.g., app_log_20250710_120000.tar.gz -> log_analytics_report_20250710_120000.txt
+	reportFileName := logAnalysisConfig.OutputFile
+	archiveBase := filepath.Base(archivePath)
+	archiveBase = strings.TrimSuffix(archiveBase, ".tar.gz")
+	archiveBase = strings.TrimSuffix(archiveBase, ".gz")
+	// Extract timestamp portion: look for _YYYYMMDD_HHMMSS pattern
+	tsRegex := regexp.MustCompile(`(\d{8}_\d{6})`)
+	if matches := tsRegex.FindString(archiveBase); matches != "" {
+		// Insert timestamp before .txt extension
+		ext := filepath.Ext(reportFileName)
+		base := strings.TrimSuffix(reportFileName, ext)
+		reportFileName = fmt.Sprintf("%s_%s%s", base, matches, ext)
+	}
+	reportPath := filepath.Join(outputDir, reportFileName)
 	err = generateAnalyticsReport(reportPath, allSummaries, correlatedIssues,
 		globalPatternCounts, logAnalysisConfig, totalMatchesFound, archivePath)
 	if err != nil {
@@ -3269,8 +3334,9 @@ func isLikelyTextFile(path string) bool {
 }
 
 // analyzeFileForPatterns scans a file for error patterns and returns matches with context
+// Lines matching any exclude pattern are skipped (false positive filtering)
 func analyzeFileForPatterns(filePath, displayName string, compiledPatterns []*regexp.Regexp,
-	patternNames []string, maxMatches, contextLines int) FileAnalysisSummary {
+	compiledExcludes []*regexp.Regexp, patternNames []string, maxMatches, contextLines int) FileAnalysisSummary {
 
 	summary := FileAnalysisSummary{
 		FileName:      displayName,
@@ -3301,6 +3367,18 @@ func analyzeFileForPatterns(filePath, displayName string, compiledPatterns []*re
 	for lineIdx, line := range lines {
 		if matchCount >= maxMatches {
 			break
+		}
+
+		// Check if this line matches any exclude keyword — skip if so
+		excluded := false
+		for _, exRe := range compiledExcludes {
+			if exRe.MatchString(line) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
 		}
 
 		for patIdx, re := range compiledPatterns {
@@ -3452,11 +3530,12 @@ func generateIssueDescription(pattern string, totalCount int, files []string) st
 func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 	correlatedIssues []CorrelatedIssue, globalPatternCounts map[string]int,
 	config struct {
-		Enabled       bool     `yaml:"enabled"`
-		OutputFile    string   `yaml:"outputFile"`
-		ErrorPatterns []string `yaml:"errorPatterns"`
-		MaxMatches    int      `yaml:"maxMatches"`
-		ContextLines  int      `yaml:"contextLines"`
+		Enabled         bool     `yaml:"enabled"`
+		OutputFile      string   `yaml:"outputFile"`
+		ErrorPatterns   []string `yaml:"errorPatterns"`
+		ExcludeKeywords []string `yaml:"excludeKeywords"`
+		MaxMatches      int      `yaml:"maxMatches"`
+		ContextLines    int      `yaml:"contextLines"`
 	}, totalMatches int, archivePath string) error {
 
 	file, err := os.Create(reportPath)
@@ -3475,6 +3554,9 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 	fmt.Fprintf(w, "  Generated:     %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(w, "  Archive:       %s\n", filepath.Base(archivePath))
 	fmt.Fprintf(w, "  Patterns:      %s\n", strings.Join(config.ErrorPatterns, ", "))
+	if len(config.ExcludeKeywords) > 0 {
+		fmt.Fprintf(w, "  Excludes:      %s\n", strings.Join(config.ExcludeKeywords, ", "))
+	}
 	fmt.Fprintf(w, "  Context Lines: %d before / %d after\n", config.ContextLines, config.ContextLines)
 	fmt.Fprintf(w, "  Max Matches:   %d per file\n", config.MaxMatches)
 	fmt.Fprintf(w, "  Files Analyzed: %d with matches out of total scanned\n", len(summaries))
@@ -4797,6 +4879,11 @@ func main() {
 				}
 			}
 		}
+	}
+
+	// Copy logger_info.txt to the output directory so it lives alongside the downloaded files
+	if successCount > 0 {
+		logger.CopyLogFileTo(*outputDir)
 	}
 
 	fmt.Println("\nDownload complete!")

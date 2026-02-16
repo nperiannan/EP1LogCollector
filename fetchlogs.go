@@ -3010,9 +3010,9 @@ type CorrelatedIssue struct {
 
 // FileAnalysisSummary holds analysis results for a single file
 type FileAnalysisSummary struct {
-	FileName     string
-	TotalMatches int
-	Matches      []LogMatch
+	FileName      string
+	TotalMatches  int
+	Matches       []LogMatch
 	PatternCounts map[string]int // count per pattern
 }
 
@@ -3108,8 +3108,8 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 
 	// Step 3: Analyze each file for error patterns
 	var allSummaries []FileAnalysisSummary
-	globalPatternCounts := make(map[string]int)             // pattern -> total count across all files
-	patternFileMap := make(map[string]map[string]int)       // pattern -> file -> count
+	globalPatternCounts := make(map[string]int)       // pattern -> total count across all files
+	patternFileMap := make(map[string]map[string]int) // pattern -> file -> count
 	totalMatchesFound := 0
 
 	for _, filePath := range logFiles {
@@ -3586,20 +3586,20 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 				fmt.Fprintln(w, "      --- BEFORE ---")
 				for i, line := range match.BeforeLines {
 					beforeLineNum := match.LineNumber - len(match.BeforeLines) + i
-					fmt.Fprintf(w, "      %4d | %s\n", beforeLineNum, truncateLine(line, 200))
+					fmt.Fprintf(w, "      %4d | %s\n", beforeLineNum, line)
 				}
 			}
 
 			// The matched line (highlighted)
 			fmt.Fprintln(w, "      >>> MATCHED LINE <<<")
-			fmt.Fprintf(w, "      %4d | %s\n", match.LineNumber, truncateLine(match.MatchedLine, 200))
+			fmt.Fprintf(w, "      %4d | %s\n", match.LineNumber, match.MatchedLine)
 
 			// After context
 			if len(match.AfterLines) > 0 {
 				fmt.Fprintln(w, "      --- AFTER ---")
 				for i, line := range match.AfterLines {
 					afterLineNum := match.LineNumber + 1 + i
-					fmt.Fprintf(w, "      %4d | %s\n", afterLineNum, truncateLine(line, 200))
+					fmt.Fprintf(w, "      %4d | %s\n", afterLineNum, line)
 				}
 			}
 

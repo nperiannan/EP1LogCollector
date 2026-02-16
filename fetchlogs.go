@@ -2573,32 +2573,22 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 
 	// Step 2: List workflows
 	logger.Info("Listing workflows in namespace '%s'...", temporalNamespace)
+
+	// First: get the plain text tabular listing (human-readable, used for parsing workflow IDs)
 	listSession, err := awsClient.NewSession()
 	if err != nil {
 		return fmt.Errorf("failed to create session for workflow listing: %v", err)
 	}
 
-	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s --output json 2>/dev/null",
+	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s 2>/dev/null",
 		adminPod, temporalNamespace)
 	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
 	listSession.Close()
 	if err != nil {
-		// Try without --output json (plain text listing)
-		logger.Debug("JSON listing failed, trying plain text listing...")
-		listSession2, err2 := awsClient.NewSession()
-		if err2 != nil {
-			return fmt.Errorf("failed to create session for workflow listing: %v", err2)
-		}
-		listCmd2 := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s 2>/dev/null",
-			adminPod, temporalNamespace)
-		listOutput, err = listSession2.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd2))
-		listSession2.Close()
-		if err != nil {
-			return fmt.Errorf("failed to list temporal workflows: %v\nOutput: %s", err, string(listOutput))
-		}
+		return fmt.Errorf("failed to list temporal workflows: %v\nOutput: %s", err, string(listOutput))
 	}
 
-	// Save the full workflow listing
+	// Save the tabular workflow listing as workflow_list.txt
 	writeFileToRemote(awsClient, fmt.Sprintf("%s/workflow_list.txt", temporalOutputDir),
 		fmt.Sprintf("# Temporal Workflow List\n# Namespace: %s\n# Collected: %s\n# Filter: %s\n%s\n\n%s",
 			temporalNamespace, time.Now().Format("2006-01-02 15:04:05"),
@@ -2611,7 +2601,22 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 			strings.Repeat("-", 60),
 			string(listOutput)))
 
-	// Step 3: Extract workflow IDs from the listing
+	// Also save JSON listing as workflow_list.json (useful for programmatic analysis)
+	jsonListSession, jsonErr := awsClient.NewSession()
+	if jsonErr == nil {
+		jsonListCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s --output json 2>/dev/null",
+			adminPod, temporalNamespace)
+		jsonListOutput, jsonExecErr := jsonListSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", jsonListCmd))
+		jsonListSession.Close()
+		if jsonExecErr == nil {
+			writeFileToRemote(awsClient, fmt.Sprintf("%s/workflow_list.json", temporalOutputDir), string(jsonListOutput))
+			logger.Debug("Saved JSON workflow listing to workflow_list.json")
+		} else {
+			logger.Debug("JSON workflow listing failed (non-critical): %v", jsonExecErr)
+		}
+	}
+
+	// Step 3: Extract workflow IDs from the tabular listing
 	listOutputStr := string(listOutput)
 	logger.Debug("Workflow list output (first 500 chars): %s", func() string {
 		if len(listOutputStr) > 500 {

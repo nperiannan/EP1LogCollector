@@ -2612,12 +2612,19 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 			string(listOutput)))
 
 	// Step 3: Extract workflow IDs from the listing
-	workflowIDs := extractWorkflowIDs(string(listOutput), temporalConfig.WorkflowIdPrefix, numberOfWorkflows)
+	listOutputStr := string(listOutput)
+	logger.Debug("Workflow list output (first 500 chars): %s", func() string {
+		if len(listOutputStr) > 500 {
+			return listOutputStr[:500] + "..."
+		}
+		return listOutputStr
+	}())
+	workflowIDs := extractWorkflowIDs(listOutputStr, temporalConfig.WorkflowIdPrefix, numberOfWorkflows)
 	if len(workflowIDs) == 0 {
 		logger.Warn("No workflow IDs found matching the criteria")
 		writeFileToRemote(awsClient, fmt.Sprintf("%s/no_workflows_found.txt", temporalOutputDir),
-			fmt.Sprintf("No workflows found matching criteria.\nPrefix filter: '%s'\nNamespace: %s\n",
-				temporalConfig.WorkflowIdPrefix, temporalNamespace))
+			fmt.Sprintf("No workflows found matching criteria.\nPrefix filter: '%s'\nNamespace: %s\nRaw listing output:\n%s\n",
+				temporalConfig.WorkflowIdPrefix, temporalNamespace, listOutputStr))
 		return nil
 	}
 
@@ -2753,39 +2760,86 @@ func executeTemporalCommand(awsClient *ssh.Client, command string) string {
 }
 
 // extractWorkflowIDs parses workflow listing output and extracts workflow IDs
-// Supports both JSON array output and plain text tabular output from `temporal workflow list`
+// Supports both JSON output and plain text tabular output from `temporal workflow list`
 func extractWorkflowIDs(listOutput string, prefixFilter string, maxCount int) []string {
 	var workflowIDs []string
-	lines := strings.Split(strings.TrimSpace(listOutput), "\n")
+	trimmed := strings.TrimSpace(listOutput)
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		// Skip header lines
-		if strings.HasPrefix(line, "Status") || strings.HasPrefix(line, "------") || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Try to extract workflow ID from different formats:
-		// Format 1 (tabular): "Running  deploy-profile-Test_profile-20260105-141248  ..."
-		// Format 2 (tabular): "Completed  workflow-id  WorkflowType  2025-01-05T..."
-		// The workflow ID is typically the second field in the table
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			// Check if first field looks like a status
-			possibleStatus := strings.ToLower(fields[0])
-			if possibleStatus == "running" || possibleStatus == "completed" || possibleStatus == "failed" ||
-				possibleStatus == "canceled" || possibleStatus == "terminated" || possibleStatus == "timedout" ||
-				possibleStatus == "continueasnew" {
-				workflowID := fields[1]
-				// Apply prefix filter if specified
-				if prefixFilter != "" && !strings.HasPrefix(workflowID, prefixFilter) {
+	// Try JSON parsing first — temporal workflow list --output json returns one JSON object per line (JSONL)
+	// or could return a JSON array. Look for workflowId or WorkflowId fields.
+	if strings.Contains(trimmed, "workflowId") || strings.Contains(trimmed, "WorkflowId") || strings.Contains(trimmed, "workflow_id") {
+		lines := strings.Split(trimmed, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// Extract workflowId from JSON-like content using simple string matching
+			// Handles formats like: "workflowId": "deploy-profile-..."
+			for _, key := range []string{`"workflowId"`, `"WorkflowId"`, `"workflow_id"`} {
+				idx := strings.Index(line, key)
+				if idx == -1 {
 					continue
 				}
-				workflowIDs = append(workflowIDs, workflowID)
+				// Find the value after the key
+				rest := line[idx+len(key):]
+				// Skip : and whitespace
+				rest = strings.TrimLeft(rest, ": \t")
+				// Extract quoted value
+				if len(rest) > 0 && rest[0] == '"' {
+					rest = rest[1:]
+					endIdx := strings.Index(rest, "\"")
+					if endIdx > 0 {
+						wfID := rest[:endIdx]
+						if prefixFilter == "" || strings.HasPrefix(wfID, prefixFilter) {
+							workflowIDs = append(workflowIDs, wfID)
+						}
+					}
+				}
+				break
+			}
+		}
+		// Deduplicate (same workflow ID might appear in multiple JSON fields)
+		seen := make(map[string]bool)
+		unique := []string{}
+		for _, id := range workflowIDs {
+			if !seen[id] {
+				seen[id] = true
+				unique = append(unique, id)
+			}
+		}
+		workflowIDs = unique
+	}
+
+	// If JSON parsing didn't find anything, try tabular format
+	if len(workflowIDs) == 0 {
+		lines := strings.Split(trimmed, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			// Skip header lines
+			if strings.HasPrefix(line, "Status") || strings.HasPrefix(line, "------") || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			// Try to extract workflow ID from tabular format:
+			// "Running  deploy-profile-Test_profile-20260105-141248  WorkflowType  2025-01-05T..."
+			// "Completed  workflow-id  WorkflowType  2025-01-05T..."
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				possibleStatus := strings.ToLower(fields[0])
+				if possibleStatus == "running" || possibleStatus == "completed" || possibleStatus == "failed" ||
+					possibleStatus == "canceled" || possibleStatus == "terminated" || possibleStatus == "timedout" ||
+					possibleStatus == "continueasnew" {
+					workflowID := fields[1]
+					if prefixFilter != "" && !strings.HasPrefix(workflowID, prefixFilter) {
+						continue
+					}
+					workflowIDs = append(workflowIDs, workflowID)
+				}
 			}
 		}
 	}

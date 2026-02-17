@@ -4031,11 +4031,11 @@ func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []C
 }
 
 // ============================================================================
-// Post-Download Message Filter — Filter logs into a separate filter/ directory
+// Post-Download Message Filter — Filter logs into a separate filtered_logs_{timestamp} directory
 // ============================================================================
 
 // filterDownloadedLogs extracts a .tar.gz archive, applies message filters to each log file,
-// and writes filtered versions into a filter/ subdirectory preserving the archive's directory structure.
+// and writes filtered versions into a filtered_logs_{timestamp} directory preserving the archive's directory structure.
 //
 // Filter logic:
 //   - keyValueFilters: For each filter, if a line contains the key, it's kept only if the value matches.
@@ -4091,16 +4091,16 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	archiveBase = strings.TrimSuffix(archiveBase, ".gz")
 
 	// Extract timestamp from archive name (e.g., app_log_20260217_095735 -> 20260217_095735)
-	// Use it to create filter/filtered_log_{timestamp}/
+	// Use it to create filtered_logs_{timestamp}/
 	tsRe := regexp.MustCompile(`(\d{8}_\d{6})$`)
 	tsMatch := tsRe.FindString(archiveBase)
 	filterDirName := archiveBase // fallback: use full archive base name
 	if tsMatch != "" {
-		filterDirName = "filtered_log_" + tsMatch
+		filterDirName = "filtered_logs_" + tsMatch
 	}
 
-	// Create filter output directory: outputDir/filter/filtered_log_{timestamp}/
-	filterBaseDir := filepath.Join(outputDir, "filter", filterDirName)
+	// Create filter output directory: outputDir/filtered_logs_{timestamp}/
+	filterBaseDir := filepath.Join(outputDir, filterDirName)
 
 	// Discover all files
 	var logFiles []string

@@ -104,8 +104,9 @@ func (l *Logger) Close() {
 	}
 }
 
-// CopyLogFileTo copies the logger_info.txt to the specified output directory
-func (l *Logger) CopyLogFileTo(outputDir string) {
+// CopyLogFileTo copies the logger_info.txt to the specified output directory.
+// If archiveTimestamp is non-empty, the file is saved as logger_info_{timestamp}.txt
+func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 	if l.logFile == nil {
 		return
 	}
@@ -113,7 +114,11 @@ func (l *Logger) CopyLogFileTo(outputDir string) {
 	l.logFile.Sync()
 
 	srcPath := l.logFile.Name()
-	dstPath := filepath.Join(outputDir, "logger_info.txt")
+	dstFileName := "logger_info.txt"
+	if archiveTimestamp != "" {
+		dstFileName = fmt.Sprintf("logger_info_%s.txt", archiveTimestamp)
+	}
+	dstPath := filepath.Join(outputDir, dstFileName)
 
 	// Don't copy if source and destination are the same
 	absSrc, _ := filepath.Abs(srcPath)
@@ -471,8 +476,9 @@ type AppVersionNamespace struct {
 
 // Configuration structure for the application
 type Config struct {
-	Username    string `yaml:"username"`    // Global username for all connections
-	Environment string `yaml:"environment"` // Environment identifier (e.g., dl1r1, g2r1)
+	Username         string `yaml:"username"`    // Global username for all connections
+	Environment      string `yaml:"environment"` // Environment identifier (e.g., dl1r1, g2r1)
+	archiveTimestamp string // Runtime-only: timestamp extracted from archive name (not persisted in YAML)
 	Bastion     struct {
 		Host     string `yaml:"host"`
 		Port     int    `yaml:"port"`
@@ -3879,8 +3885,17 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	archiveBase = strings.TrimSuffix(archiveBase, ".tar.gz")
 	archiveBase = strings.TrimSuffix(archiveBase, ".gz")
 
-	// Create filter output directory: outputDir/filter/archiveName/
-	filterBaseDir := filepath.Join(outputDir, "filter", archiveBase)
+	// Extract timestamp from archive name (e.g., app_log_20260217_095735 -> 20260217_095735)
+	// Use it to create filter/filtered_log_{timestamp}/
+	tsRe := regexp.MustCompile(`(\d{8}_\d{6})$`)
+	tsMatch := tsRe.FindString(archiveBase)
+	filterDirName := archiveBase // fallback: use full archive base name
+	if tsMatch != "" {
+		filterDirName = "filtered_log_" + tsMatch
+	}
+
+	// Create filter output directory: outputDir/filter/filtered_log_{timestamp}/
+	filterBaseDir := filepath.Join(outputDir, "filter", filterDirName)
 
 	// Discover all files
 	var logFiles []string
@@ -4097,8 +4112,11 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 	outputFileName = strings.ReplaceAll(outputFileName, "{environment}", config.Environment)
 	outputFileName = strings.ReplaceAll(outputFileName, "{username}", config.Username)
 
-	// Replace {timestamp} placeholder with actual timestamp
-	timestampStr := time.Now().Format("20060102_150405")
+	// Replace {timestamp} placeholder — use override if provided, else current time
+	timestampStr := config.archiveTimestamp
+	if timestampStr == "" {
+		timestampStr = time.Now().Format("20060102_150405")
+	}
 	outputFileName = strings.ReplaceAll(outputFileName, "{timestamp}", timestampStr)
 
 	// Use the output directory from logs config or current directory
@@ -4840,6 +4858,14 @@ func main() {
 		overallDuration := time.Since(overallStartTime)
 		logger.Info("Overall log collection and archiving completed in: %s", overallDuration.Round(time.Millisecond))
 
+		// Extract timestamp from archive name (e.g., app_log_20260217_095735 -> 20260217_095735)
+		// and store it in config for consistent naming across all output files
+		tsRe := regexp.MustCompile(`(\d{8}_\d{6})`)
+		if tsMatch := tsRe.FindString(finalArchiveName); tsMatch != "" {
+			config.archiveTimestamp = tsMatch
+			logger.Debug("Extracted archive timestamp: %s", tsMatch)
+		}
+
 		// Update the log pattern to look for the newly created archive
 		archivePattern := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
 		*logPattern = archivePattern
@@ -5117,7 +5143,7 @@ func main() {
 
 	// Copy logger_info.txt to the output directory so it lives alongside the downloaded files
 	if successCount > 0 {
-		logger.CopyLogFileTo(*outputDir)
+		logger.CopyLogFileTo(*outputDir, config.archiveTimestamp)
 	}
 
 	// Run post-download message filtering if enabled

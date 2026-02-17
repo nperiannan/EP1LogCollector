@@ -6158,11 +6158,8 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 
 	deviceType := strings.ToLower(device.Type)
 
-	// Create device-specific output directory
+	// Device-specific output directory (created only after successful connection)
 	deviceOutputDir := filepath.Join(outputDir, device.Name)
-	if err := os.MkdirAll(deviceOutputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
-	}
 
 	switch deviceType {
 	case "exos":
@@ -6172,6 +6169,11 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 			return fmt.Errorf("failed to connect to device %s: %v", device.Name, err)
 		}
 		defer ds.Close()
+
+		// Create output directory only after successful connection
+		if err := os.MkdirAll(deviceOutputDir, 0755); err != nil {
+			return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
+		}
 
 		// Disable paging
 		if err := ds.disableExosPaging(dlc.ExosDefaults.PagingDisableCommand); err != nil {
@@ -6203,6 +6205,11 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 			return fmt.Errorf("failed to connect to device %s: %v", device.Name, err)
 		}
 		defer ds.Close()
+
+		// Create output directory only after successful connection
+		if err := os.MkdirAll(deviceOutputDir, 0755); err != nil {
+			return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
+		}
 
 		// Initialize VOSS session: enable → config → disable paging
 		if err := ds.initVossSession(dlc); err != nil {

@@ -213,7 +213,7 @@ deviceLogCollection:
   
   # VOSS Device Type Defaults
   vossDefaults:
-    enableCommand: "en"
+    enableCommand: "enable"
     configCommand: "configure terminal"
     pagingDisableCommand: "terminal more disable"
     diagnosticCommands:
@@ -223,21 +223,21 @@ deviceLogCollection:
       - name: "sys_info"
         command: "show sys-info"
         description: "System information and uptime"
-      - name: "interfaces"
-        command: "show interfaces GigabitEthernet name"
-        description: "Interface names and status"
       - name: "vlan"
         command: "show vlan basic"
         description: "VLAN configuration"
-      - name: "ip_route"
-        command: "show ip route"
-        description: "IP routing table"
-      - name: "isis"
-        command: "show isis"
-        description: "IS-IS status"
-      - name: "spbm"
-        command: "show isis spbm"
-        description: "SPBM configuration"
+      - name: "iqagent"
+        command: "show application iqagent"
+        description: "IQ Agent status"
+      - name: "inlets"
+        command: "show application inlets"
+        description: "Inlets status"
+      - name: "openapi"
+        command: "show application openapi"
+        description: "OpenAPI status"
+      - name: "telegraf"
+        command: "show application telegraf"
+        description: "Telegraf status"
       - name: "running_config"
         command: "show running-config"
         description: "Running configuration"
@@ -307,8 +307,8 @@ deviceLogCollection:
       password: "rwa"
       
       diagnostics:
-        enabled: false               # Skip diagnostics for this device
-        useDefaults: false
+        enabled: true               # Skip diagnostics for this device
+        useDefaults: true
         additionalCommands: []
       
       logs:
@@ -344,6 +344,7 @@ deviceLogCollection:
           - "/intflash/openapi/openapi_server.log"
           - "/intflash/alarmLog"
           - "/intflash/config.cfg"
+          - "/intflash/diag_logs"
         removeCompressedFile: false
         removeOldLogs: false
         oldLogsPattern: ""

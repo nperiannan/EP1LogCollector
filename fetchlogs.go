@@ -522,7 +522,7 @@ type Config struct {
 			ContextLines    int      `yaml:"contextLines"`    // Lines before/after each match
 		} `yaml:"logAnalysis"`
 		MessageFilter struct {
-			Enabled         bool `yaml:"enabled"`         // Enable/disable post-download message filtering
+			Enabled         bool `yaml:"enabled"` // Enable/disable post-download message filtering
 			KeyValueFilters []struct {
 				Key   string `yaml:"key"`   // Key to look for in log lines (e.g., ownerID, serial)
 				Value string `yaml:"value"` // Value to match (lines with key but different value are excluded)
@@ -3856,7 +3856,11 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 
 	if hasKeyValueFilters {
 		for _, kv := range filterConfig.KeyValueFilters {
-			logger.Info("  Key-Value Filter: key=%q value=%q (keep lines without key OR with matching value)", kv.Key, kv.Value)
+			if kv.Value == "" {
+				logger.Info("  Key-Value Filter: key=%q value=(empty) → SKIPPED (no value to filter on)", kv.Key)
+			} else {
+				logger.Info("  Key-Value Filter: key=%q value=%q (keep lines without key OR with matching value)", kv.Key, kv.Value)
+			}
 		}
 	}
 	if hasSpecificStrings {
@@ -3911,11 +3915,16 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	// For each key-value filter, we build a regex that matches: key followed by optional separators and quote-wrapped value
 	// Pattern: key\s*[:=]\s*"?value"?  (handles key=value, key: value, key="value", "key":"value", etc.)
 	type kvFilter struct {
-		keyPattern *regexp.Regexp   // Matches the key anywhere in the line
-		fullPattern *regexp.Regexp  // Matches key with the specified value
+		keyPattern  *regexp.Regexp // Matches the key anywhere in the line
+		fullPattern *regexp.Regexp // Matches key with the specified value
 	}
 	var kvFilters []kvFilter
 	for _, kv := range filterConfig.KeyValueFilters {
+		// Skip filters with empty value — empty value means "don't filter on this key"
+		if kv.Value == "" {
+			logger.Info("  Skipping key-value filter for key=%q (no value specified, keeping all lines)", kv.Key)
+			continue
+		}
 		// Pattern to detect if the key exists in the line (case-insensitive)
 		keyRe, err := regexp.Compile("(?i)" + regexp.QuoteMeta(kv.Key))
 		if err != nil {

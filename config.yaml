@@ -6,7 +6,7 @@ environment: dl2r1
 bastion:
   host: usnc-awsgtwy-02.extremenetworks.com
   port: 22
-  password: "ENC:uMIIy0Brlcem0uWMV7a0f7gVMZDrTVb8NtyFeaQsZHj6UZZn2z/e8RxZi38r"
+  password: "ENC:ncPRTa7X9mDHBIdYs13ne14Dm06J2OGyD6k7wHn7zCis1yK7jaaTiKlEtdZj"
   # keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
 
 # AWS Server Configuration
@@ -46,6 +46,11 @@ logCollection:
     enabled: true                   # Enable/disable temporal workflow data collection
     workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows)
     numberOfWorkflows: 3            # Number of recent workflows to collect (1-20, default 3)
+    namespace: "configuration"      # Temporal namespace to query
+  # Temporal schedule information collection
+  temporalScheduleCollection:
+    enabled: true                   # Enable/disable temporal schedule data collection
+    numberOfSchedules: 5            # Number of recent schedules to collect (1-20, default 5)
     namespace: "configuration"      # Temporal namespace to query
   # Log analysis and error detection
   logAnalysis:

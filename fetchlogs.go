@@ -479,7 +479,7 @@ type Config struct {
 	Username         string `yaml:"username"`    // Global username for all connections
 	Environment      string `yaml:"environment"` // Environment identifier (e.g., dl1r1, g2r1)
 	archiveTimestamp string // Runtime-only: timestamp extracted from archive name (not persisted in YAML)
-	Bastion     struct {
+	Bastion          struct {
 		Host     string `yaml:"host"`
 		Port     int    `yaml:"port"`
 		Password string `yaml:"password"`
@@ -519,6 +519,11 @@ type Config struct {
 			NumberOfWorkflows int    `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
 			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
 		} `yaml:"temporalWorkflowCollection"`
+		TemporalScheduleCollection struct {
+			Enabled           bool   `yaml:"enabled"`           // Enable temporal schedule data collection
+			NumberOfSchedules int    `yaml:"numberOfSchedules"` // Number of schedules to collect (1-20)
+			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
+		} `yaml:"temporalScheduleCollection"`
 		LogAnalysis struct {
 			Enabled         bool     `yaml:"enabled"`         // Enable automatic log analysis
 			OutputFile      string   `yaml:"outputFile"`      // Output file name for analysis report
@@ -749,6 +754,10 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	Enabled           bool   `yaml:"enabled"`
 	WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`
 	NumberOfWorkflows int    `yaml:"numberOfWorkflows"`
+	Namespace         string `yaml:"namespace"`
+}, temporalScheduleConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	NumberOfSchedules int    `yaml:"numberOfSchedules"`
 	Namespace         string `yaml:"namespace"`
 }) (string, error) {
 	// Start timing the log collection process
@@ -1031,6 +1040,16 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 		err = collectTemporalWorkflowInfo(awsClient, temporalConfig, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("Temporal workflow collection failed: %v", err)
+			// Don't return here - continue with archive creation
+		}
+	}
+
+	// Collect Temporal schedule information before archiving (if enabled)
+	if temporalScheduleConfig.Enabled {
+		logger.Info("Starting Temporal schedule information collection...")
+		err = collectTemporalScheduleInfo(awsClient, temporalScheduleConfig, environment, username, tempDir, finalLogFileName)
+		if err != nil {
+			logger.Warn("Temporal schedule collection failed: %v", err)
 			// Don't return here - continue with archive creation
 		}
 	}
@@ -2974,6 +2993,182 @@ func extractActivityNames(activitiesOutput string) []string {
 	return names
 }
 
+// collectTemporalScheduleInfo collects Temporal schedule information from the admin pod
+func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	NumberOfSchedules int    `yaml:"numberOfSchedules"`
+	Namespace         string `yaml:"namespace"`
+}, environment, username, tempDir, finalLogFileName string) error {
+	if !temporalConfig.Enabled {
+		logger.Debug("Temporal schedule collection is disabled")
+		return nil
+	}
+
+	logger.Info("Starting Temporal schedule information collection...")
+
+	// Set defaults
+	temporalNamespace := temporalConfig.Namespace
+	if temporalNamespace == "" {
+		temporalNamespace = "configuration"
+	}
+	numberOfSchedules := temporalConfig.NumberOfSchedules
+	if numberOfSchedules <= 0 {
+		numberOfSchedules = 5
+	}
+	if numberOfSchedules > 20 {
+		numberOfSchedules = 20
+	}
+
+	// Use the same Temporal output directory that was created for workflow collection
+	logDir := fmt.Sprintf("%s/%s", tempDir, finalLogFileName)
+	temporalOutputDir := fmt.Sprintf("%s/Temporal", logDir)
+
+	// Ensure the directory exists (it should already exist from workflow collection, but check anyway)
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for temporal directory: %v", err)
+	}
+	defer session.Close()
+
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", temporalOutputDir)
+	if err := executeCommandAsRoot(session, mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create temporal directory: %v", err)
+	}
+
+	// Step 1: Find the temporal admin pod (same as workflow collection)
+	logger.Info("Discovering Temporal admin pod in 'common' namespace...")
+	podSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for pod discovery: %v", err)
+	}
+
+	podCmd := "kubectl get pods -n common --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print \\$1}'"
+	podOutput, err := podSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", podCmd))
+	podSession.Close()
+	if err != nil {
+		logger.Debug("Pod discovery command output: %s", strings.TrimSpace(string(podOutput)))
+		return fmt.Errorf("failed to discover temporal admin pod: %v", err)
+	}
+
+	adminPod := strings.TrimSpace(string(podOutput))
+	if adminPod == "" {
+		return fmt.Errorf("no running temporal-admintools pod found in 'common' namespace")
+	}
+	logger.Info("Found Temporal admin pod: %s", adminPod)
+
+	// Step 2: List schedules
+	logger.Info("Listing schedules in namespace '%s'...", temporalNamespace)
+
+	listSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for schedule listing: %v", err)
+	}
+
+	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal schedule list --namespace %s 2>/dev/null",
+		adminPod, temporalNamespace)
+	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
+	listSession.Close()
+	if err != nil {
+		return fmt.Errorf("failed to list temporal schedules: %v\\nOutput: %s", err, string(listOutput))
+	}
+
+	// Save the schedule listing as schedule_list.txt
+	writeFileToRemote(awsClient, fmt.Sprintf("%s/schedule_list.txt", temporalOutputDir),
+		fmt.Sprintf("# Temporal Schedule List\\n# Namespace: %s\\n# Collected: %s\\n%s\\n\\n%s",
+			temporalNamespace, time.Now().Format("2006-01-02 15:04:05"),
+			strings.Repeat("-", 60),
+			string(listOutput)))
+
+	// Step 3: Extract schedule IDs from the listing
+	listOutputStr := string(listOutput)
+	logger.Debug("Schedule list output (first 500 chars): %s", func() string {
+		if len(listOutputStr) > 500 {
+			return listOutputStr[:500] + "..."
+		}
+		return listOutputStr
+	}())
+
+	scheduleIDs := extractScheduleIDs(listOutputStr, numberOfSchedules)
+	if len(scheduleIDs) == 0 {
+		logger.Warn("No schedule IDs found")
+		writeFileToRemote(awsClient, fmt.Sprintf("%s/no_schedules_found.txt", temporalOutputDir),
+			fmt.Sprintf("No schedules found.\\nNamespace: %s\\nRaw listing output:\\n%s\\n",
+				temporalNamespace, listOutputStr))
+		return nil
+	}
+
+	logger.Info("Found %d schedule(s) to collect information for", len(scheduleIDs))
+	for i, schedID := range scheduleIDs {
+		logger.Info("  %d. %s", i+1, schedID)
+	}
+
+	// Step 4: For each schedule, collect detailed information using `temporal schedule describe`
+	for i, scheduleID := range scheduleIDs {
+		logger.Info("Collecting data for schedule %d/%d: %s", i+1, len(scheduleIDs), scheduleID)
+
+		// Create a sanitized filename from schedule ID
+		safeSchedID := sanitizeFilename(scheduleID)
+		schedOutputFile := fmt.Sprintf("%s/schedule_%s.txt", temporalOutputDir, safeSchedID)
+
+		var schedContent strings.Builder
+		schedContent.WriteString(fmt.Sprintf("# Temporal Schedule Details\\n"))
+		schedContent.WriteString(fmt.Sprintf("# Schedule ID: %s\\n", scheduleID))
+		schedContent.WriteString(fmt.Sprintf("# Namespace: %s\\n", temporalNamespace))
+		schedContent.WriteString(fmt.Sprintf("# Collected: %s\\n", time.Now().Format("2006-01-02 15:04:05")))
+		schedContent.WriteString(fmt.Sprintf("#%s\\n\\n", strings.Repeat("-", 60)))
+
+		// Describe the schedule
+		logger.Debug("  Collecting schedule details...")
+		schedContent.WriteString("=" + strings.Repeat("=", 79) + "\\n")
+		schedContent.WriteString("  SCHEDULE DESCRIPTION\\n")
+		schedContent.WriteString("=" + strings.Repeat("=", 79) + "\\n\\n")
+
+		describeCmd := fmt.Sprintf(`kubectl exec %s -n common -- temporal schedule describe --namespace %s --schedule-id "%s" 2>&1`,
+			adminPod, temporalNamespace, scheduleID)
+		describeOutput := executeTemporalCommand(awsClient, describeCmd)
+		schedContent.WriteString(describeOutput + "\\n\\n")
+
+		// Write the complete schedule file
+		writeFileToRemote(awsClient, schedOutputFile, schedContent.String())
+		logger.Info("  Saved schedule data to: %s", schedOutputFile)
+	}
+
+	logger.Info("Temporal schedule collection completed: %d schedule(s) collected", len(scheduleIDs))
+	logger.Info("Temporal schedule data saved to remote directory: %s", temporalOutputDir)
+	return nil
+}
+
+// extractScheduleIDs parses schedule listing output and extracts schedule IDs
+// The `temporal schedule list` output format is typically:
+//   ScheduleId          WorkflowType        ...
+//   schedule-profile-   DeployProfile       ...
+func extractScheduleIDs(listOutput string, maxCount int) []string {
+	var scheduleIDs []string
+	lines := strings.Split(strings.TrimSpace(listOutput), "\\n")
+
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || i == 0 {
+			// Skip empty lines and header line
+			continue
+		}
+
+		// The schedule ID is typically the first column
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			schedID := fields[0]
+			if schedID != "" && !strings.HasPrefix(schedID, "ScheduleId") {
+				scheduleIDs = append(scheduleIDs, schedID)
+				if len(scheduleIDs) >= maxCount {
+					break
+				}
+			}
+		}
+	}
+
+	return scheduleIDs
+}
+
 // writeFileToRemote writes content to a file on the remote server via SSH using stdin pipe
 func writeFileToRemote(awsClient *ssh.Client, filePath, content string) error {
 	session, err := awsClient.NewSession()
@@ -4848,7 +5043,7 @@ func main() {
 		// Start timing the entire log collection and archive creation process
 		overallStartTime := time.Now()
 
-		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.TemporalWorkflowCollection)
+		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection)
 		if err != nil {
 			logger.Error("Failed to collect logs: %v", err)
 			return

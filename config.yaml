@@ -45,7 +45,7 @@ logCollection:
   temporalWorkflowCollection:
     enabled: true                   # Enable/disable temporal workflow data collection
     workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows)
-    numberOfWorkflows: 3            # Number of recent workflows to collect (1-20, default 3)
+    numberOfWorkflows: 5            # Number of recent workflows to collect (1-20, default 3)
     namespace: "configuration"      # Temporal namespace to query
   # Temporal schedule information collection
   temporalScheduleCollection:
@@ -88,6 +88,24 @@ logCollection:
       - key: "serial"
         value: ""
     specificStrings: []             # Only keep lines containing at least one of these strings (empty = no filter)
+  # Pod file collection (collect specific files from inside pods)
+  podFileCollection:
+    enabled: true                  # Enable/disable pod file collection
+    collections:                    # List of pod file collection configurations
+      - namespace: "common"         # Kubernetes namespace
+        podPrefix: "cs-configuration"  # Pod name prefix to match
+        logPath: "/var/log/configuration/"  # Path inside the pod
+        filePatterns:               # File patterns to collect (supports wildcards)
+          - "server.log"
+          - "server_err.log"
+          - "*.log.gz"
+      # Example: Add more collections as needed
+      # - namespace: "xiq"
+      #   podPrefix: "hmweb"
+      #   logPath: "/opt/app/logs/"
+      #   filePatterns:
+      #     - "*.log"
+      #     - "application*.log"
 
 # General System Information Collection
 generalInfo:

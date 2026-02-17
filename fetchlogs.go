@@ -447,6 +447,14 @@ type PodLogSource struct {
 	OutputName string `yaml:"outputName"`
 }
 
+// PodFileCollection defines configuration for collecting specific files from inside pods
+type PodFileCollection struct {
+	Namespace    string   `yaml:"namespace"`    // Kubernetes namespace
+	PodPrefix    string   `yaml:"podPrefix"`    // Pod name prefix to match
+	LogPath      string   `yaml:"logPath"`      // Path inside the pod (e.g., /var/log/configuration/)
+	FilePatterns []string `yaml:"filePatterns"` // File patterns to collect (e.g., *.log, server.log)
+}
+
 // Default log collection sources matching the shell script
 var defaultLogSources = []PodLogSource{
 	// NVO namespace logs
@@ -540,6 +548,10 @@ type Config struct {
 			} `yaml:"keyValueFilters"` // Keep lines where key is absent OR key has specified value
 			SpecificStrings []string `yaml:"specificStrings"` // Only keep lines containing these exact strings
 		} `yaml:"messageFilter"`
+		PodFileCollection struct {
+			Enabled     bool                `yaml:"enabled"`     // Enable/disable pod file collection
+			Collections []PodFileCollection `yaml:"collections"` // List of pod file collection configurations
+		} `yaml:"podFileCollection"`
 	} `yaml:"logCollection"`
 	// General system information collection
 	GeneralInfo struct {
@@ -759,6 +771,9 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	Enabled           bool   `yaml:"enabled"`
 	NumberOfSchedules int    `yaml:"numberOfSchedules"`
 	Namespace         string `yaml:"namespace"`
+}, podFileCollectionConfig struct {
+	Enabled     bool                `yaml:"enabled"`
+	Collections []PodFileCollection `yaml:"collections"`
 }) (string, error) {
 	// Start timing the log collection process
 	logCollectionStartTime := time.Now()
@@ -1050,6 +1065,16 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 		err = collectTemporalScheduleInfo(awsClient, temporalScheduleConfig, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("Temporal schedule collection failed: %v", err)
+			// Don't return here - continue with archive creation
+		}
+	}
+
+	// Collect pod files before archiving (if enabled)
+	if podFileCollectionConfig.Enabled && len(podFileCollectionConfig.Collections) > 0 {
+		logger.Info("Starting pod file collection...")
+		err = collectPodFiles(awsClient, podFileCollectionConfig.Collections, tempDir, finalLogFileName)
+		if err != nil {
+			logger.Warn("Pod file collection failed: %v", err)
 			// Don't return here - continue with archive creation
 		}
 	}
@@ -3179,6 +3204,176 @@ func extractScheduleIDs(listOutput string, maxCount int) []string {
 	return scheduleIDs
 }
 
+// ============================================================================
+// Pod File Collection — Collect specific files from inside pods
+// ============================================================================
+
+// collectPodFiles collects specific files from pods based on configuration
+func collectPodFiles(awsClient *ssh.Client, collections []PodFileCollection, tempDir, finalLogFileName string) error {
+	logger.Info("Collecting pod files from %d configuration(s)...", len(collections))
+
+	for i, collection := range collections {
+		logger.Info("[%d/%d] Processing: namespace=%s, podPrefix=%s", i+1, len(collections), collection.Namespace, collection.PodPrefix)
+
+		// Step 1: Find pods matching the prefix
+		pods, err := findPodsMatchingPrefix(awsClient, collection.Namespace, collection.PodPrefix)
+		if err != nil {
+			logger.Warn("Failed to find pods for %s/%s: %v", collection.Namespace, collection.PodPrefix, err)
+			continue
+		}
+
+		if len(pods) == 0 {
+			logger.Warn("No pods found matching prefix %s in namespace %s", collection.PodPrefix, collection.Namespace)
+			continue
+		}
+
+		logger.Info("Found %d pod(s) matching prefix %s", len(pods), collection.PodPrefix)
+
+		// Step 2: For each pod, collect files matching the patterns
+		for _, pod := range pods {
+			logger.Debug("  Processing pod: %s", pod)
+
+			// Create output directory for this pod
+			podOutputDir := fmt.Sprintf("%s/%s/PodFiles/%s/%s", tempDir, finalLogFileName, collection.Namespace, pod)
+			mkdirSession, err := awsClient.NewSession()
+			if err != nil {
+				logger.Warn("  Failed to create session for mkdir: %v", err)
+				continue
+			}
+			mkdirCmd := fmt.Sprintf("mkdir -p %s", podOutputDir)
+			executeCommandAsRoot(mkdirSession, mkdirCmd)
+			mkdirSession.Close()
+
+			// Step 3: For each file pattern, find and copy files
+			for _, pattern := range collection.FilePatterns {
+				logger.Debug("    Looking for files matching: %s", pattern)
+
+				// List files matching the pattern
+				files, err := listFilesInPod(awsClient, collection.Namespace, pod, collection.LogPath, pattern)
+				if err != nil {
+					logger.Warn("    Failed to list files in pod %s: %v", pod, err)
+					continue
+				}
+
+				if len(files) == 0 {
+					logger.Debug("    No files found matching pattern: %s", pattern)
+					continue
+				}
+
+				logger.Info("    Found %d file(s) matching pattern %s", len(files), pattern)
+
+				// Copy each file
+				for _, file := range files {
+					logger.Debug("      Copying: %s", file)
+					err := copyFileFromPod(awsClient, collection.Namespace, pod, file, podOutputDir)
+					if err != nil {
+						logger.Warn("      Failed to copy %s: %v", file, err)
+					} else {
+						logger.Debug("      ✓ Copied successfully")
+					}
+				}
+			}
+		}
+	}
+
+	logger.Info("Pod file collection completed")
+	return nil
+}
+
+// findPodsMatchingPrefix finds all pods in a namespace matching the given prefix
+func findPodsMatchingPrefix(awsClient *ssh.Client, namespace, podPrefix string) ([]string, error) {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	cmd := fmt.Sprintf("kubectl get pods -n %s --no-headers | grep '^%s' | awk '{print $1}'", namespace, podPrefix)
+	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", cmd))
+	if err != nil {
+		return nil, fmt.Errorf("kubectl command failed: %v", err)
+	}
+
+	pods := []string{}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		pod := strings.TrimSpace(line)
+		if pod != "" {
+			pods = append(pods, pod)
+		}
+	}
+
+	return pods, nil
+}
+
+// listFilesInPod lists files in a pod directory matching a pattern
+func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern string) ([]string, error) {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// Ensure logPath ends with /
+	if !strings.HasSuffix(logPath, "/") {
+		logPath += "/"
+	}
+
+	// Use find command to list files matching pattern
+	findCmd := fmt.Sprintf("kubectl exec -n %s %s -- find %s -maxdepth 1 -type f -name '%s' 2>/dev/null",
+		namespace, pod, logPath, pattern)
+	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", findCmd))
+	if err != nil {
+		// Try simpler ls-based approach as fallback
+		lsCmd := fmt.Sprintf("kubectl exec -n %s %s -- ls %s%s 2>/dev/null",
+			namespace, pod, logPath, pattern)
+		output2, err2 := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", lsCmd))
+		if err2 != nil {
+			return nil, fmt.Errorf("both find and ls commands failed: %v, %v", err, err2)
+		}
+		output = output2
+	}
+
+	files := []string{}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		file := strings.TrimSpace(line)
+		if file != "" && !strings.HasSuffix(file, "/") {
+			// If file is just a basename, prepend the logPath
+			if !strings.HasPrefix(file, "/") {
+				file = logPath + file
+			}
+			files = append(files, file)
+		}
+	}
+
+	return files, nil
+}
+
+// copyFileFromPod copies a file from a pod to the local AWS server
+func copyFileFromPod(awsClient *ssh.Client, namespace, pod, sourceFile, destDir string) error {
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// Extract filename from path
+	fileName := filepath.Base(sourceFile)
+	destFile := fmt.Sprintf("%s/%s", destDir, fileName)
+
+	// Use kubectl exec cat to copy file content
+	copyCmd := fmt.Sprintf("kubectl exec -n %s %s -- cat %s > %s 2>/dev/null",
+		namespace, pod, sourceFile, destFile)
+
+	err = executeCommandAsRoot(session, copyCmd)
+	if err != nil {
+		return fmt.Errorf("copy command failed: %v", err)
+	}
+
+	return nil
+}
+
 // writeFileToRemote writes content to a file on the remote server via SSH using stdin pipe
 func writeFileToRemote(awsClient *ssh.Client, filePath, content string) error {
 	session, err := awsClient.NewSession()
@@ -5053,7 +5248,7 @@ func main() {
 		// Start timing the entire log collection and archive creation process
 		overallStartTime := time.Now()
 
-		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection)
+		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection, config.LogCollection.PodFileCollection)
 		if err != nil {
 			logger.Error("Failed to collect logs: %v", err)
 			return

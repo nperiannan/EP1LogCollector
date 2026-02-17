@@ -45,7 +45,7 @@ logCollection:
   temporalWorkflowCollection:
     enabled: true                   # Enable/disable temporal workflow data collection
     workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows)
-    numberOfWorkflows: 5            # Number of recent workflows to collect (1-20, default 3)
+    numberOfWorkflows: 3            # Number of recent workflows to collect (1-20, default 3)
     namespace: "configuration"      # Temporal namespace to query
   # Temporal schedule information collection
   temporalScheduleCollection:
@@ -96,9 +96,9 @@ logCollection:
         podPrefix: "cs-configuration"  # Pod name prefix to match
         logPath: "/var/log/configuration/"  # Path inside the pod
         filePatterns:               # File patterns to collect (supports wildcards)
-          - "server.log"
-          - "server_err.log"
-          - "*.log.gz"
+          - "*server.log"           # Matches server.log and cs-configuration-*-server.log
+          - "*server_err.log"       # Matches server_err.log and cs-configuration-*-server_err.log
+          - "*.log.gz"              # Matches all compressed log files
       # Example: Add more collections as needed
       # - namespace: "xiq"
       #   podPrefix: "hmweb"
@@ -106,7 +106,7 @@ logCollection:
       #   filePatterns:
       #     - "*.log"
       #     - "application*.log"
-
+      #     - "*.log.gz"
 # General System Information Collection
 generalInfo:
   enabled: false

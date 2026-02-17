@@ -34,12 +34,20 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **Namespace Separators**: Visual separation between namespaces in version reports
 - **Historical Tracking**: Unique filenames for tracking version changes over time
 
+### 🔎 Post-Download Message Filter (NEW)
+- **Key-Value Filtering**: Filter log lines by key-value pairs (e.g., keep only `ownerID=1096`)
+- **Specific String Matching**: Keep only lines containing specified strings
+- **Non-Destructive**: Original logs are never modified — filtered output goes to a separate `filter/` directory
+- **Directory Preservation**: Maintains the original archive directory structure in filtered output
+- **Configurable**: Enable/disable via `messageFilter.enabled` in config.yaml
+
 ## Features
 
 - **🔄 End-to-End Kubernetes Log Collection**: Remotely collect logs from Kubernetes pods, create timestamped archives, and download automatically
 - **📊 General System Information Collection**: Automatically collect kubectl and system command outputs for comprehensive operational snapshots with per-command output files
 - **🔍 Intelligent Log Analytics**: Post-download analysis of collected logs with configurable error patterns, cross-file correlation, severity classification, before/after context, and comprehensive `log_analytics_report.txt` generation
-- **📋 Application Version Collection**: Standalone feature to collect and format application version information from Kubernetes clusters
+- **� Post-Download Message Filter**: Filter downloaded logs by key-value pairs and specific strings into a separate `filter/` directory without modifying originals
+- **�📋 Application Version Collection**: Standalone feature to collect and format application version information from Kubernetes clusters
 - **🗑️ Smart Archive Management**: Automatic cleanup of remote archives after successful download with configurable retention
 - **⚡ High-Performance Native SCP Downloads**: 2-step optimized architecture with native SCP achieving 2-4 MB/s (10x faster than SFTP)
 - **🔧 Cross-Platform Compatibility**: Works seamlessly on Windows and Linux with automatic OS-specific optimizations
@@ -958,7 +966,121 @@ The report (`log_analytics_report.txt`) is saved in your output directory and co
 
 **Note**: The analysis runs locally after the archive is downloaded. The report is saved alongside the downloaded archive in your configured output directory.
 
-## 📊 General System Information Collection
+## � **Post-Download Message Filter**
+
+After downloading and analyzing log archives, the tool can optionally **filter** all log files by key-value pairs and/or specific strings, writing the filtered output into a `filter/` subdirectory. Original downloaded logs are never modified.
+
+### Key Features
+
+- **🔑 Key-Value Filtering**: Define key-value pairs (e.g., `ownerID=1096`). Lines containing the key are kept only if the value matches. Lines that don't contain the key at all pass through unaffected.
+- **📝 Specific String Matching**: Define exact strings that must appear in a line for it to be kept. If configured, only lines containing at least one of the specified strings are included.
+- **📁 Directory Preservation**: Filtered output mirrors the original archive directory structure inside `filter/<archiveName>/`.
+- **🛡️ Non-Destructive**: Original logs remain untouched. Filtered copies are written to a separate directory.
+- **📊 Summary Statistics**: Reports files filtered, lines kept, and lines removed.
+
+### How It Works
+
+1. **📦 Extract**: The downloaded `.tar.gz` archive is extracted to a temporary directory
+2. **🔍 Scan**: Each text/log file is read line by line
+3. **🔑 Key-Value Check**: For each key-value filter, if the line contains the key, it's kept only if the value matches. Lines without the key pass through.
+4. **📝 String Check**: If specific strings are configured, the line must contain at least one to be kept.
+5. **💾 Write**: Filtered lines are written to `filter/<archiveName>/` preserving the directory structure
+6. **🧹 Cleanup**: Temporary extraction directory is removed automatically
+
+### Filter Logic
+
+| Scenario | Key-Value Filter Result | Specific String Filter Result |
+|----------|------------------------|------------------------------|
+| Line does NOT contain the key | ✅ Passes (unaffected) | N/A |
+| Line contains key with **matching** value | ✅ Passes | N/A |
+| Line contains key with **different** value | ❌ Filtered out | N/A |
+| Line contains at least one specific string | N/A | ✅ Passes |
+| Line does NOT contain any specific string | N/A | ❌ Filtered out |
+| Both filters active | Must pass BOTH key-value AND specific string checks | |
+
+### Configuration
+
+```yaml
+logCollection:
+  messageFilter:
+    enabled: true                   # Enable/disable message filtering
+    keyValueFilters:                # Keep lines where key is absent OR key has matching value
+      - key: "ownerID"
+        value: "1096"              # Only keep lines with ownerID=1096 (or lines without ownerID)
+      - key: "serial"
+        value: ""                  # Only keep lines with empty serial (or lines without serial)
+    specificStrings: []             # Only keep lines containing these strings (empty = no filter)
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable/disable post-download message filtering |
+| `keyValueFilters` | list | `[]` | List of key-value pairs to filter by |
+| `keyValueFilters[].key` | string | — | Key to look for in log lines (e.g., `ownerID`, `serial`) |
+| `keyValueFilters[].value` | string | — | Value to match. Lines with the key but a different value are removed |
+| `specificStrings` | list | `[]` | Only keep lines containing at least one of these strings (empty = no filter) |
+
+### Output Structure
+
+```
+C:\Logs\
+├── app_log_20260217_120000.tar.gz          # Original archive (untouched)
+├── log_analytics_report_20260217.txt       # Analytics report
+├── logger_info.txt                         # Session log
+└── filter/                                 # Filtered output directory
+    └── app_log_20260217_120000/             # Named after the archive
+        ├── app_log/
+        │   ├── nvo-edge-pod1.log            # Filtered version
+        │   ├── cs-configuration-pod2.log    # Filtered version
+        │   └── cas-api-service-pod1.log     # Filtered version
+        └── General/
+            └── nodes_detailed.txt          # Filtered version
+```
+
+### Usage Examples
+
+```yaml
+# Example 1: Keep only lines for a specific ownerID
+messageFilter:
+  enabled: true
+  keyValueFilters:
+    - key: "ownerID"
+      value: "1096"
+  specificStrings: []
+
+# Example 2: Keep only lines containing specific error messages
+messageFilter:
+  enabled: true
+  keyValueFilters: []
+  specificStrings:
+    - "connection refused"
+    - "timeout expired"
+
+# Example 3: Combine both — ownerID filtering + specific string matching
+messageFilter:
+  enabled: true
+  keyValueFilters:
+    - key: "ownerID"
+      value: "1096"
+    - key: "serial"
+      value: "SN12345"
+  specificStrings:
+    - "ERROR"
+    - "WARN"
+```
+
+### When Message Filter Helps
+
+- **Multi-Tenant Logs**: Filter logs by tenant/owner ID when multiple tenants share the same log files
+- **Device-Specific Issues**: Isolate log entries for a specific device serial number
+- **Focused Debugging**: Narrow down large log files to only error/warning messages for a specific entity
+- **Noise Reduction**: Remove irrelevant log entries before manual review
+
+**Note**: The message filter runs after log analytics. Both the original logs and the analytics report remain unchanged. Filtered files are created separately in the `filter/` directory.
+
+## �📊 General System Information Collection
 
 The tool automatically collects comprehensive system and cluster information alongside log files, providing a complete operational snapshot. Each command output is saved as a separate file within a `General/` directory inside the archive.
 

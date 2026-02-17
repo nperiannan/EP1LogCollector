@@ -5478,10 +5478,10 @@ func collectExosLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogC
 			// Include device IP in filename for unique JIRA attachments across devices
 			deviceIP := strings.ReplaceAll(device.IPAddress, ".", "_")
 			remoteBase := filepath.Base(remotePath)
-			ext := filepath.Ext(remoteBase)                           // .gz
-			nameWithoutExt := strings.TrimSuffix(remoteBase, ext)      // nos_logs.tar
-			ext2 := filepath.Ext(nameWithoutExt)                       // .tar
-			baseName := strings.TrimSuffix(nameWithoutExt, ext2)       // nos_logs
+			ext := filepath.Ext(remoteBase)                                          // .gz
+			nameWithoutExt := strings.TrimSuffix(remoteBase, ext)                    // nos_logs.tar
+			ext2 := filepath.Ext(nameWithoutExt)                                     // .tar
+			baseName := strings.TrimSuffix(nameWithoutExt, ext2)                     // nos_logs
 			localFileName := fmt.Sprintf("%s_%s%s%s", baseName, deviceIP, ext2, ext) // nos_logs_10_127_34_23.tar.gz
 			localPath := filepath.Join(outputDir, localFileName)
 
@@ -5587,6 +5587,75 @@ func downloadFileFromDeviceSFTP(client *ssh.Client, remotePath, localPath string
 	}
 
 	logger.Debug("Downloaded %d bytes: %s -> %s", written, remotePath, localPath)
+	return nil
+}
+
+// compressDirectoryToTarGz compresses an entire directory into a single .tar.gz file.
+// The archive preserves the directory structure relative to the source directory.
+func compressDirectoryToTarGz(sourceDir, outputPath string, logger *Logger) error {
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create archive file %s: %v", outputPath, err)
+	}
+	defer outFile.Close()
+
+	gzWriter := gzip.NewWriter(outFile)
+	defer gzWriter.Close()
+
+	tarWriter := tar.NewWriter(gzWriter)
+	defer tarWriter.Close()
+
+	baseDir := filepath.Base(sourceDir)
+
+	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Build the relative path inside the archive using the directory name as root
+		relPath, err := filepath.Rel(filepath.Dir(sourceDir), path)
+		if err != nil {
+			return fmt.Errorf("failed to get relative path for %s: %v", path, err)
+		}
+
+		// Use forward slashes in tar headers for cross-platform compatibility
+		relPath = filepath.ToSlash(relPath)
+
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return fmt.Errorf("failed to create tar header for %s: %v", path, err)
+		}
+		header.Name = relPath
+
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return fmt.Errorf("failed to write tar header for %s: %v", path, err)
+		}
+
+		// Only write file contents for regular files
+		if info.IsDir() {
+			return nil
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open %s: %v", path, err)
+		}
+		defer file.Close()
+
+		if _, err := io.Copy(tarWriter, file); err != nil {
+			return fmt.Errorf("failed to write %s to archive: %v", path, err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// Clean up partial archive on error
+		os.Remove(outputPath)
+		return fmt.Errorf("failed to compress directory %s: %v", baseDir, err)
+	}
+
+	logger.Debug("Compressed directory '%s' to: %s", baseDir, outputPath)
 	return nil
 }
 
@@ -6168,20 +6237,18 @@ func main() {
 				logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
 				logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
 			} else {
-				var attachmentFiles []string
-				diagFiles, _ := filepath.Glob(filepath.Join(dlcOutDir, "*", "*_diagnostics_*.txt"))
-				attachmentFiles = append(attachmentFiles, diagFiles...)
-				tarFiles, _ := filepath.Glob(filepath.Join(dlcOutDir, "*", "*.tar.gz"))
-				attachmentFiles = append(attachmentFiles, tarFiles...)
-				logFiles, _ := filepath.Glob(filepath.Join(dlcOutDir, "*", "*.log"))
-				attachmentFiles = append(attachmentFiles, logFiles...)
-
-				if len(attachmentFiles) > 0 {
+				// Compress entire device logs directory into a single archive for JIRA
+				archiveName := filepath.Base(dlcOutDir) + ".tar.gz"
+				archivePath := filepath.Join(filepath.Dir(dlcOutDir), archiveName)
+				logger.Info("Compressing device logs for JIRA attachment: %s", archiveName)
+				if err := compressDirectoryToTarGz(dlcOutDir, archivePath, logger); err != nil {
+					logger.Error("Failed to compress device logs directory: %v", err)
+				} else {
+					logger.Info("Device logs compressed: %s", archivePath)
+					attachmentFiles := []string{archivePath}
 					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 						logger.Error("Failed to attach device log files to JIRA issue %s: %v", *jiraIssueID, err)
 					}
-				} else {
-					logger.Warn("No device log files found to attach to JIRA issue %s", *jiraIssueID)
 				}
 			}
 		}
@@ -6789,15 +6856,24 @@ func main() {
 				attachmentFiles = append(attachmentFiles, analyticsReportPath)
 			}
 
-			// Add device log diagnostic files (use * instead of ** since Go's filepath.Glob doesn't support recursive **)
+			// Add device logs as a single compressed archive
 			if deviceLogOutputDir != "" {
-				deviceFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*_diagnostics_*.txt"))
-				attachmentFiles = append(attachmentFiles, deviceFiles...)
-				// Also look for downloaded log files from devices
-				deviceLogFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*.tar.gz"))
-				attachmentFiles = append(attachmentFiles, deviceLogFiles...)
-				deviceLogFilesPlain, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*.log"))
-				attachmentFiles = append(attachmentFiles, deviceLogFilesPlain...)
+				archiveName := filepath.Base(deviceLogOutputDir) + ".tar.gz"
+				archivePath := filepath.Join(filepath.Dir(deviceLogOutputDir), archiveName)
+				logger.Info("Compressing device logs for JIRA attachment: %s", archiveName)
+				if err := compressDirectoryToTarGz(deviceLogOutputDir, archivePath, logger); err != nil {
+					logger.Warn("Failed to compress device logs directory: %v", err)
+					// Fallback: attach individual files
+					deviceFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*_diagnostics_*.txt"))
+					attachmentFiles = append(attachmentFiles, deviceFiles...)
+					deviceLogFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*.tar.gz"))
+					attachmentFiles = append(attachmentFiles, deviceLogFiles...)
+					deviceLogFilesPlain, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*.log"))
+					attachmentFiles = append(attachmentFiles, deviceLogFilesPlain...)
+				} else {
+					logger.Info("Device logs compressed: %s", archivePath)
+					attachmentFiles = append(attachmentFiles, archivePath)
+				}
 			}
 
 			// Attempt to attach files to JIRA

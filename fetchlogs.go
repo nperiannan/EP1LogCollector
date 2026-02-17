@@ -5098,11 +5098,12 @@ func stripAnsiCodes(s string) string {
 }
 
 // exosPromptRegex matches EXOS CLI prompts like:
-//   "DeviceName.1 # "
-//   "* DeviceName.2 # "
-//   "DeviceName # "
-//   "DeviceName.1 >"
-//   "* (CIT_33.6.0.289) DeviceName.1 # "   ← firmware version prefix
+//
+//	"DeviceName.1 # "
+//	"* DeviceName.2 # "
+//	"DeviceName # "
+//	"DeviceName.1 >"
+//	"* (CIT_33.6.0.289) DeviceName.1 # "   ← firmware version prefix
 var exosPromptRegex = regexp.MustCompile(`(?m)^[\*\s]*(?:\([^\)]*\)\s+)?[\w][\w\-\.]*\s*[#>]\s*$`)
 
 // isExosPrompt checks if the buffered output ends with an EXOS CLI prompt
@@ -5485,7 +5486,7 @@ func collectExosLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogC
 
 				// Cleanup compressed file on device if configured
 				if logConfig.RemoveCompressedFile {
-					rmCmd := fmt.Sprintf("rm %s", remotePath)
+					rmCmd := fmt.Sprintf("run script shell rm -f %s", remotePath)
 					if _, err := ds.sendCommand(rmCmd, 10*time.Second); err != nil {
 						logger.Warn("Failed to cleanup compressed file on device: %v", err)
 					} else {

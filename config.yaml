@@ -207,21 +207,6 @@ deviceLogCollection:
       - name: "vlan"
         command: "show vlan"
         description: "VLAN configuration"
-      - name: "openapi_trace"
-        command: "debug ems show trace all all | in openapi_server"
-        description: "OpenAPI server traces"
-      - name: "openapi_log"
-        command: "show log messages openapi"
-        description: "OpenAPI server logs"
-      - name: "iqagent_log"
-        command: "show log messages iqagent agent"
-        description: "IQ Agent logs"
-      - name: "hive_agent_log"
-        command: "debug iqagent show log hive-agent all"
-        description: "Hive agent debug logs"
-      - name: "agent_log"
-        command: "debug iqagent show log agent all"
-        description: "Agent debug logs"
       - name: "running_config"
         command: "show configuration"
         description: "Running configuration"
@@ -246,8 +231,8 @@ deviceLogCollection:
       logs:
         enabled: true
         compressionEnabled: true
-        compressionCommand: "run script shell tar -cvzf /tmp/nos_logs.tar.gz -C /usr/local/tmp/eciq/ openapi_server.log hiveagent.log agent.log"
-        compressedFilePath: "/tmp/nos_logs.tar.gz"
+        compressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz -C /usr/local/tmp/eciq/ openapi_server.log hiveagent.log agent.log"
+        compressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz"
         fallbackFiles:               # Auto-fallback if compression fails
           - "/usr/local/tmp/eciq/agent.log"
           - "/usr/local/tmp/eciq/hiveagent.log"
@@ -298,8 +283,8 @@ deviceLogCollection:
       logs:
         enabled: true
         compressionEnabled: true
-        compressionCommand: "run script shell tar -cvzf /tmp/nos_logs.tar.gz /usr/local/tmp/eciq/*.log"
-        compressedFilePath: "/tmp/nos_logs.tar.gz"
+        compressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz -C /usr/local/tmp/eciq/ *.log"
+        compressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz"
         fallbackFiles:
           - "/usr/local/tmp/eciq/agent.log"
         removeCompressedFile: true

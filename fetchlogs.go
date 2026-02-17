@@ -6141,8 +6141,37 @@ func main() {
 			return
 		}
 
-		if _, err := processDeviceLogCollection(*config, *outputDir, "", logger); err != nil {
+		dlcOutDir, err := processDeviceLogCollection(*config, *outputDir, "", logger)
+		if err != nil {
 			logger.Error("Device log collection failed: %v", err)
+		}
+
+		// Attach device log files to JIRA if requested
+		if *jiraIssueID != "" && dlcOutDir != "" {
+			logger.Info("")
+			if !config.Jira.AttachmentEnabled {
+				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+			} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
+				logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
+				logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
+				logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+			} else {
+				var attachmentFiles []string
+				diagFiles, _ := filepath.Glob(filepath.Join(dlcOutDir, "*", "*_diagnostics_*.txt"))
+				attachmentFiles = append(attachmentFiles, diagFiles...)
+				tarFiles, _ := filepath.Glob(filepath.Join(dlcOutDir, "*", "*.tar.gz"))
+				attachmentFiles = append(attachmentFiles, tarFiles...)
+				logFiles, _ := filepath.Glob(filepath.Join(dlcOutDir, "*", "*.log"))
+				attachmentFiles = append(attachmentFiles, logFiles...)
+
+				if len(attachmentFiles) > 0 {
+					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						logger.Error("Failed to attach device log files to JIRA issue %s: %v", *jiraIssueID, err)
+					}
+				} else {
+					logger.Warn("No device log files found to attach to JIRA issue %s", *jiraIssueID)
+				}
+			}
 		}
 		return
 	}
@@ -6748,14 +6777,14 @@ func main() {
 				attachmentFiles = append(attachmentFiles, analyticsReportPath)
 			}
 
-			// Add device log diagnostic files
+			// Add device log diagnostic files (use * instead of ** since Go's filepath.Glob doesn't support recursive **)
 			if deviceLogOutputDir != "" {
-				deviceFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "**", "*_diagnostics_*.txt"))
+				deviceFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*_diagnostics_*.txt"))
 				attachmentFiles = append(attachmentFiles, deviceFiles...)
 				// Also look for downloaded log files from devices
-				deviceLogFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "**", "*.tar.gz"))
+				deviceLogFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*.tar.gz"))
 				attachmentFiles = append(attachmentFiles, deviceLogFiles...)
-				deviceLogFilesPlain, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "**", "*.log"))
+				deviceLogFilesPlain, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "*", "*.log"))
 				attachmentFiles = append(attachmentFiles, deviceLogFilesPlain...)
 			}
 

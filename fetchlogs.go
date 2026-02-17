@@ -5475,7 +5475,14 @@ func collectExosLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogC
 
 			// Download compressed file via SFTP
 			remotePath := logConfig.CompressedFilePath
-			localFileName := filepath.Base(remotePath)
+			// Include device IP in filename for unique JIRA attachments across devices
+			deviceIP := strings.ReplaceAll(device.IPAddress, ".", "_")
+			remoteBase := filepath.Base(remotePath)
+			ext := filepath.Ext(remoteBase)                           // .gz
+			nameWithoutExt := strings.TrimSuffix(remoteBase, ext)      // nos_logs.tar
+			ext2 := filepath.Ext(nameWithoutExt)                       // .tar
+			baseName := strings.TrimSuffix(nameWithoutExt, ext2)       // nos_logs
+			localFileName := fmt.Sprintf("%s_%s%s%s", baseName, deviceIP, ext2, ext) // nos_logs_10_127_34_23.tar.gz
 			localPath := filepath.Join(outputDir, localFileName)
 
 			if err := downloadFileFromDeviceSFTP(ds.Client, remotePath, localPath, logger); err != nil {
@@ -5510,8 +5517,13 @@ func collectExosLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogC
 	successCount := 0
 	failCount := 0
 
+	deviceIP := strings.ReplaceAll(device.IPAddress, ".", "_")
 	for _, remotePath := range logConfig.FallbackFiles {
-		localFileName := filepath.Base(remotePath)
+		// Include device IP in filename for unique JIRA attachments across devices
+		remoteBase := filepath.Base(remotePath)
+		ext := filepath.Ext(remoteBase)
+		baseName := strings.TrimSuffix(remoteBase, ext)
+		localFileName := fmt.Sprintf("%s_%s%s", baseName, deviceIP, ext) // agent_10_127_34_23.log
 		localPath := filepath.Join(outputDir, localFileName)
 
 		logger.Info("Downloading: %s", remotePath)

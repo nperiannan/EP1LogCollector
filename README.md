@@ -56,6 +56,20 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **Error Handling**: Graceful fallback if credentials missing or API call fails
 - **Configurable**: Enable/disable via `jira.attachmentEnabled` in config.yaml
 
+### 🔌 Network Device Log Collection (NEW)
+- **EXOS Switch Support**: Direct SSH connection to Extreme Networks EXOS switches for diagnostics and log collection
+- **11 Default Diagnostic Commands**: Pre-configured commands including `show version`, `show switch`, `show vlan`, IQ Agent logs, and more
+- **Combined Diagnostics Report**: All command outputs saved to a single timestamped file with headers, separators, and summary footer
+- **Log File Download via SFTP**: Download log files directly from devices with compression support
+- **Auto-Fallback**: If compressed archive fails, automatically downloads individual log files
+- **Parallel Device Collection**: Process multiple devices concurrently with goroutines
+- **Per-Device Global Timeout**: Configurable timeout (default 600s) prevents hanging on unresponsive devices
+- **CLI Paging Disabled**: Automatic `disable clipaging` before command execution
+- **Per-Command Timeout**: Configurable timeout (default 180s) with graceful handling on timeout
+- **Standalone Mode**: Use `--device-logs` to collect only network device logs
+- **Integrated Mode**: Device logs included in `--all` and config mode when `deviceLogCollection.enabled: true`
+- **JIRA Attachment**: Device diagnostic reports and log files automatically attached to JIRA issues
+
 ## Features
 
 - **🔄 End-to-End Kubernetes Log Collection**: Remotely collect logs from Kubernetes pods, create timestamped archives, and download automatically
@@ -66,6 +80,7 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **🗑️ Smart Archive Management**: Automatic cleanup of remote archives after successful download with configurable retention
 - **📂 Pod File Collection**: Collect specific files directly from inside Kubernetes pods using wildcard patterns with organized output per namespace and pod
 - **🔗 JIRA Integration**: Automatically attach downloaded files to JIRA issues via command-line flag using REST API
+- **🔌 Network Device Logs**: Direct SSH to EXOS switches for diagnostic commands and log file collection with parallel processing
 - **⚡ High-Performance Native SCP Downloads**: 2-step optimized architecture with native SCP achieving 2-4 MB/s (10x faster than SFTP)
 - **🔧 Cross-Platform Compatibility**: Works seamlessly on Windows and Linux with automatic OS-specific optimizations
 - **🔐 Password Encryption**: AES-256-GCM encryption for secure password storage in config files
@@ -219,6 +234,43 @@ jira:
   apiToken: ""                       # API token from https://id.atlassian.com/manage-profile/security/api-tokens
   attachmentEnabled: false           # Enable/disable automatic file attachment
   baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance URL
+
+# Network Device Log Collection
+deviceLogCollection:
+  enabled: false                     # Master enable/disable
+  outputDir: "DeviceLogs"           # Output directory for device logs
+  parallelDownloads: true            # Download from multiple devices concurrently
+  globalTimeout: 600                 # Timeout per device (seconds)
+  cliSettings:
+    commandTimeout: 180              # Max timeout per command (seconds)
+    commandDelay: 1                  # Delay between commands (seconds)
+  exosDefaults:
+    pagingDisableCommand: "disable clipaging"
+    diagnosticCommands:
+      - name: "version"
+        command: "show version"
+        description: "Software version and hardware info"
+      # ... 11 pre-configured commands
+  devices:
+    - name: "my-exos-switch"
+      type: "exos"
+      enabled: true
+      ipAddress: "10.127.34.23"
+      port: 22
+      username: "admin"
+      password: "your-password"
+      diagnostics:
+        enabled: true
+        useDefaults: true
+        additionalCommands: []
+      logs:
+        enabled: true
+        compressionEnabled: true
+        compressionCommand: "run script shell tar -cvzf /tmp/nos_logs.tar.gz ..."
+        compressedFilePath: "/tmp/nos_logs.tar.gz"
+        fallbackFiles:
+          - "/usr/local/tmp/eciq/agent.log"
+          - "/usr/local/tmp/eciq/hiveagent.log"
 ```
 
 ### Template Placeholders
@@ -323,14 +375,23 @@ The tool supports multiple operation modes for different use cases:
 - Skips log collection and system info
 - Perfect for version audits and deployment verification
 
-**6. List Mode (`--list`)**
+**6. Device Logs Mode (`--device-logs`)**
+```bash
+.\fetchlogs.exe --device-logs
+```
+- Collects **only** network device diagnostics and log files
+- Connects via SSH to configured EXOS switches
+- Runs diagnostic commands and downloads log files
+- Requires `deviceLogCollection.enabled: true` in config.yaml
+
+**7. List Mode (`--list`)**
 ```bash
 .\fetchlogs.exe --list
 ```
 - Lists available log files without downloading
 - Traditional file listing mode
 
-**7. Interactive Mode**
+**8. Interactive Mode**
 ```bash
 .\fetchlogs.exe -interactive
 ```
@@ -340,10 +401,11 @@ The tool supports multiple operation modes for different use cases:
 ### Mode Priority
 
 **Operation mode flags override config.yaml settings:**
-- `--all` → Enables logs + versions + system info (regardless of config)
-- `--logs-only` → Enables only log collection (regardless of config)
+- `--all` → Enables logs + versions + system info + device logs (if enabled in config)
+- `--logs-only` → Enables only Kubernetes log collection (no device logs)
 - `--sys-info` → Enables only system info (regardless of config)
 - `--version` → Enables only versions (regardless of config)
+- `--device-logs` → Enables only network device log collection
 - No mode flag → Uses config.yaml settings
 
 ### Basic Usage Examples

@@ -6718,6 +6718,13 @@ func main() {
 					attachmentFiles := []string{archivePath}
 					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 						logger.Error("Failed to attach device log files to JIRA issue %s: %v", *jiraIssueID, err)
+					} else {
+						// Clean up the compressed archive after successful JIRA upload
+						if err := os.Remove(archivePath); err != nil {
+							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+						} else {
+							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+						}
 					}
 				}
 			}
@@ -7350,6 +7357,17 @@ func main() {
 			if len(attachmentFiles) > 0 {
 				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+				} else if deviceLogOutputDir != "" {
+					// Clean up the compressed device log archive after successful JIRA upload
+					archiveName := filepath.Base(deviceLogOutputDir) + ".tar.gz"
+					archivePath := filepath.Join(filepath.Dir(deviceLogOutputDir), archiveName)
+					if _, statErr := os.Stat(archivePath); statErr == nil {
+						if err := os.Remove(archivePath); err != nil {
+							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+						} else {
+							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+						}
+					}
 				}
 			} else {
 				logger.Warn("No files found to attach to JIRA issue %s", *jiraIssueID)

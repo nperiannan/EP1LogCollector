@@ -80,6 +80,54 @@ logCollection:
       - "errors=0"
     maxMatches: 20                  # Maximum matches per log file to include in summary
     contextLines: 2                 # Number of lines before/after each match to include
+    # Transaction/Correlation ID tracking for cross-file correlation
+    correlationKeys:                # Extract correlation IDs to group related errors across files
+      - pattern: 'TXN-\d+'          # Match transaction IDs like TXN-12345
+        type: "transaction"
+      - pattern: 'REQ-[A-Z0-9]+'    # Match request IDs like REQ-ABC123
+        type: "request"  
+      - pattern: 'CORRELATION_ID=\S+'  # Match CORRELATION_ID=xyz
+        type: "correlation"
+      - pattern: 'traceId["\s:=]+([a-f0-9-]{36}|[a-f0-9]{32})'  # Match trace IDs (UUID or hex)
+        type: "trace"
+    timestampPatterns:              # Timestamp formats to parse for chronological correlation
+      - '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}'  # ISO 8601: 2026-02-18T14:30:15.123
+      - '\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]'     # Bracketed: [2026-02-18 14:30:15]
+      - '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}'  # Space-separated: 2026-02-18 14:30:15.123
+    # Semantic error grouping - group similar errors together for better classification
+    errorGroups:
+      - name: "Database Connection Issues"
+        patterns:
+          - "connection timeout"
+          - "database unavailable"
+          - "cannot connect to db"
+          - "db connection failed"
+          - "connection pool exhausted"
+        severity: "HIGH"
+      - name: "Permission/Authentication Errors"
+        patterns:
+          - "permission denied"
+          - "access denied"
+          - "unauthorized"
+          - "authentication failed"
+          - "forbidden"
+        severity: "MEDIUM"
+      - name: "Network/Communication Errors"
+        patterns:
+          - "connection refused"
+          - "connection reset"
+          - "network unreachable"
+          - "timeout"
+          - "no route to host"
+        severity: "MEDIUM"
+      - name: "Resource Exhaustion"
+        patterns:
+          - "out of memory"
+          - "disk full"
+          - "quota exceeded"
+          - "too many open files"
+          - "resource limit"
+        severity: "HIGH"
   # Post-download message filtering (creates filtered copies in filter/ directory)
   messageFilter:
     enabled: false                  # Enable/disable message filtering
@@ -89,6 +137,11 @@ logCollection:
       - key: "serial"
         value: ""
     specificStrings: []             # Only keep lines containing at least one of these strings (empty = no filter)
+    # Loki-style replica log merging (combine logs from replica pods into single files)
+    combineReplicas: true           # Merge replica pod logs into single file per service
+    replicaPattern: "-[a-z0-9]{5,10}$"  # Regex pattern to detect replica suffix (e.g., -abc123, -xyz789)
+    sortByTimestamp: true           # Sort combined logs chronologically by timestamp
+    timestampPattern: '\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{3,6})?'  # Regex to extract timestamp from log lines
   # Pod file collection (collect specific files from inside pods)
   podFileCollection:
     enabled: true                  # Enable/disable pod file collection

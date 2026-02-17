@@ -54,7 +54,7 @@ logCollection:
     namespace: "configuration"      # Temporal namespace to query
   # Log analysis and error detection
   logAnalysis:
-    enabled: true                   # Enable automatic log analysis for errors/issues
+    enabled: false                  # Enable automatic log analysis for errors/issues
     outputFile: "log_analysis_summary.txt"  # Output file name for analysis results
     errorPatterns:                  # Patterns to search for in collected logs (case-insensitive)
       - "error"
@@ -81,7 +81,7 @@ logCollection:
     contextLines: 2                 # Number of lines before/after each match to include
   # Post-download message filtering (creates filtered copies in filter/ directory)
   messageFilter:
-    enabled: true                  # Enable/disable message filtering
+    enabled: false                  # Enable/disable message filtering
     keyValueFilters:                # Keep lines where key is absent OR key has matching value
       - key: "ownerID"
         value: "1096"
@@ -162,9 +162,9 @@ appVersionCollection:
 
 # JIRA Integration Settings
 jira:
-  email: ""                         # Your Atlassian account email address
-  apiToken: ""                      # Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
-  attachmentEnabled: false          # Enable/disable automatic file attachment to JIRA issues
+  email: "nperiannan@extremenetworks.com" # Your Atlassian account email address
+  apiToken: ""                            # Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+  attachmentEnabled: true                 # Enable/disable automatic file attachment to JIRA issues
   baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance base URL
   # 
   # Usage: Run with --jira flag to attach downloaded files to a JIRA issue
@@ -175,8 +175,8 @@ jira:
 
 # Network Device Log Collection Settings
 deviceLogCollection:
-  enabled: false                      # Master enable/disable for device log collection
-  outputDir: "DeviceLogs"            # Subdirectory within main outputDir for device logs
+  enabled: true                      # Master enable/disable for device log collection
+  outputDir: "Device"               # Subdirectory within main outputDir for device logs
   parallelDownloads: true            # Download from multiple devices concurrently
   globalTimeout: 600                 # Total timeout per device (seconds)
   
@@ -222,12 +222,15 @@ deviceLogCollection:
       - name: "agent_log"
         command: "debug iqagent show log agent all"
         description: "Agent debug logs"
+      - name: "running_config"
+        command: "show configuration"
+        description: "Running configuration"
   
   # Individual Devices
   devices:
     - name: "core-switch-exos"
       type: "exos"                   # Device type: "exos" or "voss"
-      enabled: false                 # Per-device enable/disable
+      enabled: true                  # Per-device enable/disable
       ipAddress: "10.127.34.23"
       port: 22
       username: "admin"
@@ -284,8 +287,8 @@ deviceLogCollection:
       enabled: false
       ipAddress: "10.127.34.25"
       port: 22
-      username: "admin"
-      password: ""
+      username: "rwa"
+      password: "rwa"
       
       diagnostics:
         enabled: false               # Skip diagnostics for this device

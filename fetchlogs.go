@@ -4947,12 +4947,32 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 // DeviceSession represents an active SSH session to a network device with
 // interactive shell support for sending CLI commands
 type DeviceSession struct {
-	Client  *ssh.Client
-	Session *ssh.Session
-	Stdin   io.WriteCloser
-	Stdout  *bufio.Reader
-	Device  NetworkDevice
-	Logger  *Logger
+	Client   *ssh.Client
+	Session  *ssh.Session
+	Stdin    io.WriteCloser
+	Stdout   *bufio.Reader
+	Device   NetworkDevice
+	Logger   *Logger
+	byteChan chan byte  // Single reader goroutine sends bytes here
+	errChan  chan error // Reader goroutine sends errors here
+}
+
+// startReader launches a single goroutine that continuously reads from Stdout
+// and sends bytes through byteChan. This prevents goroutine leaks from
+// multiple concurrent ReadByte() callers.
+func (ds *DeviceSession) startReader() {
+	ds.byteChan = make(chan byte, 65536)
+	ds.errChan = make(chan error, 1)
+	go func() {
+		for {
+			b, err := ds.Stdout.ReadByte()
+			if err != nil {
+				ds.errChan <- err
+				return
+			}
+			ds.byteChan <- b
+		}
+	}()
 }
 
 // connectToExosDevice establishes an SSH connection to an EXOS switch
@@ -5056,6 +5076,9 @@ func connectToExosDevice(device NetworkDevice, logger *Logger) (*DeviceSession, 
 		Logger:  logger,
 	}
 
+	// Start the single reader goroutine — all reads go through byteChan
+	ds.startReader()
+
 	// Wait for initial prompt
 	if err := ds.waitForPrompt(15 * time.Second); err != nil {
 		ds.Close()
@@ -5066,117 +5089,164 @@ func connectToExosDevice(device NetworkDevice, logger *Logger) (*DeviceSession, 
 	return ds, nil
 }
 
+// ansiRegex strips ANSI escape sequences (colors, cursor movement, etc.)
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[[\?]?[0-9;]*[hlm]`)
+
+// stripAnsiCodes removes ANSI escape sequences from a string
+func stripAnsiCodes(s string) string {
+	return ansiRegex.ReplaceAllString(s, "")
+}
+
+// exosPromptRegex matches EXOS CLI prompts like:
+//   "DeviceName.1 # "
+//   "* DeviceName.2 # "
+//   "DeviceName # "
+//   "DeviceName.1 >"
+//   "* (CIT_33.6.0.289) DeviceName.1 # "   ← firmware version prefix
+var exosPromptRegex = regexp.MustCompile(`(?m)^[\*\s]*(?:\([^\)]*\)\s+)?[\w][\w\-\.]*\s*[#>]\s*$`)
+
+// isExosPrompt checks if the buffered output ends with an EXOS CLI prompt
+func isExosPrompt(output string) bool {
+	// Strip ANSI escape codes and carriage returns before checking
+	cleaned := stripAnsiCodes(output)
+	cleaned = strings.ReplaceAll(cleaned, "\r", "")
+
+	lines := strings.Split(cleaned, "\n")
+	if len(lines) == 0 {
+		return false
+	}
+	lastLine := lines[len(lines)-1]
+	if strings.TrimSpace(lastLine) == "" && len(lines) > 1 {
+		lastLine = lines[len(lines)-2]
+	}
+	return exosPromptRegex.MatchString(lastLine)
+}
+
 // waitForPrompt reads output until a CLI prompt pattern is detected
 // EXOS prompts typically end with "# " or "> " possibly preceded by the device name
 func (ds *DeviceSession) waitForPrompt(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var buf bytes.Buffer
+	lastLogLen := 0
 
 	for {
-		if time.Now().After(deadline) {
+		// Periodic debug logging every 256 bytes
+		if buf.Len()-lastLogLen >= 256 {
+			ds.Logger.Debug("waitForPrompt: received %d bytes so far", buf.Len())
+			lastLogLen = buf.Len()
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return fmt.Errorf("timeout after %v waiting for prompt (received %d bytes: %q)",
 				timeout, buf.Len(), truncateString(buf.String(), 200))
 		}
 
-		// Set read deadline on the underlying connection
-		ds.Stdout.Reset(ds.Stdout)
-
-		// Read available data with a short timeout per read
-		readDone := make(chan struct{})
-		var b byte
-		var readErr error
-		go func() {
-			b, readErr = ds.Stdout.ReadByte()
-			close(readDone)
-		}()
-
 		select {
-		case <-readDone:
-			if readErr != nil {
-				if readErr == io.EOF {
-					return fmt.Errorf("connection closed while waiting for prompt")
-				}
-				return readErr
-			}
+		case b := <-ds.byteChan:
 			buf.WriteByte(b)
-
-			// Check if we've received a prompt
-			current := buf.String()
-			if isExosPrompt(current) {
+			if isExosPrompt(buf.String()) {
 				ds.Logger.Debug("Detected prompt after %d bytes", buf.Len())
 				return nil
 			}
-		case <-time.After(time.Until(deadline)):
-			return fmt.Errorf("timeout waiting for prompt")
+		case err := <-ds.errChan:
+			if err == io.EOF {
+				return fmt.Errorf("connection closed while waiting for prompt")
+			}
+			return err
+		case <-time.After(remaining):
+			return fmt.Errorf("timeout waiting for prompt (received %d bytes)", buf.Len())
 		}
 	}
 }
 
-// isExosPrompt checks if the buffered output ends with an EXOS CLI prompt
-// EXOS prompts look like: "DeviceName.1 # " or "* DeviceName.2 # " or "DeviceName # "
-func isExosPrompt(output string) bool {
-	trimmed := strings.TrimRight(output, " ")
-	if strings.HasSuffix(trimmed, "#") || strings.HasSuffix(trimmed, ">") {
-		// Verify it looks like a prompt line (last line contains prompt characters)
-		lines := strings.Split(output, "\n")
-		lastLine := strings.TrimSpace(lines[len(lines)-1])
-		if len(lastLine) > 0 && (strings.HasSuffix(lastLine, "#") || strings.HasSuffix(lastLine, "# ") ||
-			strings.HasSuffix(lastLine, ">") || strings.HasSuffix(lastLine, "> ")) {
-			return true
+// drainBuffer reads and discards any pending data in byteChan.
+// Non-blocking: only drains bytes already available in the channel.
+func (ds *DeviceSession) drainBuffer() {
+	drained := 0
+	for {
+		select {
+		case <-ds.byteChan:
+			drained++
+		default:
+			if drained > 0 {
+				ds.Logger.Debug("drainBuffer: discarded %d bytes", drained)
+			}
+			return
 		}
 	}
-	return false
 }
 
 // sendCommand sends a CLI command to the device and reads the response until
-// the next prompt appears. Returns the command output (excluding the prompt).
+// the next prompt appears. Uses a settling delay to avoid false prompt detection.
+// Returns the command output (excluding the echoed command and trailing prompt).
 func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (string, error) {
 	ds.Logger.Debug("Sending command to '%s': %s", ds.Device.Name, command)
 
-	// Send the command
+	// Step 1: Drain any pending output from previous commands
+	ds.drainBuffer()
+
+	// Step 2: Send the command
 	_, err := fmt.Fprintf(ds.Stdin, "%s\n", command)
 	if err != nil {
 		return "", fmt.Errorf("failed to send command '%s': %v", command, err)
 	}
 
-	// Read response until next prompt
+	// Step 3: Read response until prompt, with settling delay to avoid false positives
 	var output bytes.Buffer
 	deadline := time.Now().Add(timeout)
+	settleDelay := 500 * time.Millisecond
 
 	for {
-		if time.Now().After(deadline) {
+		// Check for prompt BEFORE waiting for new data (handles the case where
+		// settling was interrupted by trailing bytes that complete a valid prompt)
+		if output.Len() > 0 && isExosPrompt(output.String()) {
+			// Settling: wait to make sure no more data is coming.
+			settleDeadline := time.Now().Add(settleDelay)
+			settled := true
+			for time.Now().Before(settleDeadline) {
+				settleRemaining := time.Until(settleDeadline)
+				if settleRemaining <= 0 {
+					break
+				}
+				select {
+				case mb := <-ds.byteChan:
+					output.WriteByte(mb)
+					settled = false
+				case <-time.After(settleRemaining):
+					// No more data within settle period — it's a real prompt
+				}
+				if !settled {
+					break
+				}
+			}
+
+			if settled {
+				result := cleanCommandOutput(output.String(), command)
+				ds.Logger.Debug("Command '%s' completed (%d bytes output)", command, len(result))
+				return result, nil
+			}
+			// Not settled — more data arrived; loop back to re-check prompt
+			continue
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return output.String(), fmt.Errorf("command '%s' timed out after %v (collected %d bytes)",
 				command, timeout, output.Len())
 		}
 
-		readDone := make(chan struct{})
-		var b byte
-		var readErr error
-		go func() {
-			b, readErr = ds.Stdout.ReadByte()
-			close(readDone)
-		}()
-
 		select {
-		case <-readDone:
-			if readErr != nil {
-				if readErr == io.EOF {
-					// Connection closed - return what we have
-					return output.String(), fmt.Errorf("connection closed during command '%s'", command)
-				}
-				return output.String(), readErr
-			}
+		case b := <-ds.byteChan:
 			output.WriteByte(b)
 
-			// Check if the prompt has reappeared (command complete)
-			current := output.String()
-			if isExosPrompt(current) {
-				// Strip the command echo and trailing prompt from output
-				result := cleanCommandOutput(current, command)
-				ds.Logger.Debug("Command '%s' completed (%d bytes output)", command, len(result))
-				return result, nil
+		case readErr := <-ds.errChan:
+			if readErr == io.EOF {
+				return output.String(), fmt.Errorf("connection closed during command '%s'", command)
 			}
-		case <-time.After(time.Until(deadline)):
+			return output.String(), readErr
+
+		case <-time.After(remaining):
 			return output.String(), fmt.Errorf("command '%s' timed out after %v", command, timeout)
 		}
 	}
@@ -5185,9 +5255,12 @@ func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (str
 // cleanCommandOutput removes the echoed command from the beginning and the
 // trailing prompt from the output, returning just the command results
 func cleanCommandOutput(raw, command string) string {
-	lines := strings.Split(raw, "\n")
+	// Strip ANSI codes and carriage returns for clean parsing
+	cleaned := stripAnsiCodes(raw)
+	cleaned = strings.ReplaceAll(cleaned, "\r", "")
+	lines := strings.Split(cleaned, "\n")
 
-	// Find start index: skip lines that are the echoed command
+	// Find start index: skip the echoed command line
 	startIdx := 0
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -5197,19 +5270,19 @@ func cleanCommandOutput(raw, command string) string {
 		}
 	}
 
-	// Find end index: remove the last prompt line
+	// Find end index: remove trailing prompt line(s)
 	endIdx := len(lines)
 	for i := len(lines) - 1; i >= startIdx; i-- {
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasSuffix(trimmed, "#") || strings.HasSuffix(trimmed, ">") ||
-			strings.HasSuffix(trimmed, "# ") || strings.HasSuffix(trimmed, "> ") {
+		// Use regex for prompt detection instead of loose suffix matching
+		if exosPromptRegex.MatchString(lines[i]) {
 			endIdx = i
-			break
+			continue
 		}
-		break // Non-empty, non-prompt line found, stop searching
+		break
 	}
 
 	if startIdx >= endIdx {
@@ -5645,8 +5718,8 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 		timestamp = time.Now().Format("20060102_150405")
 	}
 
-	// Build output directory: baseOutputDir/DeviceLogs_timestamp
-	deviceLogFolderName := fmt.Sprintf("DeviceLogs_%s", timestamp)
+	// Build output directory: baseOutputDir/Device_timestamp
+	deviceLogFolderName := fmt.Sprintf("Device_%s", timestamp)
 	var timestampDir string
 	if baseOutputDir != "" {
 		timestampDir = filepath.Join(baseOutputDir, deviceLogFolderName)
@@ -6056,6 +6129,23 @@ func main() {
 		}
 	}
 
+	// --device-logs mode: collect only network device logs and diagnostics
+	// This mode does NOT require bastion/AWS — it connects directly to devices via SSH
+	if selectedMode == "device-logs" {
+		logger.Info("Running in device-logs mode (network device logs only)...")
+
+		if !config.DeviceLogCollection.Enabled {
+			logger.Warn("Device log collection is disabled in config.yaml (deviceLogCollection.enabled: false)")
+			logger.Info("Please enable deviceLogCollection in config.yaml and configure your devices")
+			return
+		}
+
+		if _, err := processDeviceLogCollection(*config, *outputDir, "", logger); err != nil {
+			logger.Error("Device log collection failed: %v", err)
+		}
+		return
+	}
+
 	// Validate required parameters
 	if *username == "" || *password == "" || *bastionHost == "" {
 		fmt.Println("Error: Missing required parameters")
@@ -6073,7 +6163,7 @@ func main() {
 	}
 
 	// Check if any operations are requested before attempting connections
-	hasOperations := collectLogs || collectInfo || collectAppVersions || *listOnly
+	hasOperations := collectLogs || collectInfo || collectAppVersions || collectDeviceLogs || *listOnly
 
 	if !hasOperations {
 		fmt.Println("No operations requested.")
@@ -6199,25 +6289,6 @@ func main() {
 					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
 				}
 			}
-		}
-		return
-	}
-
-	// --device-logs mode: collect only network device logs and diagnostics
-	if selectedMode == "device-logs" {
-		logger.Info("Running in device-logs mode (network device logs only)...")
-
-		// Check if device log collection is enabled
-		if !config.DeviceLogCollection.Enabled {
-			logger.Warn("Device log collection is disabled in config.yaml (deviceLogCollection.enabled: false)")
-			logger.Info("Please enable deviceLogCollection in config.yaml and configure your devices")
-			return
-		}
-
-		logger.Debug("collectDeviceLogs flag: %v", collectDeviceLogs)
-
-		if _, err := processDeviceLogCollection(*config, *outputDir, "", logger); err != nil {
-			logger.Error("Device log collection failed: %v", err)
 		}
 		return
 	}

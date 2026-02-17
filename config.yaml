@@ -96,9 +96,15 @@ logCollection:
         podPrefix: "cs-configuration"  # Pod name prefix to match
         logPath: "/var/log/configuration/"  # Path inside the pod
         filePatterns:               # File patterns to collect (supports wildcards)
-          - "*server.log"           # Matches server.log and cs-configuration-*-server.log
-          - "*server_err.log"       # Matches server_err.log and cs-configuration-*-server_err.log
-          - "*.log.gz"              # Matches all compressed log files
+          - "*.log"                 # ALL .log files (server.log, error.log, etc.)
+          - "*.log.gz"              # ALL compressed log files
+        # Wildcard Pattern Examples:
+        #   "*.log"          → All files ending with .log
+        #   "server*"        → All files starting with "server" (server.log, server_err.log)
+        #   "*error*"        → All files containing "error" in the name
+        #   "application*.log" → Files like application.log, application-2024.log
+        #   "*"              → ALL files (use carefully - might be too many!)
+        #   "server.log"     → Exact filename match (no wildcard)
       # Example: Add more collections as needed
       # - namespace: "xiq"
       #   podPrefix: "hmweb"

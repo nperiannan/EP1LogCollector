@@ -6870,6 +6870,11 @@ func main() {
 			logger.Error("Device log collection failed: %v", err)
 		}
 
+		// Move logger_info.txt into the Device_timestamp directory
+		if dlcOutDir != "" {
+			logger.CopyLogFileTo(dlcOutDir, "")
+		}
+
 		// Attach device log files to JIRA if requested
 		if *jiraIssueID != "" && dlcOutDir != "" {
 			logger.Info("")
@@ -6901,6 +6906,11 @@ func main() {
 					}
 				}
 			}
+		}
+		// Clean up logger_info.txt from workspace dir (already copied into Device_timestamp dir)
+		if dlcOutDir != "" {
+			logger.Close()
+			os.Remove("logger_info.txt")
 		}
 		return
 	}

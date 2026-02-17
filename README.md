@@ -2,9 +2,20 @@
 
 A command-line utility for fetching log files from AWS instances via a bastion host with integrated Kubernetes log collection and comprehensive system information gathering.
 
-## Recent Updates (v2.0)
+## Recent Updates (v1.1.0 - Latest)
 
-### ⚡ High-Performance Native SCP Downloads (NEW)
+### 🏷️ Renamed to LogCollector (NEW)
+- **Full Rebrand**: Tool renamed from "fetchlogs" to "logcollector" across all files and documentation
+- **Build Versioning**: New `-v` flag shows version, build number, and build date
+- **Automated Builds**: PowerShell build script with auto-incrementing build numbers
+- **Cross-Platform Releases**: Pre-built binaries for Windows, Linux, macOS (Intel & Apple Silicon)
+
+### 🔍 Loki-Style Log Filtering (NEW)
+- **Strict Inclusion Filter**: Lines without matching key=value patterns are now dropped (Loki/LogQL behavior)
+- **Non-Destructive**: Original logs preserved, filtered output in separate directory
+- **Key-Value Matching**: Filter by specific key=value pairs (e.g., `ownerID=1096`)
+
+### ⚡ High-Performance Native SCP Downloads
 - **10x Speed Improvement**: Native SCP achieves 2-4 MB/s vs 435-667 KB/s with SFTP
 - **2-Step Architecture**: Optimized AWS→Bastion (internal SCP) + Bastion→Local (native SCP)
 - **Passwordless Automation**: Automatic temporary SSH key generation and cleanup
@@ -113,6 +124,25 @@ A command-line utility for fetching log files from AWS instances via a bastion h
   - **Windows**: OpenSSH client (included in Windows 10+ by default)
   - **Linux**: OpenSSH client (typically pre-installed)
   - **Verification**: Run `scp -V` and `ssh-keygen -V` to confirm availability
+
+## Download
+
+**Latest Release: v1.1.0**
+
+Download pre-built binaries from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.1.0):
+
+| Platform | Binary |
+|----------|--------|
+| Windows (x64) | `logcollector-windows-amd64.exe` |
+| Linux (x64) | `logcollector-linux-amd64` |
+| macOS (Intel) | `logcollector-darwin-amd64` |
+| macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**What's New in v1.1.0:**
+- **Renamed to LogCollector** - Full rebrand from fetchlogs (binary, source, module, docs)
+- **Loki-style strict inclusion filter** - Log filter now drops lines without matching key
+- **Build versioning** - Run `logcollector.exe -v` to display version, build number, and build date
+- **Automated build system** - `build.ps1` with auto-incrementing build numbers
 
 ## Building
 

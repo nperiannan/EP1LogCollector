@@ -1,6 +1,23 @@
-# Quick Start Guide
+# Quick Start Guide - LogCollector
 
-A command-line tool to collect logs, system info, and application versions from Kubernetes clusters via SSH bastion host.
+A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
+
+## Latest Release: v1.1.0
+
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.1.0)
+
+| Platform | Binary |
+|----------|--------|
+| Windows (x64) | `logcollector-windows-amd64.exe` |
+| Linux (x64) | `logcollector-linux-amd64` |
+| macOS (Intel) | `logcollector-darwin-amd64` |
+| macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**What's New in v1.1.0:**
+- Renamed to **LogCollector** (was fetchlogs)
+- Loki-style strict inclusion filter
+- Build versioning with `-v` flag
+- Automated build system with version injection
 
 ## Prerequisites
 
@@ -19,9 +36,18 @@ A command-line tool to collect logs, system info, and application versions from 
 
 ## Quick Setup
 
-### 1. Build the Tool
+### 1. Get the Tool
+
+**Option A: Download Pre-built Binary (Recommended)**
+- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.1.0)
+- Extract/rename to `logcollector.exe` (Windows) or `logcollector` (Linux/Mac)
+- Check version: `logcollector.exe -v` or `./logcollector -v`
+
+**Option B: Build from Source**
 ```bash
-go build -o fetchlogs.exe fetchlogs.go
+go build -o logcollector.exe logcollector.go
+# Or use automated build script
+.\build.ps1
 ```
 
 ### 2. Configure `config.yaml`
@@ -63,33 +89,39 @@ options:
 
 ### Basic Commands
 
+**Check Version:**
+```bash
+.\logcollector.exe -v
+```
+→ Shows version, build number, and build date
+
 **Collect Everything:**
 ```bash
-./fetchlogs.exe --all
+.\logcollector.exe --all
 ```
-→ Logs + System Info + App Versions + Temporal Workflows + Schedules
+→ Logs + System Info + App Versions + Temporal Workflows + Schedules + Network Devices
 
 **Collect Only Logs:**
 ```bash
-./fetchlogs.exe --logs-only
+.\logcollector.exe --logs-only
 ```
 → Kubernetes pod logs only
 
 **Collect System Info:**
 ```bash
-./fetchlogs.exe --sys-info
+.\logcollector.exe --sys-info
 ```
 → Cluster health, pod status, node info
 
 **Collect App Versions:**
 ```bash
-./fetchlogs.exe --version
+.\logcollector.exe --version
 ```
 → Application versions from all namespaces
 
 **Use Config File Settings:**
 ```bash
-./fetchlogs.exe
+.\logcollector.exe
 ```
 → Uses enabled/disabled flags from config.yaml
 
@@ -97,25 +129,25 @@ options:
 
 **Change download method:**
 ```bash
-./fetchlogs.exe --native-scp    # Force native SCP (fast)
-./fetchlogs.exe --sftp          # Force SFTP (parallel)
+.\logcollector.exe --native-scp    # Force native SCP (fast)
+.\logcollector.exe --sftp          # Force SFTP (parallel)
 ```
 
 **Change log level:**
 ```bash
-./fetchlogs.exe -log-level DEBUG
+.\logcollector.exe -log-level DEBUG
 ```
 
 **Time-based log collection:**
 ```bash
-./fetchlogs.exe --logs-only -time-duration 30m   # Last 30 minutes
-./fetchlogs.exe --logs-only -time-duration 2h    # Last 2 hours
+.\logcollector.exe --logs-only -time-duration 30m   # Last 30 minutes
+.\logcollector.exe --logs-only -time-duration 2h    # Last 2 hours
 ```
 
 **Attach files to JIRA issue:**
 ```bash
-./fetchlogs.exe --all --jira XCP-17614           # Attach to JIRA issue
-./fetchlogs.exe --logs-only --jira XCP-12345     # Logs only, attach to JIRA
+.\logcollector.exe --all --jira XCP-17614           # Attach to JIRA issue
+.\logcollector.exe --logs-only --jira XCP-12345     # Logs only, attach to JIRA
 ```
 
 ## Config.yaml Reference

@@ -4494,10 +4494,11 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 }
 
 // collectAppVersionsStandalone collects application version information and saves it locally
-func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
+// Returns the path to the created file and any error
+func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) (string, error) {
 	if !config.AppVersionCollection.Enabled {
 		logger.Info("App version collection is disabled in config")
-		return nil
+		return "", nil
 	}
 
 	logger.Debug("Starting standalone application version collection...")
@@ -4506,7 +4507,7 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 	logger.Debug("Checking available namespaces...")
 	nsSession, err := awsClient.NewSession()
 	if err != nil {
-		return fmt.Errorf("failed to create session for namespace check: %v", err)
+		return "", fmt.Errorf("failed to create session for namespace check: %v", err)
 	}
 	nsCmd := "kubectl get namespaces --no-headers | awk '{print \\$1}'"
 	nsOutput, err := nsSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", nsCmd))
@@ -4733,12 +4734,12 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory %s: %v", outputDir, err)
+		return "", fmt.Errorf("failed to create output directory %s: %v", outputDir, err)
 	}
 
 	// Write to local file
 	if err := ioutil.WriteFile(localFilePath, []byte(content), 0644); err != nil {
-		return fmt.Errorf("failed to write app versions file %s: %v", localFilePath, err)
+		return "", fmt.Errorf("failed to write app versions file %s: %v", localFilePath, err)
 	}
 
 	// Get file info for logging
@@ -4768,7 +4769,7 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 	logger.Info("Standalone app version collection completed: %d/%d pods processed successfully", successCount, totalPods)
 	logger.Info("Version information saved locally to: %s", localFilePath)
 
-	return nil
+	return localFilePath, nil
 }
 
 // attachFilesToJira uploads files to a JIRA issue using the JIRA REST API
@@ -5310,12 +5311,29 @@ func main() {
 	// --version mode: collect only application version information
 	if selectedMode == "version" {
 		logger.Info("Running in version mode (app version collection only)...")
-		err = collectAppVersionsStandalone(awsClient, config)
+		versionFilePath, err := collectAppVersionsStandalone(awsClient, config)
 		if err != nil {
 			logger.Error("Failed to collect app versions: %v", err)
 			return
 		}
 		logger.Info("App version collection completed successfully!")
+
+		// Attach to JIRA if requested
+		if *jiraIssueID != "" && versionFilePath != "" {
+			logger.Info("")
+			if !config.Jira.AttachmentEnabled {
+				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+			} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
+				logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
+				logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
+				logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+			} else {
+				attachmentFiles := []string{versionFilePath}
+				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+				}
+			}
+		}
 		return
 	}
 
@@ -5340,12 +5358,29 @@ func main() {
 		// If only app version collection is enabled (no logs, no general info)
 		if collectAppVersions && !collectLogs && !collectInfo {
 			logger.Info("Running in config mode - collecting app versions only...")
-			err = collectAppVersionsStandalone(awsClient, config)
+			versionFilePath, err := collectAppVersionsStandalone(awsClient, config)
 			if err != nil {
 				logger.Error("Failed to collect app versions: %v", err)
 				return
 			}
 			logger.Info("App version collection completed successfully!")
+
+			// Attach to JIRA if requested
+			if *jiraIssueID != "" && versionFilePath != "" {
+				logger.Info("")
+				if !config.Jira.AttachmentEnabled {
+					logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+				} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
+					logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
+					logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
+					logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+				} else {
+					attachmentFiles := []string{versionFilePath}
+					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+					}
+				}
+			}
 			return
 		}
 	}
@@ -5419,7 +5454,7 @@ func main() {
 	// Collect app versions if enabled and logs were collected
 	if collectAppVersions && collectLogs {
 		logger.Info("Collecting application version information...")
-		err = collectAppVersionsStandalone(awsClient, config)
+		_, err = collectAppVersionsStandalone(awsClient, config)
 		if err != nil {
 			logger.Warn("Failed to collect app versions: %v", err)
 			// Don't return - continue with log downloads

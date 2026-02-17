@@ -211,6 +211,37 @@ deviceLogCollection:
         command: "show configuration"
         description: "Running configuration"
   
+  # VOSS Device Type Defaults
+  vossDefaults:
+    enableCommand: "en"
+    configCommand: "configure terminal"
+    pagingDisableCommand: "terminal more disable"
+    diagnosticCommands:
+      - name: "software"
+        command: "show software"
+        description: "Software version information"
+      - name: "sys_info"
+        command: "show sys-info"
+        description: "System information and uptime"
+      - name: "interfaces"
+        command: "show interfaces GigabitEthernet name"
+        description: "Interface names and status"
+      - name: "vlan"
+        command: "show vlan basic"
+        description: "VLAN configuration"
+      - name: "ip_route"
+        command: "show ip route"
+        description: "IP routing table"
+      - name: "isis"
+        command: "show isis"
+        description: "IS-IS status"
+      - name: "spbm"
+        command: "show isis spbm"
+        description: "SPBM configuration"
+      - name: "running_config"
+        command: "show running-config"
+        description: "Running configuration"
+  
   # Individual Devices
   devices:
     - name: "core-switch-exos"
@@ -288,6 +319,32 @@ deviceLogCollection:
         fallbackFiles:
           - "/usr/local/tmp/eciq/agent.log"
         removeCompressedFile: true
+        removeOldLogs: false
+        oldLogsPattern: ""
+
+    - name: "Man-flo-0035"
+      type: "voss"
+      enabled: true
+      ipAddress: "10.139.121.231"
+      port: 22
+      username: "rwa"
+      password: "rwa"
+      
+      diagnostics:
+        enabled: true
+        useDefaults: true            # Use vossDefaults.diagnosticCommands
+        additionalCommands: []
+      
+      logs:
+        enabled: true
+        compressionEnabled: false    # VOSS doesn't support on-device tar
+        compressionCommand: ""
+        compressedFilePath: ""
+        fallbackFiles:               # Download individual files from /intflash/
+          - "/intflash/openapi/openapi_server.log"
+          - "/intflash/alarmLog"
+          - "/intflash/config.cfg"
+        removeCompressedFile: false
         removeOldLogs: false
         oldLogsPattern: ""
 

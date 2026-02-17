@@ -512,6 +512,14 @@ type ExosDefaultConfig struct {
 	DiagnosticCommands   []DeviceCommand `yaml:"diagnosticCommands"`
 }
 
+// VossDefaultConfig contains default settings for VOSS devices
+type VossDefaultConfig struct {
+	EnableCommand        string          `yaml:"enableCommand"`
+	ConfigCommand        string          `yaml:"configCommand"`
+	PagingDisableCommand string          `yaml:"pagingDisableCommand"`
+	DiagnosticCommands   []DeviceCommand `yaml:"diagnosticCommands"`
+}
+
 // DeviceDiagnosticConfig controls diagnostic command collection for a device
 type DeviceDiagnosticConfig struct {
 	Enabled            bool            `yaml:"enabled"`
@@ -552,6 +560,7 @@ type DeviceLogCollection struct {
 	GlobalTimeout     int               `yaml:"globalTimeout"`
 	CLISettings       DeviceCLISettings `yaml:"cliSettings"`
 	ExosDefaults      ExosDefaultConfig `yaml:"exosDefaults"`
+	VossDefaults      VossDefaultConfig `yaml:"vossDefaults"`
 	Devices           []NetworkDevice   `yaml:"devices"`
 }
 
@@ -5106,8 +5115,16 @@ func stripAnsiCodes(s string) string {
 //	"* (CIT_33.6.0.289) DeviceName.1 # "   ← firmware version prefix
 var exosPromptRegex = regexp.MustCompile(`(?m)^[\*\s]*(?:\([^\)]*\)\s+)?[\w][\w\-\.]*\s*[#>]\s*$`)
 
-// isExosPrompt checks if the buffered output ends with an EXOS CLI prompt
-func isExosPrompt(output string) bool {
+// vossPromptRegex matches VOSS CLI prompts like:
+//
+//	"Man-flo-0035:1>"        ← normal mode
+//	"Man-flo-0035:1#"        ← enable mode
+//	"Man-flo-0035:1(config)#" ← config mode
+//	"Man-flo-0035:1(config-if)#" ← interface config mode
+var vossPromptRegex = regexp.MustCompile(`(?m)^[\w][\w\-\.]*:\d+(?:\([^\)]*\))?[#>]\s*$`)
+
+// isDevicePrompt checks if the buffered output ends with a CLI prompt for the given device type
+func isDevicePrompt(output string, deviceType string) bool {
 	// Strip ANSI escape codes and carriage returns before checking
 	cleaned := stripAnsiCodes(output)
 	cleaned = strings.ReplaceAll(cleaned, "\r", "")
@@ -5120,7 +5137,28 @@ func isExosPrompt(output string) bool {
 	if strings.TrimSpace(lastLine) == "" && len(lines) > 1 {
 		lastLine = lines[len(lines)-2]
 	}
-	return exosPromptRegex.MatchString(lastLine)
+
+	switch strings.ToLower(deviceType) {
+	case "voss":
+		return vossPromptRegex.MatchString(lastLine)
+	default: // exos
+		return exosPromptRegex.MatchString(lastLine)
+	}
+}
+
+// isExosPrompt checks if the buffered output ends with an EXOS CLI prompt
+func isExosPrompt(output string) bool {
+	return isDevicePrompt(output, "exos")
+}
+
+// getPromptRegex returns the prompt regex for the given device type
+func getPromptRegex(deviceType string) *regexp.Regexp {
+	switch strings.ToLower(deviceType) {
+	case "voss":
+		return vossPromptRegex
+	default:
+		return exosPromptRegex
+	}
 }
 
 // waitForPrompt reads output until a CLI prompt pattern is detected
@@ -5146,7 +5184,7 @@ func (ds *DeviceSession) waitForPrompt(timeout time.Duration) error {
 		select {
 		case b := <-ds.byteChan:
 			buf.WriteByte(b)
-			if isExosPrompt(buf.String()) {
+			if isDevicePrompt(buf.String(), ds.Device.Type) {
 				ds.Logger.Debug("Detected prompt after %d bytes", buf.Len())
 				return nil
 			}
@@ -5201,7 +5239,7 @@ func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (str
 	for {
 		// Check for prompt BEFORE waiting for new data (handles the case where
 		// settling was interrupted by trailing bytes that complete a valid prompt)
-		if output.Len() > 0 && isExosPrompt(output.String()) {
+		if output.Len() > 0 && isDevicePrompt(output.String(), ds.Device.Type) {
 			// Settling: wait to make sure no more data is coming.
 			settleDeadline := time.Now().Add(settleDelay)
 			settled := true
@@ -5223,7 +5261,7 @@ func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (str
 			}
 
 			if settled {
-				result := cleanCommandOutput(output.String(), command)
+				result := cleanCommandOutput(output.String(), command, ds.Device.Type)
 				ds.Logger.Debug("Command '%s' completed (%d bytes output)", command, len(result))
 				return result, nil
 			}
@@ -5255,7 +5293,7 @@ func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (str
 
 // cleanCommandOutput removes the echoed command from the beginning and the
 // trailing prompt from the output, returning just the command results
-func cleanCommandOutput(raw, command string) string {
+func cleanCommandOutput(raw, command, deviceType string) string {
 	// Strip ANSI codes and carriage returns for clean parsing
 	cleaned := stripAnsiCodes(raw)
 	cleaned = strings.ReplaceAll(cleaned, "\r", "")
@@ -5272,6 +5310,7 @@ func cleanCommandOutput(raw, command string) string {
 	}
 
 	// Find end index: remove trailing prompt line(s)
+	promptRegex := getPromptRegex(deviceType)
 	endIdx := len(lines)
 	for i := len(lines) - 1; i >= startIdx; i-- {
 		trimmed := strings.TrimSpace(lines[i])
@@ -5279,7 +5318,7 @@ func cleanCommandOutput(raw, command string) string {
 			continue
 		}
 		// Use regex for prompt detection instead of loose suffix matching
-		if exosPromptRegex.MatchString(lines[i]) {
+		if promptRegex.MatchString(lines[i]) {
 			endIdx = i
 			continue
 		}
@@ -5546,8 +5585,399 @@ func collectExosLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogC
 	return nil
 }
 
+// ============================================================================
+// VOSS Device Support
+// ============================================================================
+
+// connectToVossDevice establishes an SSH connection to a VOSS switch
+// using password authentication and returns a connected DeviceSession.
+// VOSS requires: login → enable mode → config mode → disable paging
+func connectToVossDevice(device NetworkDevice, logger *Logger) (*DeviceSession, error) {
+	logger.Info("Connecting to VOSS device '%s' at %s:%d...", device.Name, device.IPAddress, device.Port)
+
+	port := device.Port
+	if port == 0 {
+		port = 22
+	}
+
+	config := &ssh.ClientConfig{
+		User: device.Username,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(device.Password),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+		Config: ssh.Config{
+			Ciphers: []string{
+				"aes128-ctr", "aes192-ctr", "aes256-ctr",
+				"aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
+				"aes128-cbc", "aes256-cbc",
+			},
+		},
+	}
+
+	addr := net.JoinHostPort(device.IPAddress, strconv.Itoa(port))
+
+	// Establish TCP connection with timeout
+	tcpConn, err := net.DialTimeout("tcp", addr, config.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("TCP connection to %s failed: %v", addr, err)
+	}
+
+	// Optimize TCP connection
+	if tcp, ok := tcpConn.(*net.TCPConn); ok {
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(30 * time.Second)
+		tcp.SetNoDelay(true)
+	}
+
+	// Create SSH connection
+	clientConn, chans, reqs, err := ssh.NewClientConn(tcpConn, addr, config)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("SSH handshake with %s failed: %v", device.Name, err)
+	}
+
+	client := ssh.NewClient(clientConn, chans, reqs)
+	logger.Info("SSH connection established to '%s' (%s)", device.Name, device.IPAddress)
+
+	// Open an interactive session with PTY for CLI interaction
+	session, err := client.NewSession()
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("failed to create SSH session on %s: %v", device.Name, err)
+	}
+
+	// Request a PTY (pseudo-terminal) for interactive CLI
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          0,     // Disable echo
+		ssh.TTY_OP_ISPEED: 14400, // Input speed
+		ssh.TTY_OP_OSPEED: 14400, // Output speed
+	}
+	if err := session.RequestPty("xterm", 80, 200, modes); err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("PTY request failed on %s: %v", device.Name, err)
+	}
+
+	// Set up stdin/stdout pipes for interactive communication
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("failed to create stdin pipe on %s: %v", device.Name, err)
+	}
+
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("failed to create stdout pipe on %s: %v", device.Name, err)
+	}
+	stdout := bufio.NewReaderSize(stdoutPipe, 65536)
+
+	// Start interactive shell
+	if err := session.Shell(); err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("failed to start shell on %s: %v", device.Name, err)
+	}
+
+	ds := &DeviceSession{
+		Client:  client,
+		Session: session,
+		Stdin:   stdin,
+		Stdout:  stdout,
+		Device:  device,
+		Logger:  logger,
+	}
+
+	// Start the single reader goroutine
+	ds.startReader()
+
+	// Wait for initial prompt (VOSS shows login banner then prompt like "hostname:1>")
+	if err := ds.waitForPrompt(15 * time.Second); err != nil {
+		ds.Close()
+		return nil, fmt.Errorf("timed out waiting for initial prompt on %s: %v", device.Name, err)
+	}
+
+	logger.Info("Interactive session ready on '%s'", device.Name)
+	return ds, nil
+}
+
+// initVossSession enters enable mode and config mode, then disables paging.
+// VOSS requires: en → conf terminal → terminal more disable
+func (ds *DeviceSession) initVossSession(dlc DeviceLogCollection) error {
+	logger := ds.Logger
+
+	// Step 1: Enter enable mode
+	enableCmd := dlc.VossDefaults.EnableCommand
+	if enableCmd == "" {
+		enableCmd = "en"
+	}
+	logger.Info("Entering enable mode on '%s'...", ds.Device.Name)
+	if _, err := ds.sendCommand(enableCmd, 10*time.Second); err != nil {
+		return fmt.Errorf("failed to enter enable mode on %s: %v", ds.Device.Name, err)
+	}
+	logger.Info("Enable mode active on '%s'", ds.Device.Name)
+
+	// Step 2: Enter config mode
+	configCmd := dlc.VossDefaults.ConfigCommand
+	if configCmd == "" {
+		configCmd = "configure terminal"
+	}
+	logger.Info("Entering config mode on '%s'...", ds.Device.Name)
+	if _, err := ds.sendCommand(configCmd, 10*time.Second); err != nil {
+		return fmt.Errorf("failed to enter config mode on %s: %v", ds.Device.Name, err)
+	}
+	logger.Info("Config mode active on '%s'", ds.Device.Name)
+
+	// Step 3: Disable CLI paging
+	pagingCmd := dlc.VossDefaults.PagingDisableCommand
+	if pagingCmd == "" {
+		pagingCmd = "terminal more disable"
+	}
+	logger.Info("Disabling CLI paging on '%s'...", ds.Device.Name)
+	if _, err := ds.sendCommand(pagingCmd, 10*time.Second); err != nil {
+		return fmt.Errorf("failed to disable paging on %s: %v", ds.Device.Name, err)
+	}
+	logger.Info("CLI paging disabled on '%s'", ds.Device.Name)
+
+	return nil
+}
+
+// collectVossDiagnostics executes diagnostic commands on a VOSS device and writes
+// the combined output to a single file with headers, separators, and a summary footer.
+func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceLogCollection, outputDir string) error {
+	logger := ds.Logger
+
+	// Determine which commands to run
+	var commands []DeviceCommand
+	if device.Diagnostics.UseDefaults {
+		commands = append(commands, dlc.VossDefaults.DiagnosticCommands...)
+	}
+	if len(device.Diagnostics.AdditionalCommands) > 0 {
+		commands = append(commands, device.Diagnostics.AdditionalCommands...)
+	}
+
+	if len(commands) == 0 {
+		logger.Warn("No diagnostic commands configured for VOSS device '%s'", device.Name)
+		return nil
+	}
+
+	logger.Info("Collecting diagnostics from '%s': %d commands to execute", device.Name, len(commands))
+
+	// Create output file
+	diagFileName := fmt.Sprintf("%s_diagnostics_%s.txt", device.Name, time.Now().Format("20060102_150405"))
+	diagFilePath := filepath.Join(outputDir, diagFileName)
+
+	file, err := os.Create(diagFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create diagnostics file %s: %v", diagFilePath, err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	commandTimeout := time.Duration(dlc.CLISettings.CommandTimeout) * time.Second
+	if commandTimeout == 0 {
+		commandTimeout = 180 * time.Second
+	}
+	commandDelay := time.Duration(dlc.CLISettings.CommandDelay) * time.Second
+
+	// Write file header
+	fmt.Fprintf(writer, "================================================================================\n")
+	fmt.Fprintf(writer, "  VOSS Device Diagnostics Report\n")
+	fmt.Fprintf(writer, "================================================================================\n")
+	fmt.Fprintf(writer, "  Device Name:    %s\n", device.Name)
+	fmt.Fprintf(writer, "  Device IP:      %s\n", device.IPAddress)
+	fmt.Fprintf(writer, "  Device Type:    %s\n", device.Type)
+	fmt.Fprintf(writer, "  Collection Time: %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(writer, "  Total Commands:  %d\n", len(commands))
+	fmt.Fprintf(writer, "  Command Timeout: %v\n", commandTimeout)
+	fmt.Fprintf(writer, "================================================================================\n\n")
+
+	// Execute each command
+	successCount := 0
+	failCount := 0
+	timeoutCount := 0
+
+	for i, cmd := range commands {
+		cmdStartTime := time.Now()
+
+		logger.Info("[%d/%d] Executing: %s (%s)", i+1, len(commands), cmd.Name, cmd.Command)
+
+		// Write command header in output file
+		fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n")
+		fmt.Fprintf(writer, "  Command %d/%d: %s\n", i+1, len(commands), cmd.Name)
+		fmt.Fprintf(writer, "  Command:     %s\n", cmd.Command)
+		if cmd.Description != "" {
+			fmt.Fprintf(writer, "  Description: %s\n", cmd.Description)
+		}
+		fmt.Fprintf(writer, "  Start Time:  %s\n", cmdStartTime.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n\n")
+
+		// Send command and collect output
+		output, err := ds.sendCommand(cmd.Command, commandTimeout)
+		cmdDuration := time.Since(cmdStartTime)
+
+		if err != nil {
+			if strings.Contains(err.Error(), "timed out") {
+				timeoutCount++
+				logger.Warn("Command '%s' timed out after %v", cmd.Name, commandTimeout)
+				fmt.Fprintf(writer, "*** COMMAND TIMED OUT after %v ***\n", commandTimeout)
+				fmt.Fprintf(writer, "Partial output collected (%d bytes):\n\n", len(output))
+			} else {
+				failCount++
+				logger.Error("Command '%s' failed: %v", cmd.Name, err)
+				fmt.Fprintf(writer, "*** COMMAND FAILED: %v ***\n\n", err)
+			}
+		} else {
+			successCount++
+		}
+
+		// Write command output
+		if output != "" {
+			fmt.Fprintf(writer, "%s\n", output)
+		}
+
+		// Write command footer
+		fmt.Fprintf(writer, "\n  [Duration: %v | Status: ", cmdDuration)
+		if err == nil {
+			fmt.Fprintf(writer, "SUCCESS")
+		} else if strings.Contains(err.Error(), "timed out") {
+			fmt.Fprintf(writer, "TIMEOUT")
+		} else {
+			fmt.Fprintf(writer, "FAILED")
+		}
+		fmt.Fprintf(writer, "]\n\n")
+
+		// Flush after each command to preserve data on failure
+		writer.Flush()
+
+		// Delay between commands (skip after last command)
+		if i < len(commands)-1 && commandDelay > 0 {
+			time.Sleep(commandDelay)
+		}
+	}
+
+	// Write summary footer
+	fmt.Fprintf(writer, "\n================================================================================\n")
+	fmt.Fprintf(writer, "  Summary\n")
+	fmt.Fprintf(writer, "================================================================================\n")
+	fmt.Fprintf(writer, "  Total Commands:  %d\n", len(commands))
+	fmt.Fprintf(writer, "  Successful:      %d\n", successCount)
+	fmt.Fprintf(writer, "  Failed:          %d\n", failCount)
+	fmt.Fprintf(writer, "  Timed Out:       %d\n", timeoutCount)
+	fmt.Fprintf(writer, "  Completed:       %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(writer, "================================================================================\n")
+
+	logger.Info("Diagnostics saved to: %s", diagFilePath)
+	logger.Info("Results: %d succeeded, %d failed, %d timed out", successCount, failCount, timeoutCount)
+
+	return nil
+}
+
+// collectVossLogFiles downloads log files from a VOSS device using SFTP.
+// VOSS only supports one session per SSH connection, so we open a dedicated
+// SSH connection for SFTP file transfers (separate from the interactive CLI session).
+func collectVossLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogCollection, outputDir string) error {
+	logger := ds.Logger
+	logConfig := device.Logs
+
+	if !logConfig.Enabled {
+		logger.Info("Log file collection disabled for VOSS device '%s'", device.Name)
+		return nil
+	}
+
+	// VOSS doesn't support shell-level tar compression like EXOS, so we download individual files.
+	if logConfig.CompressionEnabled {
+		logger.Info("Note: VOSS devices do not support on-device compression. Downloading individual files...")
+	}
+
+	files := logConfig.FallbackFiles
+	if len(files) == 0 {
+		logger.Warn("No log files configured for VOSS device '%s'", device.Name)
+		return fmt.Errorf("no log files to download from %s", device.Name)
+	}
+
+	logger.Info("Downloading %d log files from VOSS device '%s' via SFTP...", len(files), device.Name)
+
+	// VOSS only supports one session per SSH client, so we need a dedicated connection for SFTP
+	port := device.Port
+	if port == 0 {
+		port = 22
+	}
+	sftpConfig := &ssh.ClientConfig{
+		User: device.Username,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(device.Password),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+		Config: ssh.Config{
+			Ciphers: []string{
+				"aes128-ctr", "aes192-ctr", "aes256-ctr",
+				"aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
+				"aes128-cbc", "aes256-cbc",
+			},
+		},
+	}
+	addr := net.JoinHostPort(device.IPAddress, strconv.Itoa(port))
+	sftpSSHClient, err := ssh.Dial("tcp", addr, sftpConfig)
+	if err != nil {
+		return fmt.Errorf("failed to open SFTP SSH connection to %s: %v", device.Name, err)
+	}
+	defer sftpSSHClient.Close()
+	logger.Debug("Opened dedicated SFTP SSH connection to '%s'", device.Name)
+
+	// Create a single SFTP client and reuse it for all downloads.
+	// VOSS only supports one session per SSH connection, so we must not
+	// close and re-create the SFTP client between files.
+	sftpClient, err := sftp.NewClient(sftpSSHClient)
+	if err != nil {
+		return fmt.Errorf("failed to create SFTP client for %s: %v", device.Name, err)
+	}
+	defer sftpClient.Close()
+	logger.Debug("SFTP client ready for '%s'", device.Name)
+
+	successCount := 0
+	failCount := 0
+	deviceIP := strings.ReplaceAll(device.IPAddress, ".", "_")
+
+	for _, remotePath := range files {
+		// Include device IP in filename for unique JIRA attachments
+		remoteBase := filepath.Base(remotePath)
+		ext := filepath.Ext(remoteBase)
+		baseName := strings.TrimSuffix(remoteBase, ext)
+		localFileName := fmt.Sprintf("%s_%s%s", baseName, deviceIP, ext)
+		localPath := filepath.Join(outputDir, localFileName)
+
+		logger.Info("Downloading: %s", remotePath)
+		if err := downloadFileSFTPClient(sftpClient, remotePath, localPath, logger); err != nil {
+			logger.Warn("Failed to download '%s' from '%s': %v (continuing...)", remotePath, device.Name, err)
+			failCount++
+			continue
+		}
+
+		logger.Info("Downloaded: %s -> %s", remotePath, localPath)
+		successCount++
+	}
+
+	logger.Info("VOSS log file download complete: %d succeeded, %d failed", successCount, failCount)
+
+	if successCount == 0 {
+		return fmt.Errorf("all %d log file downloads failed from %s", failCount, device.Name)
+	}
+
+	return nil
+}
+
 // downloadFileFromDeviceSFTP uses SFTP to download a file directly from a network device.
-// This is used for collecting log files from EXOS switches.
+// This is used for collecting log files from EXOS and VOSS switches.
+// NOTE: This creates a NEW SFTP session per call. For VOSS devices (single session limit),
+// use downloadFileSFTPClient with a pre-created SFTP client instead.
 func downloadFileFromDeviceSFTP(client *ssh.Client, remotePath, localPath string, logger *Logger) error {
 	// Create SFTP client on the existing SSH connection
 	sftpClient, err := sftp.NewClient(client)
@@ -5555,6 +5985,14 @@ func downloadFileFromDeviceSFTP(client *ssh.Client, remotePath, localPath string
 		return fmt.Errorf("failed to create SFTP client: %v", err)
 	}
 	defer sftpClient.Close()
+
+	return downloadFileSFTPClient(sftpClient, remotePath, localPath, logger)
+}
+
+// downloadFileSFTPClient downloads a file using an existing SFTP client.
+// This allows reusing a single SFTP session for multiple file downloads,
+// which is required for VOSS devices that only support one session per SSH connection.
+func downloadFileSFTPClient(sftpClient *sftp.Client, remotePath, localPath string, logger *Logger) error {
 
 	// Open remote file
 	remoteFile, err := sftpClient.Open(remotePath)
@@ -5718,23 +6156,7 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 	logger.Info("Device type: %s", device.Type)
 	logger.Info("========================================")
 
-	// Only EXOS is supported in Phase 1
-	if strings.ToLower(device.Type) != "exos" {
-		logger.Warn("Device type '%s' is not yet supported (only 'exos' is supported in Phase 1)", device.Type)
-		return fmt.Errorf("unsupported device type: %s", device.Type)
-	}
-
-	// Connect to device
-	ds, err := connectToExosDevice(device, logger)
-	if err != nil {
-		return fmt.Errorf("failed to connect to device %s: %v", device.Name, err)
-	}
-	defer ds.Close()
-
-	// Disable paging
-	if err := ds.disableExosPaging(dlc.ExosDefaults.PagingDisableCommand); err != nil {
-		return fmt.Errorf("failed to disable paging on %s: %v", device.Name, err)
-	}
+	deviceType := strings.ToLower(device.Type)
 
 	// Create device-specific output directory
 	deviceOutputDir := filepath.Join(outputDir, device.Name)
@@ -5742,24 +6164,72 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 		return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
 	}
 
-	// Collect diagnostics if enabled
-	if device.Diagnostics.Enabled {
-		if err := collectExosDiagnostics(ds, device, dlc, deviceOutputDir); err != nil {
-			logger.Error("Diagnostic collection failed on '%s': %v", device.Name, err)
-			// Continue - don't abort device collection for diagnostic failure
+	switch deviceType {
+	case "exos":
+		// Connect to EXOS device
+		ds, err := connectToExosDevice(device, logger)
+		if err != nil {
+			return fmt.Errorf("failed to connect to device %s: %v", device.Name, err)
 		}
-	} else {
-		logger.Info("Diagnostic collection disabled for device '%s'", device.Name)
-	}
+		defer ds.Close()
 
-	// Collect logs if enabled
-	if device.Logs.Enabled {
-		if err := collectExosLogFiles(ds, device, dlc, deviceOutputDir); err != nil {
-			logger.Error("Log file collection failed on '%s': %v", device.Name, err)
-			// Continue - report error but don't abort
+		// Disable paging
+		if err := ds.disableExosPaging(dlc.ExosDefaults.PagingDisableCommand); err != nil {
+			return fmt.Errorf("failed to disable paging on %s: %v", device.Name, err)
 		}
-	} else {
-		logger.Info("Log file collection disabled for device '%s'", device.Name)
+
+		// Collect diagnostics if enabled
+		if device.Diagnostics.Enabled {
+			if err := collectExosDiagnostics(ds, device, dlc, deviceOutputDir); err != nil {
+				logger.Error("Diagnostic collection failed on '%s': %v", device.Name, err)
+			}
+		} else {
+			logger.Info("Diagnostic collection disabled for device '%s'", device.Name)
+		}
+
+		// Collect logs if enabled
+		if device.Logs.Enabled {
+			if err := collectExosLogFiles(ds, device, dlc, deviceOutputDir); err != nil {
+				logger.Error("Log file collection failed on '%s': %v", device.Name, err)
+			}
+		} else {
+			logger.Info("Log file collection disabled for device '%s'", device.Name)
+		}
+
+	case "voss":
+		// Connect to VOSS device
+		ds, err := connectToVossDevice(device, logger)
+		if err != nil {
+			return fmt.Errorf("failed to connect to device %s: %v", device.Name, err)
+		}
+		defer ds.Close()
+
+		// Initialize VOSS session: enable → config → disable paging
+		if err := ds.initVossSession(dlc); err != nil {
+			return fmt.Errorf("failed to initialize VOSS session on %s: %v", device.Name, err)
+		}
+
+		// Collect diagnostics if enabled
+		if device.Diagnostics.Enabled {
+			if err := collectVossDiagnostics(ds, device, dlc, deviceOutputDir); err != nil {
+				logger.Error("Diagnostic collection failed on '%s': %v", device.Name, err)
+			}
+		} else {
+			logger.Info("Diagnostic collection disabled for device '%s'", device.Name)
+		}
+
+		// Collect logs if enabled
+		if device.Logs.Enabled {
+			if err := collectVossLogFiles(ds, device, dlc, deviceOutputDir); err != nil {
+				logger.Error("Log file collection failed on '%s': %v", device.Name, err)
+			}
+		} else {
+			logger.Info("Log file collection disabled for device '%s'", device.Name)
+		}
+
+	default:
+		logger.Warn("Device type '%s' is not supported (supported: 'exos', 'voss')", device.Type)
+		return fmt.Errorf("unsupported device type: %s", device.Type)
 	}
 
 	elapsed := time.Since(startTime)

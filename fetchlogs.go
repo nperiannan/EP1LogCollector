@@ -5236,6 +5236,141 @@ func (ds *DeviceSession) disableExosPaging(pagingCommand string) error {
 	return nil
 }
 
+// collectExosDiagnostics executes diagnostic commands on an EXOS device and writes
+// the combined output to a single file with headers, separators, and a summary footer.
+// Each command's output is separated by a clear header showing the command name and timestamp.
+// On timeout, the timeout status is logged in the file and execution continues to next command.
+func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceLogCollection, outputDir string) error {
+	logger := ds.Logger
+	
+	// Determine which commands to run
+	var commands []DeviceCommand
+	if device.Diagnostics.UseDefaults {
+		commands = append(commands, dlc.ExosDefaults.DiagnosticCommands...)
+	}
+	if len(device.Diagnostics.AdditionalCommands) > 0 {
+		commands = append(commands, device.Diagnostics.AdditionalCommands...)
+	}
+	
+	if len(commands) == 0 {
+		logger.Warn("No diagnostic commands configured for device '%s'", device.Name)
+		return nil
+	}
+	
+	logger.Info("Collecting diagnostics from '%s': %d commands to execute", device.Name, len(commands))
+	
+	// Create output file
+	diagFileName := fmt.Sprintf("%s_diagnostics_%s.txt", device.Name, time.Now().Format("20060102_150405"))
+	diagFilePath := filepath.Join(outputDir, diagFileName)
+	
+	file, err := os.Create(diagFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create diagnostics file %s: %v", diagFilePath, err)
+	}
+	defer file.Close()
+	
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+	
+	commandTimeout := time.Duration(dlc.CLISettings.CommandTimeout) * time.Second
+	if commandTimeout == 0 {
+		commandTimeout = 180 * time.Second
+	}
+	commandDelay := time.Duration(dlc.CLISettings.CommandDelay) * time.Second
+	
+	// Write file header
+	fmt.Fprintf(writer, "================================================================================\n")
+	fmt.Fprintf(writer, "  EXOS Device Diagnostics Report\n")
+	fmt.Fprintf(writer, "================================================================================\n")
+	fmt.Fprintf(writer, "  Device Name:    %s\n", device.Name)
+	fmt.Fprintf(writer, "  Device IP:      %s\n", device.IPAddress)
+	fmt.Fprintf(writer, "  Device Type:    %s\n", device.Type)
+	fmt.Fprintf(writer, "  Collection Time: %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(writer, "  Total Commands:  %d\n", len(commands))
+	fmt.Fprintf(writer, "  Command Timeout: %v\n", commandTimeout)
+	fmt.Fprintf(writer, "================================================================================\n\n")
+	
+	// Execute each command
+	successCount := 0
+	failCount := 0
+	timeoutCount := 0
+	
+	for i, cmd := range commands {
+		cmdStartTime := time.Now()
+		
+		logger.Info("[%d/%d] Executing: %s (%s)", i+1, len(commands), cmd.Name, cmd.Command)
+		
+		// Write command header in output file
+		fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n")
+		fmt.Fprintf(writer, "  Command %d/%d: %s\n", i+1, len(commands), cmd.Name)
+		fmt.Fprintf(writer, "  Command:     %s\n", cmd.Command)
+		if cmd.Description != "" {
+			fmt.Fprintf(writer, "  Description: %s\n", cmd.Description)
+		}
+		fmt.Fprintf(writer, "  Start Time:  %s\n", cmdStartTime.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n\n")
+		
+		// Send command and collect output
+		output, err := ds.sendCommand(cmd.Command, commandTimeout)
+		cmdDuration := time.Since(cmdStartTime)
+		
+		if err != nil {
+			if strings.Contains(err.Error(), "timed out") {
+				timeoutCount++
+				logger.Warn("Command '%s' timed out after %v", cmd.Name, commandTimeout)
+				fmt.Fprintf(writer, "*** COMMAND TIMED OUT after %v ***\n", commandTimeout)
+				fmt.Fprintf(writer, "Partial output collected (%d bytes):\n\n", len(output))
+			} else {
+				failCount++
+				logger.Error("Command '%s' failed: %v", cmd.Name, err)
+				fmt.Fprintf(writer, "*** COMMAND FAILED: %v ***\n\n", err)
+			}
+		} else {
+			successCount++
+		}
+		
+		// Write command output
+		if output != "" {
+			fmt.Fprintf(writer, "%s\n", output)
+		}
+		
+		// Write command footer
+		fmt.Fprintf(writer, "\n  [Duration: %v | Status: ", cmdDuration)
+		if err == nil {
+			fmt.Fprintf(writer, "SUCCESS")
+		} else if strings.Contains(err.Error(), "timed out") {
+			fmt.Fprintf(writer, "TIMEOUT")
+		} else {
+			fmt.Fprintf(writer, "FAILED")
+		}
+		fmt.Fprintf(writer, "]\n\n")
+		
+		// Flush after each command to preserve data on failure
+		writer.Flush()
+		
+		// Delay between commands (skip after last command)
+		if i < len(commands)-1 && commandDelay > 0 {
+			time.Sleep(commandDelay)
+		}
+	}
+	
+	// Write summary footer
+	fmt.Fprintf(writer, "\n================================================================================\n")
+	fmt.Fprintf(writer, "  Summary\n")
+	fmt.Fprintf(writer, "================================================================================\n")
+	fmt.Fprintf(writer, "  Total Commands:  %d\n", len(commands))
+	fmt.Fprintf(writer, "  Successful:      %d\n", successCount)
+	fmt.Fprintf(writer, "  Failed:          %d\n", failCount)
+	fmt.Fprintf(writer, "  Timed Out:       %d\n", timeoutCount)
+	fmt.Fprintf(writer, "  Completed:       %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(writer, "================================================================================\n")
+	
+	logger.Info("Diagnostics saved to: %s", diagFilePath)
+	logger.Info("Results: %d succeeded, %d failed, %d timed out", successCount, failCount, timeoutCount)
+	
+	return nil
+}
+
 // Close cleanly shuts down the device session
 func (ds *DeviceSession) Close() {
 	if ds.Stdin != nil {
@@ -5293,9 +5428,14 @@ func collectDeviceLogsFromDevice(device NetworkDevice, dlc DeviceLogCollection, 
 		return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
 	}
 	
-	// Collect diagnostics if enabled (implementation in PR #3)
+	// Collect diagnostics if enabled
 	if device.Diagnostics.Enabled {
-		logger.Info("Diagnostic command collection will be implemented in PR #3")
+		if err := collectExosDiagnostics(ds, device, dlc, deviceOutputDir); err != nil {
+			logger.Error("Diagnostic collection failed on '%s': %v", device.Name, err)
+			// Continue - don't abort device collection for diagnostic failure
+		}
+	} else {
+		logger.Info("Diagnostic collection disabled for device '%s'", device.Name)
 	}
 	
 	// Collect logs if enabled (implementation in PR #4)

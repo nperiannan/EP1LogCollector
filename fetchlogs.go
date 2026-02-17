@@ -35,6 +35,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Build-time version information injected via -ldflags
+var (
+	appVersion   = "1.0.0"       // Semantic version (set via -ldflags)
+	buildNumber  = "dev"          // Auto-incrementing build number (set via -ldflags)
+	buildDate    = "unknown"      // Build timestamp (set via -ldflags)
+)
+
 // LogLevel represents different logging levels
 type LogLevel int
 
@@ -4383,10 +4390,11 @@ func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []C
 // filterDownloadedLogs extracts a .tar.gz archive, applies message filters to each log file,
 // and writes filtered versions into a filtered_logs_{timestamp} directory preserving the archive's directory structure.
 //
-// Filter logic:
-//   - keyValueFilters: For each filter, if a line contains the key, it's kept only if the value matches.
-//     Lines that don't contain the key at all pass through (unaffected).
+// Filter logic (Loki-style strict inclusion):
+//   - keyValueFilters: A line is kept ONLY if it contains the key AND the value matches.
+//     Lines that don't contain the key are dropped (not passed through).
 //   - specificStrings: If specified, lines MUST contain at least one of these strings to be included.
+//   - When both keyValueFilters and specificStrings are configured, a line must pass ALL filters.
 func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	Enabled         bool `yaml:"enabled"`
 	KeyValueFilters []struct {
@@ -4416,7 +4424,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 			if kv.Value == "" {
 				logger.Info("  Key-Value Filter: key=%q value=(empty) → SKIPPED (no value to filter on)", kv.Key)
 			} else {
-				logger.Info("  Key-Value Filter: key=%q value=%q (keep lines without key OR with matching value)", kv.Key, kv.Value)
+				logger.Info("  Key-Value Filter: key=%q value=%q (Loki-style: keep ONLY lines with matching key=value)", kv.Key, kv.Value)
 			}
 		}
 	}
@@ -4543,16 +4551,14 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 
 			keep := true
 
-			// Apply key-value filters: if line contains the key, it must have the matching value
+			// Apply key-value filters (Loki-style): line must contain key WITH matching value
+			// Lines without the key are dropped (strict inclusion, like Loki/Grafana)
 			for _, kv := range kvFilters {
-				if kv.keyPattern.MatchString(line) {
-					// Key found in this line — check if value matches
-					if !kv.fullPattern.MatchString(line) {
-						keep = false
-						break
-					}
+				if !kv.fullPattern.MatchString(line) {
+					// Line doesn't have key=value match → drop it
+					keep = false
+					break
 				}
-				// If key is NOT in the line, the line passes this filter (keep = true)
 			}
 
 			// Apply specific string filters: line must contain at least one
@@ -6602,6 +6608,9 @@ func main() {
 	// JIRA integration flag
 	jiraIssueID := flag.String("jira", "", "JIRA issue ID to attach files (e.g., XCP-17614). Requires jira config in config.yaml")
 
+	// Version display flag
+	showVersion := flag.Bool("v", false, "Show build version and exit")
+
 	// Custom help message
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
@@ -6617,6 +6626,12 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// Handle -v flag: print version and exit immediately
+	if *showVersion {
+		fmt.Printf("fetchlogs version %s (build %s) built on %s\n", appVersion, buildNumber, buildDate)
+		os.Exit(0)
+	}
 
 	// Determine operation mode
 	modeCount := 0

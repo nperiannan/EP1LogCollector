@@ -45,6 +45,11 @@ vendor/
 *.gz
 *_logs/
 *_templogs/
+logger_info.txt
+build_number.txt
+
+# Cross-platform release binaries
+logcollector-*
 
 # Sensitive files (keep template configs only)
 # Uncomment if you want to exclude config with credentials

@@ -1,4 +1,4 @@
-# GoFetch Logs - CLI Tool
+# LogCollector - CLI Tool
 
 A command-line utility for fetching log files from AWS instances via a bastion host with integrated Kubernetes log collection and comprehensive system information gathering.
 
@@ -116,8 +116,20 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 
 ## Building
 
+```powershell
+.\build.ps1
+```
+
+Or manually:
+
 ```bash
-go build -o gofetchlogs.exe fetchlogs.go
+go build -ldflags "-X 'main.buildNumber=1'" -o logcollector.exe .
+```
+
+Check version:
+
+```bash
+.\logcollector.exe -v
 ```
 
 ## Configuration
@@ -337,7 +349,7 @@ The tool supports multiple operation modes for different use cases:
 
 **1. Default Mode (No Arguments)**
 ```bash
-.\fetchlogs.exe
+.\logcollector.exe
 ```
 - Follows all settings in `config.yaml`
 - Respects `logCollection.enabled`, `appVersionCollection.enabled`, `generalInfo.enabled`
@@ -345,7 +357,7 @@ The tool supports multiple operation modes for different use cases:
 
 **2. All Mode (`--all`)**
 ```bash
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 ```
 - Collects **everything**: logs, app versions, and system information
 - Overrides all config file settings
@@ -353,7 +365,7 @@ The tool supports multiple operation modes for different use cases:
 
 **3. Logs Only Mode (`--logs-only`)**
 ```bash
-.\fetchlogs.exe --logs-only
+.\logcollector.exe --logs-only
 ```
 - Collects **only** logs from Kubernetes pods
 - Skips app version collection and system info collection
@@ -361,7 +373,7 @@ The tool supports multiple operation modes for different use cases:
 
 **4. System Info Mode (`--sys-info`)**
 ```bash
-.\fetchlogs.exe --sys-info
+.\logcollector.exe --sys-info
 ```
 - Collects **only** general system information (kubectl commands, system stats)
 - Skips log collection and version collection
@@ -369,7 +381,7 @@ The tool supports multiple operation modes for different use cases:
 
 **5. Version Mode (`--version`)**
 ```bash
-.\fetchlogs.exe --version
+.\logcollector.exe --version
 ```
 - Collects **only** application version information
 - Skips log collection and system info
@@ -377,7 +389,7 @@ The tool supports multiple operation modes for different use cases:
 
 **6. Device Logs Mode (`--device-logs`)**
 ```bash
-.\fetchlogs.exe --device-logs
+.\logcollector.exe --device-logs
 ```
 - Collects **only** network device diagnostics and log files
 - Connects via SSH to configured EXOS switches
@@ -386,14 +398,14 @@ The tool supports multiple operation modes for different use cases:
 
 **7. List Mode (`--list`)**
 ```bash
-.\fetchlogs.exe --list
+.\logcollector.exe --list
 ```
 - Lists available log files without downloading
 - Traditional file listing mode
 
 **8. Interactive Mode**
 ```bash
-.\fetchlogs.exe -interactive
+.\logcollector.exe -interactive
 ```
 - Prompts for missing information
 - Allows file selection
@@ -412,45 +424,45 @@ The tool supports multiple operation modes for different use cases:
 
 ```bash
 # Default: Use config.yaml settings
-.\fetchlogs.exe
+.\logcollector.exe
 
 # Collect everything (comprehensive troubleshooting)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # Collect only logs from Kubernetes pods
-.\fetchlogs.exe --logs-only
+.\logcollector.exe --logs-only
 
 # Quick cluster health check
-.\fetchlogs.exe --sys-info
+.\logcollector.exe --sys-info
 
 # Version audit only
-.\fetchlogs.exe --version
+.\logcollector.exe --version
 
 # Using a custom config file
-.\fetchlogs.exe -config myconfig.yaml --all
+.\logcollector.exe -config myconfig.yaml --all
 
 # List files only
-.\fetchlogs.exe --list
+.\logcollector.exe --list
 
 # Download Method Examples:
 
 # Use native SCP (default - 10x faster)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # Force native SCP explicitly
-.\fetchlogs.exe --all --native-scp
+.\logcollector.exe --all --native-scp
 
 # Force parallel SFTP instead
-.\fetchlogs.exe --all --sftp
+.\logcollector.exe --all --sftp
 
 # Use SFTP with more parallel connections
-.\fetchlogs.exe --all --sftp -num-chunks 10
+.\logcollector.exe --all --sftp -num-chunks 10
 
 # Attach downloaded files to a JIRA issue
-.\fetchlogs.exe --all --jira XCP-17614
+.\logcollector.exe --all --jira XCP-17614
 
 # Combine with other options
-.\fetchlogs.exe --logs-only --jira XCP-12345 --time-duration 1h
+.\logcollector.exe --logs-only --jira XCP-12345 --time-duration 1h
 ```
 
 ### Available Flags
@@ -499,7 +511,7 @@ The tool supports multiple authentication methods for connecting to the bastion 
 ### Password Authentication
 ```bash
 # Using command line
-.\gofetchlogs.exe -user myuser -pass mypassword -bastion bastion.example.com
+.\gologcollector.exe -user myuser -pass mypassword -bastion bastion.example.com
 
 # Using config file
 bastion:
@@ -511,7 +523,7 @@ bastion:
 ### SSH Key Authentication
 ```bash
 # Using command line
-.\gofetchlogs.exe -user myuser -bastion-key ~/.ssh/id_rsa -bastion bastion.example.com
+.\gologcollector.exe -user myuser -bastion-key ~/.ssh/id_rsa -bastion bastion.example.com
 
 # Using config file
 bastion:
@@ -545,7 +557,7 @@ When you enter a password for the first time or when authentication fails, the t
 
 **Example:**
 ```bash
-$ .\fetchlogs.exe --version
+$ .\logcollector.exe --version
 Enter bastion password: ********
 
 🔐 Encrypted Password (copy this if needed):
@@ -589,7 +601,7 @@ When prompted for a password, the tool uses secure terminal input:
 **First-Time Setup:**
 ```bash
 1. Leave password empty in config.yaml: password: ""
-2. Run the tool: .\fetchlogs.exe --version
+2. Run the tool: .\logcollector.exe --version
 3. Enter password when prompted (masked input)
 4. Password is encrypted and saved automatically
 5. Copy the displayed encrypted password for backup
@@ -675,7 +687,7 @@ The tool now supports a complete end-to-end workflow that replaces the manual sh
 ### New Automated Workflow (NEW)
 ```bash
 # Single command to collect and download logs
-.\fetchlogs.exe --all -log-name "my_log_collection" -user-id "nperiannan"
+.\logcollector.exe --all -log-name "my_log_collection" -user-id "nperiannan"
 ```
 
 This command will:
@@ -778,43 +790,43 @@ The parallel architecture ensures maximum performance while maintaining reliabil
 
 ```bash
 # Collect everything (logs, versions, system info) - comprehensive troubleshooting
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # Collect logs and system info using config.yaml defaults
-.\fetchlogs.exe
+.\logcollector.exe
 
 # Collect only application versions for version audit
-.\fetchlogs.exe --version
+.\logcollector.exe --version
 
 # Collect only system information for cluster health check
-.\fetchlogs.exe --sys-info
+.\logcollector.exe --sys-info
 
 # Collect everything with custom log name
-.\fetchlogs.exe --all -log-name "production_issue_2026"
+.\logcollector.exe --all -log-name "production_issue_2026"
 
 # Collect everything with debug output
-.\fetchlogs.exe --all -log-level DEBUG
+.\logcollector.exe --all -log-level DEBUG
 
 # Traditional mode: just download existing files
-.\fetchlogs.exe -logs "/home/nperiannan/*.tar.gz"
+.\logcollector.exe -logs "/home/nperiannan/*.tar.gz"
 
 # ⏰ NEW: Time-based log collection (collect logs from last 15 minutes)
-.\fetchlogs.exe --all -time-duration "15m"
+.\logcollector.exe --all -time-duration "15m"
 
 # ⏰ Collect logs from last 30 minutes with custom name
-.\fetchlogs.exe --all -time-duration "30m" -log-name "recent_logs"
+.\logcollector.exe --all -time-duration "30m" -log-name "recent_logs"
 
 # ⏰ Collect logs from last 1 hour
-.\fetchlogs.exe --all -time-duration "1h"
+.\logcollector.exe --all -time-duration "1h"
 
 # ⏰ Collect logs from last 2 hours with debug output
-.\fetchlogs.exe --all -time-duration "2h" -log-level DEBUG
+.\logcollector.exe --all -time-duration "2h" -log-level DEBUG
 
 # 📄 Force full log collection (override config setting even if time-based is enabled in config)
-.\fetchlogs.exe --all -time-duration "0"
+.\logcollector.exe --all -time-duration "0"
 
 # 📄 Alternative way to force full logs
-.\fetchlogs.exe --all -time-duration "disabled"
+.\logcollector.exe --all -time-duration "disabled"
 ```
 
 ### ⏰ **Time-Based Log Collection (NEW)**
@@ -831,13 +843,13 @@ The tool now supports collecting logs from a specific time period instead of dow
 **Usage Examples:**
 ```bash
 # Collect logs from last 15 minutes (common for quick troubleshooting)
-.\fetchlogs.exe --all -time-duration "15m"
+.\logcollector.exe --all -time-duration "15m"
 
 # Collect logs from last 1 hour (good for recent issue analysis)
-.\fetchlogs.exe --all -time-duration "1h"
+.\logcollector.exe --all -time-duration "1h"
 
 # Collect logs from last 30 minutes with custom naming
-.\fetchlogs.exe --all -time-duration "30m" -log-name "issue_analysis"
+.\logcollector.exe --all -time-duration "30m" -log-name "issue_analysis"
 ```
 
 **Configuration Options:**
@@ -870,14 +882,14 @@ logCollection:
 #### ⏰ **Timestamp-Based Naming**
 ```bash
 # Enable automatic timestamp naming
-.\fetchlogs.exe --all -log-name "production_logs"
+.\logcollector.exe --all -log-name "production_logs"
 # Creates: production_logs_20250624_021345.tar.gz
 ```
 
 #### 🗑️ **Auto-Cleanup After Download**
 ```bash
 # Automatically delete source archive after successful download (recommended)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 # Downloads the file AND deletes it from AWS server (controlled by deleteAfterCopy config)
 ```
 
@@ -1041,7 +1053,7 @@ The report (`log_analytics_report.txt`) is saved in your output directory and co
 
 ```bash
 # Log collection with automatic analysis (runs after download if enabled in config)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # The report is generated in the output directory (e.g., C:\Logs\)
 # Look for: log_analytics_report.txt
@@ -1269,16 +1281,16 @@ ws4r1         hacr-def456             1/1     Running   0          3d
 
 ```bash
 # Collect logs and system info (default behavior with --all)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # Collect only system info (no logs or versions)
-.\fetchlogs.exe --sys-info
+.\logcollector.exe --sys-info
 
 # Disable general info collection via config
 # Set generalInfo.enabled: false in config.yaml
 
 # View detailed execution with debug logging
-.\fetchlogs.exe --all -log-level DEBUG
+.\logcollector.exe --all -log-level DEBUG
 ```
 
 The general system information is automatically included in the same archive as the log files, providing a comprehensive operational snapshot for troubleshooting and analysis. The collection happens **before** archive creation, ensuring all information is properly included in the downloaded file.
@@ -1407,7 +1419,7 @@ logCollection:
 
 ```bash
 # Collect logs with temporal workflow data
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 # (temporal collection runs automatically if enabled in config.yaml)
 
 # Collect only from specific workflow prefix
@@ -1502,17 +1514,17 @@ appVersionCollection:
 
 ```bash
 # Collect app versions using new mode syntax
-.\fetchlogs.exe --version
+.\logcollector.exe --version
 
 # Collect app versions with debug output
-.\fetchlogs.exe --version -log-level DEBUG
+.\logcollector.exe --version -log-level DEBUG
 
 # Enable via config file (run without mode flags)
 # Set appVersionCollection.enabled: true in config.yaml
-.\fetchlogs.exe
+.\logcollector.exe
 
 # Collect everything including versions
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 ```
 
 ### Output File Naming
@@ -1704,19 +1716,19 @@ options:
 
 ```bash
 # Default behavior (uses SCP from config.yaml or defaults to SCP)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # Explicitly force SCP (override config)
-.\fetchlogs.exe --all --native-scp
+.\logcollector.exe --all --native-scp
 
 # Force SFTP with default connections (8)
-.\fetchlogs.exe --all --sftp
+.\logcollector.exe --all --sftp
 
 # Force SFTP with 10 parallel connections for maximum SFTP speed
-.\fetchlogs.exe --all --sftp -num-chunks 10
+.\logcollector.exe --all --sftp -num-chunks 10
 
 # Debug to see which method is being used
-.\fetchlogs.exe --all -log-level DEBUG
+.\logcollector.exe --all -log-level DEBUG
 ```
 
 **Configuration File Examples:**
@@ -1755,10 +1767,10 @@ scp -i <temp_key> \
 
 ```bash
 # Standard download (uses native SCP automatically)
-.\fetchlogs.exe --all
+.\logcollector.exe --all
 
 # Debug mode to see SCP command details
-.\fetchlogs.exe --all -log-level DEBUG
+.\logcollector.exe --all -log-level DEBUG
 
 # Force SFTP fallback by using older version
 # (Native SCP is automatic in current version)
@@ -1789,7 +1801,7 @@ options:
 
 Or override it with the command-line flag:
 ```bash
-.\gofetchlogs.exe -log-level DEBUG
+.\gologcollector.exe -log-level DEBUG
 ```
 
 ## Error Recovery

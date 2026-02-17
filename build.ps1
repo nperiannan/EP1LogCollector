@@ -1,12 +1,12 @@
-# build.ps1 — Build fetchlogs with auto-incrementing build number
-# Usage: .\build.ps1 [-Version "1.0.0"] [-Output "fetchlogs.exe"]
+# build.ps1 — Build logcollector with auto-incrementing build number
+# Usage: .\build.ps1 [-Version "1.0.0"] [-Output "logcollector.exe"]
 #
 # Each run increments the build number in build_number.txt and injects
 # version, build number, and build date via Go's -ldflags.
 
 param(
     [string]$Version = "1.0.0",
-    [string]$Output = "fetchlogs.exe"
+    [string]$Output = "logcollector.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,7 +28,7 @@ $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 # Build with ldflags
 $ldflags = "-X 'main.appVersion=$Version' -X 'main.buildNumber=$buildNum' -X 'main.buildDate=$buildDate'"
 
-Write-Host "Building fetchlogs v$Version (build #$buildNum) ..." -ForegroundColor Cyan
+Write-Host "Building logcollector v$Version (build #$buildNum) ..." -ForegroundColor Cyan
 go build -ldflags $ldflags -o $Output .
 
 if ($LASTEXITCODE -eq 0) {

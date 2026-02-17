@@ -37,9 +37,9 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion   = "1.0.0"       // Semantic version (set via -ldflags)
-	buildNumber  = "dev"          // Auto-incrementing build number (set via -ldflags)
-	buildDate    = "unknown"      // Build timestamp (set via -ldflags)
+	appVersion  = "1.0.0"   // Semantic version (set via -ldflags)
+	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
+	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
 
 // LogLevel represents different logging levels
@@ -100,7 +100,7 @@ func NewLogger(minLevel LogLevel) *Logger {
 	} else {
 		l.logFile = f
 		// Write header
-		header := fmt.Sprintf("# Fetchlogs Session Log\n# Started: %s\n# Log Level: %s\n%s\n\n",
+		header := fmt.Sprintf("# LogCollector Session Log\n# Started: %s\n# Log Level: %s\n%s\n\n",
 			time.Now().Format("2006-01-02 15:04:05"), minLevel.String(), strings.Repeat("-", 60))
 		f.WriteString(header)
 	}
@@ -2383,7 +2383,7 @@ func downloadFromBastionParallel(connParams *ConnectionParams, bastionPath, loca
 // downloadFromBastionWithSCP uses native scp command to download from bastion (much faster than SFTP)
 func downloadFromBastionWithSCP(connParams *ConnectionParams, bastionPath, localPath string, fileSize int64, fileName string) error {
 	// Create temporary SSH key for passwordless scp
-	tempKeyPath := filepath.Join(os.TempDir(), fmt.Sprintf("fetchlogs_temp_key_%d", time.Now().Unix()))
+	tempKeyPath := filepath.Join(os.TempDir(), fmt.Sprintf("logcollector_temp_key_%d", time.Now().Unix()))
 	tempPubKeyPath := tempKeyPath + ".pub"
 
 	logger.Debug("Generating temporary SSH key pair for SCP transfer")
@@ -6629,7 +6629,7 @@ func main() {
 
 	// Handle -v flag: print version and exit immediately
 	if *showVersion {
-		fmt.Printf("fetchlogs version %s (build %s) built on %s\n", appVersion, buildNumber, buildDate)
+		fmt.Printf("logcollector version %s (build %s) built on %s\n", appVersion, buildNumber, buildDate)
 		os.Exit(0)
 	}
 

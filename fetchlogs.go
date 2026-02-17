@@ -6532,6 +6532,23 @@ func main() {
 		// Note: tempDir cleanup is now handled immediately after archive creation in collectKubernetesLogs()
 	}
 
+	// Collect network device logs if enabled (in --all or config mode)
+	var deviceLogOutputDir string
+	if collectDeviceLogs && config.DeviceLogCollection.Enabled {
+		logger.Info("")
+		logger.Info("Starting network device log collection...")
+		if err := processDeviceLogCollection(*config, logger); err != nil {
+			logger.Error("Device log collection failed: %v", err)
+		} else {
+			// Store output directory for JIRA attachment
+			dlcOutput := config.DeviceLogCollection.OutputDir
+			if dlcOutput == "" {
+				dlcOutput = "DeviceLogs"
+			}
+			deviceLogOutputDir = dlcOutput
+		}
+	}
+
 	logger.Info("Download Summary:")
 	logger.Info("-----------------")
 	logger.Info("Total files: %d", totalFiles)
@@ -6644,6 +6661,17 @@ func main() {
 			analyticsReportPath := filepath.Join(*outputDir, fmt.Sprintf("log_analytics_report_%s.txt", config.archiveTimestamp))
 			if _, err := os.Stat(analyticsReportPath); err == nil {
 				attachmentFiles = append(attachmentFiles, analyticsReportPath)
+			}
+
+			// Add device log diagnostic files
+			if deviceLogOutputDir != "" {
+				deviceFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "**", "*_diagnostics_*.txt"))
+				attachmentFiles = append(attachmentFiles, deviceFiles...)
+				// Also look for downloaded log files from devices
+				deviceLogFiles, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "**", "*.tar.gz"))
+				attachmentFiles = append(attachmentFiles, deviceLogFiles...)
+				deviceLogFilesPlain, _ := filepath.Glob(filepath.Join(deviceLogOutputDir, "**", "*.log"))
+				attachmentFiles = append(attachmentFiles, deviceLogFilesPlain...)
 			}
 
 			// Attempt to attach files to JIRA

@@ -6,7 +6,7 @@ environment: dl2r1
 bastion:
   host: usnc-awsgtwy-02.extremenetworks.com
   port: 22
-  password: "ENC:ncPRTa7X9mDHBIdYs13ne14Dm06J2OGyD6k7wHn7zCis1yK7jaaTiKlEtdZj"
+  password: "ENC:WgMYIPy0MM7xMja0Egp1eJzIDnV0e/m5ZCFds2PwHxFe/vFVTe1KocW6tzyY"
   # keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
 
 # AWS Server Configuration
@@ -172,6 +172,136 @@ jira:
   # 
   # Files attached: archive (.tar.gz), logger_info, app_versions, analytics report
   # Authentication: Requires valid email and API token configured above
+
+# Network Device Log Collection Settings
+deviceLogCollection:
+  enabled: false                      # Master enable/disable for device log collection
+  outputDir: "DeviceLogs"            # Subdirectory within main outputDir for device logs
+  parallelDownloads: true            # Download from multiple devices concurrently
+  globalTimeout: 600                 # Total timeout per device (seconds)
+  
+  # CLI Settings
+  cliSettings:
+    commandTimeout: 180              # Max timeout per command (seconds)
+    commandDelay: 1                  # Delay between commands (seconds)
+  
+  # EXOS Device Type Defaults
+  exosDefaults:
+    pagingDisableCommand: "disable clipaging"
+    diagnosticCommands:
+      - name: "version"
+        command: "show version"
+        description: "Software version and hardware info"
+      - name: "switch"
+        command: "show switch"
+        description: "Switch status and uptime"
+      - name: "inlets"
+        command: "show inlets"
+        description: "Inlets status"
+      - name: "iqagent"
+        command: "show iqagent"
+        description: "IQ Agent status"
+      - name: "telemetry"
+        command: "show telemetry"
+        description: "Telemetry configuration"
+      - name: "vlan"
+        command: "show vlan"
+        description: "VLAN configuration"
+      - name: "openapi_trace"
+        command: "debug ems show trace all all | in openapi_server"
+        description: "OpenAPI server traces"
+      - name: "openapi_log"
+        command: "show log messages openapi"
+        description: "OpenAPI server logs"
+      - name: "iqagent_log"
+        command: "show log messages iqagent agent"
+        description: "IQ Agent logs"
+      - name: "hive_agent_log"
+        command: "debug iqagent show log hive-agent all"
+        description: "Hive agent debug logs"
+      - name: "agent_log"
+        command: "debug iqagent show log agent all"
+        description: "Agent debug logs"
+  
+  # Individual Devices
+  devices:
+    - name: "core-switch-exos"
+      type: "exos"                   # Device type: "exos" or "voss"
+      enabled: false                 # Per-device enable/disable
+      ipAddress: "10.127.34.23"
+      port: 22
+      username: "admin"
+      password: ""                   # Plain text password
+      
+      # Diagnostic Commands
+      diagnostics:
+        enabled: true
+        useDefaults: true            # Use exosDefaults.diagnosticCommands
+        additionalCommands: []       # Device-specific extras
+      
+      # Log File Collection
+      logs:
+        enabled: true
+        compressionEnabled: true
+        compressionCommand: "run script shell tar -cvzf /tmp/nos_logs.tar.gz -C /usr/local/tmp/eciq/ openapi_server.log hiveagent.log agent.log"
+        compressedFilePath: "/tmp/nos_logs.tar.gz"
+        fallbackFiles:               # Auto-fallback if compression fails
+          - "/usr/local/tmp/eciq/agent.log"
+          - "/usr/local/tmp/eciq/hiveagent.log"
+          - "/usr/local/tmp/eciq/openapi_server.log"
+        removeCompressedFile: true
+        removeOldLogs: false
+        oldLogsPattern: "/usr/local/tmp/eciq/*.log.*"
+    
+    - name: "access-switch-exos"
+      type: "exos"
+      enabled: false
+      ipAddress: "10.127.34.24"
+      port: 22
+      username: "admin"
+      password: ""
+      
+      diagnostics:
+        enabled: true
+        useDefaults: true
+        additionalCommands:
+          - name: "custom_check"
+            command: "show process"
+            description: "Process list"
+      
+      logs:
+        enabled: true
+        compressionEnabled: false    # Skip compression, download individual files
+        compressedFilePath: ""
+        fallbackFiles:
+          - "/usr/local/tmp/eciq/agent.log"
+        removeCompressedFile: false
+        removeOldLogs: false
+        oldLogsPattern: ""
+    
+    - name: "distribution-switch-exos"
+      type: "exos"
+      enabled: false
+      ipAddress: "10.127.34.25"
+      port: 22
+      username: "admin"
+      password: ""
+      
+      diagnostics:
+        enabled: false               # Skip diagnostics for this device
+        useDefaults: false
+        additionalCommands: []
+      
+      logs:
+        enabled: true
+        compressionEnabled: true
+        compressionCommand: "run script shell tar -cvzf /tmp/nos_logs.tar.gz /usr/local/tmp/eciq/*.log"
+        compressedFilePath: "/tmp/nos_logs.tar.gz"
+        fallbackFiles:
+          - "/usr/local/tmp/eciq/agent.log"
+        removeCompressedFile: true
+        removeOldLogs: false
+        oldLogsPattern: ""
 
 # ============================================================================
 # Temporal Cheat Sheet

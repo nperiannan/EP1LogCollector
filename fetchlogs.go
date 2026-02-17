@@ -493,6 +493,68 @@ type JiraConfig struct {
 	BaseURL           string `yaml:"baseUrl"`
 }
 
+// DeviceCommand represents a CLI command to execute on a network device
+type DeviceCommand struct {
+	Name        string `yaml:"name"`
+	Command     string `yaml:"command"`
+	Description string `yaml:"description"`
+}
+
+// DeviceCLISettings contains CLI-related settings for device communication
+type DeviceCLISettings struct {
+	CommandTimeout int `yaml:"commandTimeout"` // Timeout per command in seconds
+	CommandDelay   int `yaml:"commandDelay"`   // Delay between commands in seconds
+}
+
+// ExosDefaultConfig contains default settings for EXOS devices
+type ExosDefaultConfig struct {
+	PagingDisableCommand string          `yaml:"pagingDisableCommand"`
+	DiagnosticCommands   []DeviceCommand `yaml:"diagnosticCommands"`
+}
+
+// DeviceDiagnosticConfig controls diagnostic command collection for a device
+type DeviceDiagnosticConfig struct {
+	Enabled            bool            `yaml:"enabled"`
+	UseDefaults        bool            `yaml:"useDefaults"`
+	AdditionalCommands []DeviceCommand `yaml:"additionalCommands"`
+}
+
+// DeviceLogConfig controls log file collection for a device
+type DeviceLogConfig struct {
+	Enabled              bool     `yaml:"enabled"`
+	CompressionEnabled   bool     `yaml:"compressionEnabled"`
+	CompressionCommand   string   `yaml:"compressionCommand"`
+	CompressedFilePath   string   `yaml:"compressedFilePath"`
+	FallbackFiles        []string `yaml:"fallbackFiles"`
+	RemoveCompressedFile bool     `yaml:"removeCompressedFile"`
+	RemoveOldLogs        bool     `yaml:"removeOldLogs"`
+	OldLogsPattern       string   `yaml:"oldLogsPattern"`
+}
+
+// NetworkDevice represents a network switch or device for log collection
+type NetworkDevice struct {
+	Name        string                  `yaml:"name"`
+	Type        string                  `yaml:"type"` // "exos" or "voss"
+	Enabled     bool                    `yaml:"enabled"`
+	IPAddress   string                  `yaml:"ipAddress"`
+	Port        int                     `yaml:"port"`
+	Username    string                  `yaml:"username"`
+	Password    string                  `yaml:"password"`
+	Diagnostics DeviceDiagnosticConfig  `yaml:"diagnostics"`
+	Logs        DeviceLogConfig         `yaml:"logs"`
+}
+
+// DeviceLogCollection contains configuration for network device log collection
+type DeviceLogCollection struct {
+	Enabled           bool                  `yaml:"enabled"`
+	OutputDir         string                `yaml:"outputDir"`
+	ParallelDownloads bool                  `yaml:"parallelDownloads"`
+	GlobalTimeout     int                   `yaml:"globalTimeout"`
+	CLISettings       DeviceCLISettings     `yaml:"cliSettings"`
+	ExosDefaults      ExosDefaultConfig     `yaml:"exosDefaults"`
+	Devices           []NetworkDevice       `yaml:"devices"`
+}
+
 // Configuration structure for the application
 type Config struct {
 	Username         string `yaml:"username"`    // Global username for all connections
@@ -579,6 +641,8 @@ type Config struct {
 	} `yaml:"appVersionCollection"`
 	// JIRA integration for attaching files
 	Jira JiraConfig `yaml:"jira"`
+	// Network device log collection
+	DeviceLogCollection DeviceLogCollection `yaml:"deviceLogCollection"`
 }
 
 // LoadConfig loads the configuration from a YAML file
@@ -4905,6 +4969,7 @@ func main() {
 	modeLogs := flag.Bool("logs-only", false, "Collect only logs without system info or app versions")
 	modeSysInfo := flag.Bool("sys-info", false, "Collect only general system info (kubectl commands, system stats)")
 	modeVersion := flag.Bool("version", false, "Collect only application version information")
+	modeDeviceLogs := flag.Bool("device-logs", false, "Collect only network device logs and diagnostics")
 
 	// Log collection configuration flags
 	logFileName := flag.String("log-name", "", "Name for the log collection (without extension)")
@@ -4922,7 +4987,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --all              Collect logs + system info + app versions (override config)\n")
 		fmt.Fprintf(os.Stderr, "  --logs-only        Collect only logs\n")
 		fmt.Fprintf(os.Stderr, "  --sys-info         Collect only general system info (kubectl commands)\n")
-		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n\n")
+		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n")
+		fmt.Fprintf(os.Stderr, "  --device-logs      Collect only network device logs and diagnostics\n\n")
 		fmt.Fprintf(os.Stderr, "General Options:\n")
 		flag.PrintDefaults()
 	}
@@ -4943,10 +5009,13 @@ func main() {
 	if *modeVersion {
 		modeCount++
 	}
+	if *modeDeviceLogs {
+		modeCount++
+	}
 
 	if modeCount > 1 {
 		fmt.Fprintln(os.Stderr, "Error: Only one operation mode can be specified at a time")
-		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version")
+		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs")
 		os.Exit(1)
 	}
 
@@ -4966,7 +5035,7 @@ func main() {
 	}
 
 	// Set defaults based on mode (or read from config if no mode specified)
-	var collectLogs, collectInfo, collectAppVersions bool
+	var collectLogs, collectInfo, collectAppVersions, collectDeviceLogs bool
 	var selectedMode string
 
 	if *modeAll {
@@ -4974,25 +5043,36 @@ func main() {
 		collectLogs = true
 		collectInfo = true
 		collectAppVersions = true
+		collectDeviceLogs = true // Will respect config.DeviceLogCollection.Enabled after loading
 		selectedMode = "all"
 	} else if *modeLogs {
-		// --logs-only mode: collect only logs
+		// --logs-only mode: collect only logs (K8s logs, excludes device logs)
 		collectLogs = true
 		collectInfo = false
 		collectAppVersions = false
+		collectDeviceLogs = false
 		selectedMode = "logs-only"
 	} else if *modeSysInfo {
 		// --sys-info mode: collect only general system info (kubectl commands)
 		collectLogs = false
 		collectInfo = true
 		collectAppVersions = false
+		collectDeviceLogs = false
 		selectedMode = "sys-info"
 	} else if *modeVersion {
 		// --version mode: collect only application version information
 		collectLogs = false
 		collectInfo = false
 		collectAppVersions = true
+		collectDeviceLogs = false
 		selectedMode = "version"
+	} else if *modeDeviceLogs {
+		// --device-logs mode: collect only network device logs
+		collectLogs = false
+		collectInfo = false
+		collectAppVersions = false
+		collectDeviceLogs = true
+		selectedMode = "device-logs"
 	} else if modeCount == 0 {
 		// No mode specified: use config.yaml settings (default behavior)
 		selectedMode = "config"
@@ -5011,6 +5091,12 @@ func main() {
 		collectLogs = config.LogCollection.Enabled
 		collectInfo = config.GeneralInfo.Enabled
 		collectAppVersions = config.AppVersionCollection.Enabled
+		collectDeviceLogs = config.DeviceLogCollection.Enabled
+	}
+
+	// In --all mode, respect DeviceLogCollection.Enabled from config
+	if selectedMode == "all" {
+		collectDeviceLogs = config.DeviceLogCollection.Enabled
 	}
 
 	// Initialize the global logger with the log level setting
@@ -5334,6 +5420,24 @@ func main() {
 				}
 			}
 		}
+		return
+	}
+
+	// --device-logs mode: collect only network device logs and diagnostics
+	if selectedMode == "device-logs" {
+		logger.Info("Running in device-logs mode (network device logs only)...")
+		
+		// Check if device log collection is enabled
+		if !config.DeviceLogCollection.Enabled {
+			logger.Warn("Device log collection is disabled in config.yaml (deviceLogCollection.enabled: false)")
+			logger.Info("Please enable deviceLogCollection in config.yaml and configure your devices")
+			return
+		}
+		
+		// Device log collection implementation will be added in subsequent PRs
+		logger.Info("Device log collection feature - Phase 1 infrastructure complete")
+		logger.Info("Device collection implementation coming in next PR...")
+		logger.Debug("collectDeviceLogs flag: %v", collectDeviceLogs)
 		return
 	}
 

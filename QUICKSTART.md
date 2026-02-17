@@ -89,6 +89,12 @@ options:
 
 ### Basic Commands
 
+**Show Help:**
+```bash
+.\logcollector.exe -h
+```
+→ Display all available command-line flags and operation modes
+
 **Check Version:**
 ```bash
 .\logcollector.exe -v
@@ -118,6 +124,12 @@ options:
 .\logcollector.exe --version
 ```
 → Application versions from all namespaces
+
+**Collect Network Device Logs:**
+```bash
+.\logcollector.exe --device-logs
+```
+→ Network device diagnostics and log files (EXOS/VOSS switches)
 
 **Use Config File Settings:**
 ```bash

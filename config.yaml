@@ -6,7 +6,7 @@ environment: dl2r1
 bastion:
   host: usnc-awsgtwy-02.extremenetworks.com
   port: 22
-  password: "ENC:WgMYIPy0MM7xMja0Egp1eJzIDnV0e/m5ZCFds2PwHxFe/vFVTe1KocW6tzyY"
+  password: ""                   # Leave empty - tool will prompt and encrypt
   # keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
 
 # AWS Server Configuration

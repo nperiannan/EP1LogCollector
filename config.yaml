@@ -97,7 +97,6 @@ logCollection:
         logPath: "/var/log/configuration/"  # Path inside the pod
         filePatterns:               # File patterns to collect (supports wildcards)
           - "*.log"                 # ALL .log files (server.log, error.log, etc.)
-          - "*.log.gz"              # ALL compressed log files
         # Wildcard Pattern Examples:
         #   "*.log"          → All files ending with .log
         #   "server*"        → All files starting with "server" (server.log, server_err.log)
@@ -105,6 +104,11 @@ logCollection:
         #   "application*.log" → Files like application.log, application-2024.log
         #   "*"              → ALL files (use carefully - might be too many!)
         #   "server.log"     → Exact filename match (no wildcard)
+        #   ".log.gz"       → All files ending with .log.gz
+        #   "2024-*.log"     → All .log files starting with "2024-" (e.g., 2024-01.log, 2024-02.log)
+        #   "2024-??-??.log" → All .log files with date format (e.g., 2024-01-15.log, 2024-02-20.log)
+        #   "2024-0[1-2]-??.log" → All .log files from Jan and Feb 2024 (e.g., 2024-01-15.log, 2024-02-20.log)
+        #   "2024-*-??.log" → All .log files from 2024 (e.g., 2024-01-15.log, 2024-02-20.log, 2024-03-10.log)
       # Example: Add more collections as needed
       # - namespace: "xiq"
       #   podPrefix: "hmweb"

@@ -3291,7 +3291,7 @@ func findPodsMatchingPrefix(awsClient *ssh.Client, namespace, podPrefix string) 
 	// Use simpler approach: get all pods and filter in Go instead of complex shell quoting
 	cmd := fmt.Sprintf("kubectl get pods -n %s --no-headers -o custom-columns=NAME:.metadata.name", namespace)
 	logger.Debug("Executing command: sudo su - -c \"%s\"", cmd)
-	
+
 	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", cmd))
 	if err != nil {
 		logger.Debug("Command output: %s", string(output))
@@ -3332,7 +3332,7 @@ func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern stri
 	findCmd := fmt.Sprintf("kubectl exec -n %s %s -- find %s -maxdepth 1 -type f -name '%s' 2>/dev/null",
 		namespace, pod, logPath, pattern)
 	logger.Debug("Executing find command: %s", findCmd)
-	
+
 	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", findCmd))
 	if err != nil {
 		logger.Debug("Find command failed, trying ls fallback. Error: %v, Output: %s", err, string(output))
@@ -3382,7 +3382,7 @@ func copyFileFromPod(awsClient *ssh.Client, namespace, pod, sourceFile, destDir 
 	// Use kubectl exec cat to copy file content
 	copyCmd := fmt.Sprintf("kubectl exec -n %s %s -- cat %s > %s 2>/dev/null",
 		namespace, pod, sourceFile, destFile)
-	
+
 	logger.Debug("Copying file with command: %s", copyCmd)
 	err = executeCommandAsRoot(session, copyCmd)
 	if err != nil {

@@ -37,9 +37,16 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 ### 🔎 Post-Download Message Filter (NEW)
 - **Key-Value Filtering**: Filter log lines by key-value pairs (e.g., keep only `ownerID=1096`)
 - **Specific String Matching**: Keep only lines containing specified strings
-- **Non-Destructive**: Original logs are never modified — filtered output goes to a separate `filter/` directory
+- **Non-Destructive**: Original logs are never modified — filtered output goes to a separate `filtered_logs_<timestamp>/` directory
 - **Directory Preservation**: Maintains the original archive directory structure in filtered output
 - **Configurable**: Enable/disable via `messageFilter.enabled` in config.yaml
+
+### 📂 Pod File Collection (NEW)
+- **Direct Pod File Access**: Collect specific files from inside Kubernetes pods without using kubectl logs
+- **Wildcard Support**: Use patterns like `*.log`, `server*`, `*error*` to match multiple files
+- **Multiple Pods**: Automatically finds and collects from all pods matching a prefix
+- **Flexible Configuration**: Add unlimited collection configurations for different namespaces and pods
+- **Organized Output**: Files saved to `PodFiles/<namespace>/<pod-name>/` within the archive
 
 ## Features
 
@@ -49,6 +56,7 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **� Post-Download Message Filter**: Filter downloaded logs by key-value pairs and specific strings into a separate `filter/` directory without modifying originals
 - **�📋 Application Version Collection**: Standalone feature to collect and format application version information from Kubernetes clusters
 - **🗑️ Smart Archive Management**: Automatic cleanup of remote archives after successful download with configurable retention
+- **📂 Pod File Collection**: Collect specific files directly from inside Kubernetes pods using wildcard patterns with organized output per namespace and pod
 - **⚡ High-Performance Native SCP Downloads**: 2-step optimized architecture with native SCP achieving 2-4 MB/s (10x faster than SFTP)
 - **🔧 Cross-Platform Compatibility**: Works seamlessly on Windows and Linux with automatic OS-specific optimizations
 - **🔐 Password Encryption**: AES-256-GCM encryption for secure password storage in config files

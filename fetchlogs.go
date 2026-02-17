@@ -4940,6 +4940,466 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	return fmt.Errorf("JIRA API request failed with status %d: %s", resp.StatusCode, string(respBody))
 }
 
+// ============================================================================
+// Network Device Log Collection Functions
+// ============================================================================
+
+// DeviceSession represents an active SSH session to a network device with
+// interactive shell support for sending CLI commands
+type DeviceSession struct {
+	Client   *ssh.Client
+	Session  *ssh.Session
+	Stdin    io.WriteCloser
+	Stdout   *bufio.Reader
+	Device   NetworkDevice
+	Logger   *Logger
+}
+
+// connectToExosDevice establishes an SSH connection to an EXOS switch
+// using password authentication and returns a connected DeviceSession
+func connectToExosDevice(device NetworkDevice, logger *Logger) (*DeviceSession, error) {
+	logger.Info("Connecting to EXOS device '%s' at %s:%d...", device.Name, device.IPAddress, device.Port)
+	
+	port := device.Port
+	if port == 0 {
+		port = 22
+	}
+	
+	config := &ssh.ClientConfig{
+		User: device.Username,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(device.Password),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+		Config: ssh.Config{
+			Ciphers: []string{
+				"aes128-ctr", "aes192-ctr", "aes256-ctr",
+				"aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
+			},
+		},
+	}
+	
+	addr := net.JoinHostPort(device.IPAddress, strconv.Itoa(port))
+	
+	// Establish TCP connection with timeout
+	tcpConn, err := net.DialTimeout("tcp", addr, config.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("TCP connection to %s failed: %v", addr, err)
+	}
+	
+	// Optimize TCP connection
+	if tcp, ok := tcpConn.(*net.TCPConn); ok {
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(30 * time.Second)
+		tcp.SetNoDelay(true)
+	}
+	
+	// Create SSH connection
+	clientConn, chans, reqs, err := ssh.NewClientConn(tcpConn, addr, config)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("SSH handshake with %s failed: %v", device.Name, err)
+	}
+	
+	client := ssh.NewClient(clientConn, chans, reqs)
+	logger.Info("SSH connection established to '%s' (%s)", device.Name, device.IPAddress)
+	
+	// Open an interactive session with PTY for CLI interaction
+	session, err := client.NewSession()
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("failed to create SSH session on %s: %v", device.Name, err)
+	}
+	
+	// Request a PTY (pseudo-terminal) for interactive CLI
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          0,     // Disable echo
+		ssh.TTY_OP_ISPEED: 14400, // Input speed
+		ssh.TTY_OP_OSPEED: 14400, // Output speed
+	}
+	if err := session.RequestPty("xterm", 80, 200, modes); err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("PTY request failed on %s: %v", device.Name, err)
+	}
+	
+	// Set up stdin/stdout pipes for interactive communication
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("failed to create stdin pipe on %s: %v", device.Name, err)
+	}
+	
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("failed to create stdout pipe on %s: %v", device.Name, err)
+	}
+	stdout := bufio.NewReaderSize(stdoutPipe, 65536)
+	
+	// Start interactive shell
+	if err := session.Shell(); err != nil {
+		session.Close()
+		client.Close()
+		return nil, fmt.Errorf("failed to start shell on %s: %v", device.Name, err)
+	}
+	
+	ds := &DeviceSession{
+		Client:  client,
+		Session: session,
+		Stdin:   stdin,
+		Stdout:  stdout,
+		Device:  device,
+		Logger:  logger,
+	}
+	
+	// Wait for initial prompt
+	if err := ds.waitForPrompt(15 * time.Second); err != nil {
+		ds.Close()
+		return nil, fmt.Errorf("timed out waiting for initial prompt on %s: %v", device.Name, err)
+	}
+	
+	logger.Info("Interactive session ready on '%s'", device.Name)
+	return ds, nil
+}
+
+// waitForPrompt reads output until a CLI prompt pattern is detected
+// EXOS prompts typically end with "# " or "> " possibly preceded by the device name
+func (ds *DeviceSession) waitForPrompt(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var buf bytes.Buffer
+	
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout after %v waiting for prompt (received %d bytes: %q)", 
+				timeout, buf.Len(), truncateString(buf.String(), 200))
+		}
+		
+		// Set read deadline on the underlying connection
+		ds.Stdout.Reset(ds.Stdout)
+		
+		// Read available data with a short timeout per read
+		readDone := make(chan struct{})
+		var b byte
+		var readErr error
+		go func() {
+			b, readErr = ds.Stdout.ReadByte()
+			close(readDone)
+		}()
+		
+		select {
+		case <-readDone:
+			if readErr != nil {
+				if readErr == io.EOF {
+					return fmt.Errorf("connection closed while waiting for prompt")
+				}
+				return readErr
+			}
+			buf.WriteByte(b)
+			
+			// Check if we've received a prompt
+			current := buf.String()
+			if isExosPrompt(current) {
+				ds.Logger.Debug("Detected prompt after %d bytes", buf.Len())
+				return nil
+			}
+		case <-time.After(time.Until(deadline)):
+			return fmt.Errorf("timeout waiting for prompt")
+		}
+	}
+}
+
+// isExosPrompt checks if the buffered output ends with an EXOS CLI prompt
+// EXOS prompts look like: "DeviceName.1 # " or "* DeviceName.2 # " or "DeviceName # "
+func isExosPrompt(output string) bool {
+	trimmed := strings.TrimRight(output, " ")
+	if strings.HasSuffix(trimmed, "#") || strings.HasSuffix(trimmed, ">") {
+		// Verify it looks like a prompt line (last line contains prompt characters)
+		lines := strings.Split(output, "\n")
+		lastLine := strings.TrimSpace(lines[len(lines)-1])
+		if len(lastLine) > 0 && (strings.HasSuffix(lastLine, "#") || strings.HasSuffix(lastLine, "# ") ||
+			strings.HasSuffix(lastLine, ">") || strings.HasSuffix(lastLine, "> ")) {
+			return true
+		}
+	}
+	return false
+}
+
+// sendCommand sends a CLI command to the device and reads the response until
+// the next prompt appears. Returns the command output (excluding the prompt).
+func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (string, error) {
+	ds.Logger.Debug("Sending command to '%s': %s", ds.Device.Name, command)
+	
+	// Send the command
+	_, err := fmt.Fprintf(ds.Stdin, "%s\n", command)
+	if err != nil {
+		return "", fmt.Errorf("failed to send command '%s': %v", command, err)
+	}
+	
+	// Read response until next prompt
+	var output bytes.Buffer
+	deadline := time.Now().Add(timeout)
+	
+	for {
+		if time.Now().After(deadline) {
+			return output.String(), fmt.Errorf("command '%s' timed out after %v (collected %d bytes)", 
+				command, timeout, output.Len())
+		}
+		
+		readDone := make(chan struct{})
+		var b byte
+		var readErr error
+		go func() {
+			b, readErr = ds.Stdout.ReadByte()
+			close(readDone)
+		}()
+		
+		select {
+		case <-readDone:
+			if readErr != nil {
+				if readErr == io.EOF {
+					// Connection closed - return what we have
+					return output.String(), fmt.Errorf("connection closed during command '%s'", command)
+				}
+				return output.String(), readErr
+			}
+			output.WriteByte(b)
+			
+			// Check if the prompt has reappeared (command complete)
+			current := output.String()
+			if isExosPrompt(current) {
+				// Strip the command echo and trailing prompt from output
+				result := cleanCommandOutput(current, command)
+				ds.Logger.Debug("Command '%s' completed (%d bytes output)", command, len(result))
+				return result, nil
+			}
+		case <-time.After(time.Until(deadline)):
+			return output.String(), fmt.Errorf("command '%s' timed out after %v", command, timeout)
+		}
+	}
+}
+
+// cleanCommandOutput removes the echoed command from the beginning and the
+// trailing prompt from the output, returning just the command results
+func cleanCommandOutput(raw, command string) string {
+	lines := strings.Split(raw, "\n")
+	
+	// Find start index: skip lines that are the echoed command
+	startIdx := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == command || strings.Contains(trimmed, command) {
+			startIdx = i + 1
+			break
+		}
+	}
+	
+	// Find end index: remove the last prompt line
+	endIdx := len(lines)
+	for i := len(lines) - 1; i >= startIdx; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasSuffix(trimmed, "#") || strings.HasSuffix(trimmed, ">") ||
+			strings.HasSuffix(trimmed, "# ") || strings.HasSuffix(trimmed, "> ") {
+			endIdx = i
+			break
+		}
+		break // Non-empty, non-prompt line found, stop searching
+	}
+	
+	if startIdx >= endIdx {
+		return ""
+	}
+	
+	return strings.Join(lines[startIdx:endIdx], "\n")
+}
+
+// disableExosPaging sends the "disable clipaging" command to prevent paged output
+func (ds *DeviceSession) disableExosPaging(pagingCommand string) error {
+	ds.Logger.Info("Disabling CLI paging on '%s'...", ds.Device.Name)
+	
+	if pagingCommand == "" {
+		pagingCommand = "disable clipaging"
+	}
+	
+	_, err := ds.sendCommand(pagingCommand, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to disable paging on %s: %v", ds.Device.Name, err)
+	}
+	
+	ds.Logger.Info("CLI paging disabled on '%s'", ds.Device.Name)
+	return nil
+}
+
+// Close cleanly shuts down the device session
+func (ds *DeviceSession) Close() {
+	if ds.Stdin != nil {
+		// Try to send exit command gracefully
+		fmt.Fprintf(ds.Stdin, "exit\n")
+		ds.Stdin.Close()
+	}
+	if ds.Session != nil {
+		ds.Session.Close()
+	}
+	if ds.Client != nil {
+		ds.Client.Close()
+	}
+	ds.Logger.Debug("Session closed for device '%s'", ds.Device.Name)
+}
+
+// truncateString truncates a string to a maximum length, appending "..." if truncated
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// collectDeviceLogsFromDevice connects to a single EXOS device, disables paging,
+// and prepares the session for diagnostic command execution (PR #3)
+func collectDeviceLogsFromDevice(device NetworkDevice, dlc DeviceLogCollection, outputDir string, logger *Logger) error {
+	startTime := time.Now()
+	logger.Info("========================================")
+	logger.Info("Starting collection from device: %s (%s)", device.Name, device.IPAddress)
+	logger.Info("Device type: %s", device.Type)
+	logger.Info("========================================")
+	
+	// Only EXOS is supported in Phase 1
+	if strings.ToLower(device.Type) != "exos" {
+		logger.Warn("Device type '%s' is not yet supported (only 'exos' is supported in Phase 1)", device.Type)
+		return fmt.Errorf("unsupported device type: %s", device.Type)
+	}
+	
+	// Connect to device
+	ds, err := connectToExosDevice(device, logger)
+	if err != nil {
+		return fmt.Errorf("failed to connect to device %s: %v", device.Name, err)
+	}
+	defer ds.Close()
+	
+	// Disable paging
+	if err := ds.disableExosPaging(dlc.ExosDefaults.PagingDisableCommand); err != nil {
+		return fmt.Errorf("failed to disable paging on %s: %v", device.Name, err)
+	}
+	
+	// Create device-specific output directory
+	deviceOutputDir := filepath.Join(outputDir, device.Name)
+	if err := os.MkdirAll(deviceOutputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
+	}
+	
+	// Collect diagnostics if enabled (implementation in PR #3)
+	if device.Diagnostics.Enabled {
+		logger.Info("Diagnostic command collection will be implemented in PR #3")
+	}
+	
+	// Collect logs if enabled (implementation in PR #4)
+	if device.Logs.Enabled {
+		logger.Info("Log file collection will be implemented in PR #4")
+	}
+	
+	elapsed := time.Since(startTime)
+	logger.Info("Device '%s' collection completed in %v", device.Name, elapsed)
+	return nil
+}
+
+// processDeviceLogCollection orchestrates the collection of logs from all
+// enabled network devices, either sequentially or in parallel
+func processDeviceLogCollection(config Config, logger *Logger) error {
+	dlc := config.DeviceLogCollection
+	
+	if !dlc.Enabled {
+		logger.Warn("Device log collection is disabled in config.yaml")
+		return nil
+	}
+	
+	// Count enabled devices
+	enabledDevices := []NetworkDevice{}
+	for _, device := range dlc.Devices {
+		if device.Enabled {
+			enabledDevices = append(enabledDevices, device)
+		}
+	}
+	
+	if len(enabledDevices) == 0 {
+		logger.Warn("No enabled devices found in config.yaml deviceLogCollection.devices")
+		logger.Info("Please enable at least one device (set enabled: true) to collect logs")
+		return nil
+	}
+	
+	logger.Info("========================================")
+	logger.Info("Network Device Log Collection")
+	logger.Info("Enabled devices: %d of %d", len(enabledDevices), len(dlc.Devices))
+	logger.Info("Parallel downloads: %v", dlc.ParallelDownloads)
+	logger.Info("Output directory: %s", dlc.OutputDir)
+	logger.Info("========================================")
+	
+	// Create output directory
+	outputDir := dlc.OutputDir
+	if outputDir == "" {
+		outputDir = "DeviceLogs"
+	}
+	
+	timestampDir := filepath.Join(outputDir, time.Now().Format("20060102_150405"))
+	if err := os.MkdirAll(timestampDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory %s: %v", timestampDir, err)
+	}
+	
+	if dlc.ParallelDownloads && len(enabledDevices) > 1 {
+		// Parallel collection (full implementation in PR #5)
+		logger.Info("Processing %d devices in parallel...", len(enabledDevices))
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(enabledDevices))
+		
+		for _, device := range enabledDevices {
+			wg.Add(1)
+			go func(dev NetworkDevice) {
+				defer wg.Done()
+				if err := collectDeviceLogsFromDevice(dev, dlc, timestampDir, logger); err != nil {
+					logger.Error("Device '%s' failed: %v", dev.Name, err)
+					errChan <- fmt.Errorf("device %s: %v", dev.Name, err)
+				}
+			}(device)
+		}
+		
+		wg.Wait()
+		close(errChan)
+		
+		// Collect errors
+		var errors []string
+		for err := range errChan {
+			errors = append(errors, err.Error())
+		}
+		if len(errors) > 0 {
+			return fmt.Errorf("%d device(s) failed: %s", len(errors), strings.Join(errors, "; "))
+		}
+	} else {
+		// Sequential collection
+		logger.Info("Processing %d device(s) sequentially...", len(enabledDevices))
+		var errors []string
+		for _, device := range enabledDevices {
+			if err := collectDeviceLogsFromDevice(device, dlc, timestampDir, logger); err != nil {
+				logger.Error("Device '%s' failed: %v", device.Name, err)
+				errors = append(errors, fmt.Errorf("device %s: %v", device.Name, err).Error())
+			}
+		}
+		if len(errors) > 0 {
+			return fmt.Errorf("%d device(s) failed: %s", len(errors), strings.Join(errors, "; "))
+		}
+	}
+	
+	logger.Info("========================================")
+	logger.Info("Device log collection complete!")
+	logger.Info("Output directory: %s", timestampDir)
+	logger.Info("========================================")
+	return nil
+}
+
 func main() {
 	// Define command-line flags
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
@@ -5434,10 +5894,11 @@ func main() {
 			return
 		}
 		
-		// Device log collection implementation will be added in subsequent PRs
-		logger.Info("Device log collection feature - Phase 1 infrastructure complete")
-		logger.Info("Device collection implementation coming in next PR...")
 		logger.Debug("collectDeviceLogs flag: %v", collectDeviceLogs)
+		
+		if err := processDeviceLogCollection(*config, logger); err != nil {
+			logger.Error("Device log collection failed: %v", err)
+		}
 		return
 	}
 

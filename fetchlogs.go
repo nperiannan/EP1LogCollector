@@ -107,13 +107,59 @@ func (l *Logger) Close() {
 	}
 }
 
-// CopyLogFileTo copies the logger_info.txt to the specified output directory.
-// If archiveTimestamp is non-empty, the file is saved as logger_info_{timestamp}.txt
+// MoveLogFileTo moves the logger_info.txt into the specified directory.
+// The existing log file is closed, its content is copied to the new location,
+// the old file is deleted, and subsequent log output goes to the new file.
+func (l *Logger) MoveLogFileTo(outputDir string) {
+	if l.logFile == nil {
+		return
+	}
+	l.logFile.Sync()
+
+	oldPath := l.logFile.Name()
+	newPath := filepath.Join(outputDir, "logger_info.txt")
+
+	// Don't move if already in the target directory
+	absOld, _ := filepath.Abs(oldPath)
+	absNew, _ := filepath.Abs(newPath)
+	if absOld == absNew {
+		return
+	}
+
+	// Close the file first so we can read it (file is opened write-only)
+	l.logFile.Close()
+
+	// Read existing content from closed file
+	content, err := os.ReadFile(oldPath)
+	if err != nil {
+		fmt.Printf("Warning: Could not read logger_info.txt for move: %v\n", err)
+		return
+	}
+
+	// Create new file in target directory (append mode for subsequent writes)
+	newFile, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Printf("Warning: Could not create logger_info.txt in %s: %v\n", outputDir, err)
+		return
+	}
+
+	// Write existing content to new file
+	newFile.Write(content)
+
+	// Remove old file
+	os.Remove(oldPath)
+
+	// Switch to new file
+	l.logFile = newFile
+}
+
+// CopyLogFileTo copies the current log file to the specified output directory.
+// If archiveTimestamp is non-empty, the file is saved as logger_info_{timestamp}.txt.
+// Unlike MoveLogFileTo, this keeps the original file in place.
 func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 	if l.logFile == nil {
 		return
 	}
-	// Flush current content
 	l.logFile.Sync()
 
 	srcPath := l.logFile.Name()
@@ -123,7 +169,6 @@ func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 	}
 	dstPath := filepath.Join(outputDir, dstFileName)
 
-	// Don't copy if source and destination are the same
 	absSrc, _ := filepath.Abs(srcPath)
 	absDst, _ := filepath.Abs(dstPath)
 	if absSrc == absDst {
@@ -132,14 +177,14 @@ func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 
 	src, err := os.Open(srcPath)
 	if err != nil {
-		fmt.Printf("Warning: Could not read logger_info.txt for copy: %v\n", err)
+		fmt.Printf("Warning: Could not read log file for copy: %v\n", err)
 		return
 	}
 	defer src.Close()
 
 	dst, err := os.Create(dstPath)
 	if err != nil {
-		fmt.Printf("Warning: Could not create logger_info.txt in output dir: %v\n", err)
+		fmt.Printf("Warning: Could not create log file in output dir: %v\n", err)
 		return
 	}
 	defer dst.Close()
@@ -6870,9 +6915,9 @@ func main() {
 			logger.Error("Device log collection failed: %v", err)
 		}
 
-		// Move logger_info.txt into the Device_timestamp directory
+		// Move logger_info.txt directly into the Device_timestamp directory
 		if dlcOutDir != "" {
-			logger.CopyLogFileTo(dlcOutDir, "")
+			logger.MoveLogFileTo(dlcOutDir)
 		}
 
 		// Attach device log files to JIRA if requested
@@ -6906,11 +6951,6 @@ func main() {
 					}
 				}
 			}
-		}
-		// Clean up logger_info.txt from workspace dir (already copied into Device_timestamp dir)
-		if dlcOutDir != "" {
-			logger.Close()
-			os.Remove("logger_info.txt")
 		}
 		return
 	}

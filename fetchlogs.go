@@ -5529,8 +5529,34 @@ func truncateString(s string, maxLen int) string {
 }
 
 // collectDeviceLogsFromDevice connects to a single EXOS device, disables paging,
-// and prepares the session for diagnostic command execution (PR #3)
+// collects diagnostics and log files within a global timeout.
 func collectDeviceLogsFromDevice(device NetworkDevice, dlc DeviceLogCollection, outputDir string, logger *Logger) error {
+	// Apply global timeout per device
+	globalTimeout := time.Duration(dlc.GlobalTimeout) * time.Second
+	if globalTimeout == 0 {
+		globalTimeout = 600 * time.Second
+	}
+	
+	type result struct {
+		err error
+	}
+	resultChan := make(chan result, 1)
+	
+	go func() {
+		resultChan <- result{err: collectDeviceLogsFromDeviceInner(device, dlc, outputDir, logger)}
+	}()
+	
+	select {
+	case res := <-resultChan:
+		return res.err
+	case <-time.After(globalTimeout):
+		logger.Error("Device '%s' global timeout exceeded (%v)", device.Name, globalTimeout)
+		return fmt.Errorf("device %s: global timeout (%v) exceeded", device.Name, globalTimeout)
+	}
+}
+
+// collectDeviceLogsFromDeviceInner performs the actual device collection work
+func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollection, outputDir string, logger *Logger) error {
 	startTime := time.Now()
 	logger.Info("========================================")
 	logger.Info("Starting collection from device: %s (%s)", device.Name, device.IPAddress)
@@ -5629,7 +5655,7 @@ func processDeviceLogCollection(config Config, logger *Logger) error {
 	}
 	
 	if dlc.ParallelDownloads && len(enabledDevices) > 1 {
-		// Parallel collection (full implementation in PR #5)
+		// Parallel collection with goroutines
 		logger.Info("Processing %d devices in parallel...", len(enabledDevices))
 		var wg sync.WaitGroup
 		errChan := make(chan error, len(enabledDevices))

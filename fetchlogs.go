@@ -3288,21 +3288,29 @@ func findPodsMatchingPrefix(awsClient *ssh.Client, namespace, podPrefix string) 
 	}
 	defer session.Close()
 
-	cmd := fmt.Sprintf("kubectl get pods -n %s --no-headers | grep '^%s' | awk '{print $1}'", namespace, podPrefix)
-	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", cmd))
+	// Use simpler approach: get all pods and filter in Go instead of complex shell quoting
+	cmd := fmt.Sprintf("kubectl get pods -n %s --no-headers -o custom-columns=NAME:.metadata.name", namespace)
+	logger.Debug("Executing command: sudo su - -c \"%s\"", cmd)
+	
+	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", cmd))
 	if err != nil {
+		logger.Debug("Command output: %s", string(output))
 		return nil, fmt.Errorf("kubectl command failed: %v", err)
 	}
+
+	logger.Debug("Pod list output: %s", string(output))
 
 	pods := []string{}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	for _, line := range lines {
 		pod := strings.TrimSpace(line)
-		if pod != "" {
+		// Filter by prefix in Go instead of in shell
+		if pod != "" && strings.HasPrefix(pod, podPrefix) {
 			pods = append(pods, pod)
 		}
 	}
 
+	logger.Debug("Found %d pods matching prefix '%s': %v", len(pods), podPrefix, pods)
 	return pods, nil
 }
 
@@ -3320,18 +3328,27 @@ func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern stri
 	}
 
 	// Use find command to list files matching pattern
+	// Use double quotes for outer command, single quotes for pattern
 	findCmd := fmt.Sprintf("kubectl exec -n %s %s -- find %s -maxdepth 1 -type f -name '%s' 2>/dev/null",
 		namespace, pod, logPath, pattern)
+	logger.Debug("Executing find command: %s", findCmd)
+	
 	output, err := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", findCmd))
 	if err != nil {
+		logger.Debug("Find command failed, trying ls fallback. Error: %v, Output: %s", err, string(output))
 		// Try simpler ls-based approach as fallback
 		lsCmd := fmt.Sprintf("kubectl exec -n %s %s -- ls %s%s 2>/dev/null",
 			namespace, pod, logPath, pattern)
+		logger.Debug("Executing ls command: %s", lsCmd)
 		output2, err2 := session.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", lsCmd))
 		if err2 != nil {
+			logger.Debug("Ls command also failed. Error: %v, Output: %s", err2, string(output2))
 			return nil, fmt.Errorf("both find and ls commands failed: %v, %v", err, err2)
 		}
 		output = output2
+		logger.Debug("Ls command output: %s", string(output))
+	} else {
+		logger.Debug("Find command output: %s", string(output))
 	}
 
 	files := []string{}
@@ -3365,12 +3382,15 @@ func copyFileFromPod(awsClient *ssh.Client, namespace, pod, sourceFile, destDir 
 	// Use kubectl exec cat to copy file content
 	copyCmd := fmt.Sprintf("kubectl exec -n %s %s -- cat %s > %s 2>/dev/null",
 		namespace, pod, sourceFile, destFile)
-
+	
+	logger.Debug("Copying file with command: %s", copyCmd)
 	err = executeCommandAsRoot(session, copyCmd)
 	if err != nil {
+		logger.Debug("Copy command failed: %v", err)
 		return fmt.Errorf("copy command failed: %v", err)
 	}
 
+	logger.Debug("Successfully copied %s to %s", sourceFile, destFile)
 	return nil
 }
 

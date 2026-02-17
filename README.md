@@ -48,6 +48,14 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **Flexible Configuration**: Add unlimited collection configurations for different namespaces and pods
 - **Organized Output**: Files saved to `PodFiles/<namespace>/<pod-name>/` within the archive
 
+### 🔗 JIRA Integration (NEW)
+- **Automatic Attachment**: Attach downloaded files directly to JIRA issues via REST API
+- **Command-Line Flag**: Use `--jira XCP-17614` to attach files to a specific issue
+- **Secure Authentication**: API token-based authentication (email + API token)
+- **Multi-File Support**: Automatically attaches all generated files (archives, reports, analytics)
+- **Error Handling**: Graceful fallback if credentials missing or API call fails
+- **Configurable**: Enable/disable via `jira.attachmentEnabled` in config.yaml
+
 ## Features
 
 - **🔄 End-to-End Kubernetes Log Collection**: Remotely collect logs from Kubernetes pods, create timestamped archives, and download automatically
@@ -57,6 +65,7 @@ A command-line utility for fetching log files from AWS instances via a bastion h
 - **�📋 Application Version Collection**: Standalone feature to collect and format application version information from Kubernetes clusters
 - **🗑️ Smart Archive Management**: Automatic cleanup of remote archives after successful download with configurable retention
 - **📂 Pod File Collection**: Collect specific files directly from inside Kubernetes pods using wildcard patterns with organized output per namespace and pod
+- **🔗 JIRA Integration**: Automatically attach downloaded files to JIRA issues via command-line flag using REST API
 - **⚡ High-Performance Native SCP Downloads**: 2-step optimized architecture with native SCP achieving 2-4 MB/s (10x faster than SFTP)
 - **🔧 Cross-Platform Compatibility**: Works seamlessly on Windows and Linux with automatic OS-specific optimizations
 - **🔐 Password Encryption**: AES-256-GCM encryption for secure password storage in config files
@@ -203,6 +212,13 @@ appVersionCollection:
     - namespace: "nvo"
       description: "NVO services namespace"
       podPrefixes: ["nvo-edge", "nvo-network"]
+
+# JIRA Integration
+jira:
+  email: ""                          # Your Atlassian account email
+  apiToken: ""                       # API token from https://id.atlassian.com/manage-profile/security/api-tokens
+  attachmentEnabled: false           # Enable/disable automatic file attachment
+  baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance URL
 ```
 
 ### Template Placeholders
@@ -367,6 +383,12 @@ The tool supports multiple operation modes for different use cases:
 
 # Use SFTP with more parallel connections
 .\fetchlogs.exe --all --sftp -num-chunks 10
+
+# Attach downloaded files to a JIRA issue
+.\fetchlogs.exe --all --jira XCP-17614
+
+# Combine with other options
+.\fetchlogs.exe --logs-only --jira XCP-12345 --time-duration 1h
 ```
 
 ### Available Flags

@@ -112,6 +112,12 @@ options:
 ./fetchlogs.exe --logs-only -time-duration 2h    # Last 2 hours
 ```
 
+**Attach files to JIRA issue:**
+```bash
+./fetchlogs.exe --all --jira XCP-17614           # Attach to JIRA issue
+./fetchlogs.exe --logs-only --jira XCP-12345     # Logs only, attach to JIRA
+```
+
 ## Config.yaml Reference
 
 ### Essential Sections
@@ -125,6 +131,8 @@ options:
 | `aws.host` | Hostname/IP | Target server (AWS/remote) |
 | `aws.keyPath` | SSH key path | Key for target server authentication |
 | `logs.outputDir` | Directory path | Where to save downloaded files |
+| `jira.email` (optional) | Email | Atlassian account email for JIRA integration |
+| `jira.apiToken` (optional) | API token | Token from https://id.atlassian.com/manage-profile/security/api-tokens |
 
 ### Feature Toggles
 
@@ -168,6 +176,12 @@ options:
 - Supports wildcards (*.log, server*.log)
 - Configurable namespace, pod prefix, and file paths
 - Multiple collection configurations
+
+**JIRA Integration** (`jira.attachmentEnabled`):
+- Automatically attach downloaded files to JIRA issues
+- Command-line flag: `--jira XCP-12345`
+- Requires email and API token configuration
+- Multi-file attachment support
 
 ### Templates
 

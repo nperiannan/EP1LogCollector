@@ -521,6 +521,14 @@ type Config struct {
 			MaxMatches      int      `yaml:"maxMatches"`      // Max matches per log file
 			ContextLines    int      `yaml:"contextLines"`    // Lines before/after each match
 		} `yaml:"logAnalysis"`
+		MessageFilter struct {
+			Enabled         bool `yaml:"enabled"`         // Enable/disable post-download message filtering
+			KeyValueFilters []struct {
+				Key   string `yaml:"key"`   // Key to look for in log lines (e.g., ownerID, serial)
+				Value string `yaml:"value"` // Value to match (lines with key but different value are excluded)
+			} `yaml:"keyValueFilters"` // Keep lines where key is absent OR key has specified value
+			SpecificStrings []string `yaml:"specificStrings"` // Only keep lines containing these exact strings
+		} `yaml:"messageFilter"`
 	} `yaml:"logCollection"`
 	// General system information collection
 	GeneralInfo struct {
@@ -3811,6 +3819,223 @@ func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []C
 	}
 }
 
+// ============================================================================
+// Post-Download Message Filter — Filter logs into a separate filter/ directory
+// ============================================================================
+
+// filterDownloadedLogs extracts a .tar.gz archive, applies message filters to each log file,
+// and writes filtered versions into a filter/ subdirectory preserving the archive's directory structure.
+//
+// Filter logic:
+//   - keyValueFilters: For each filter, if a line contains the key, it's kept only if the value matches.
+//     Lines that don't contain the key at all pass through (unaffected).
+//   - specificStrings: If specified, lines MUST contain at least one of these strings to be included.
+func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
+	Enabled         bool `yaml:"enabled"`
+	KeyValueFilters []struct {
+		Key   string `yaml:"key"`
+		Value string `yaml:"value"`
+	} `yaml:"keyValueFilters"`
+	SpecificStrings []string `yaml:"specificStrings"`
+}) error {
+	if !filterConfig.Enabled {
+		return nil
+	}
+
+	hasKeyValueFilters := len(filterConfig.KeyValueFilters) > 0
+	hasSpecificStrings := len(filterConfig.SpecificStrings) > 0
+
+	if !hasKeyValueFilters && !hasSpecificStrings {
+		logger.Debug("Message filter enabled but no filters configured, skipping")
+		return nil
+	}
+
+	logger.Info("=" + strings.Repeat("=", 69))
+	logger.Info("  MESSAGE FILTER - Filtering downloaded logs")
+	logger.Info("=" + strings.Repeat("=", 69))
+
+	if hasKeyValueFilters {
+		for _, kv := range filterConfig.KeyValueFilters {
+			logger.Info("  Key-Value Filter: key=%q value=%q (keep lines without key OR with matching value)", kv.Key, kv.Value)
+		}
+	}
+	if hasSpecificStrings {
+		logger.Info("  Specific Strings: %s (only keep lines containing these)", strings.Join(filterConfig.SpecificStrings, ", "))
+	}
+
+	// Extract archive to temp dir
+	extractDir, err := extractTarGz(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to extract archive for filtering: %v", err)
+	}
+	defer os.RemoveAll(extractDir)
+
+	// Derive the archive timestamp for the filter subdirectory name
+	archiveBase := filepath.Base(archivePath)
+	archiveBase = strings.TrimSuffix(archiveBase, ".tar.gz")
+	archiveBase = strings.TrimSuffix(archiveBase, ".gz")
+
+	// Create filter output directory: outputDir/filter/archiveName/
+	filterBaseDir := filepath.Join(outputDir, "filter", archiveBase)
+
+	// Discover all files
+	var logFiles []string
+	err = filepath.Walk(extractDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() {
+			return nil
+		}
+		// Only filter text/log files
+		ext := strings.ToLower(filepath.Ext(path))
+		switch ext {
+		case ".log", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".out", ".err", "":
+			logFiles = append(logFiles, path)
+		default:
+			if isLikelyTextFile(path) {
+				logFiles = append(logFiles, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to walk extracted files: %v", err)
+	}
+
+	if len(logFiles) == 0 {
+		logger.Warn("No log files found in archive to filter")
+		return nil
+	}
+
+	logger.Info("Filtering %d file(s)...", len(logFiles))
+
+	// Compile key-value filter patterns for efficient matching
+	// For each key-value filter, we build a regex that matches: key followed by optional separators and quote-wrapped value
+	// Pattern: key\s*[:=]\s*"?value"?  (handles key=value, key: value, key="value", "key":"value", etc.)
+	type kvFilter struct {
+		keyPattern *regexp.Regexp   // Matches the key anywhere in the line
+		fullPattern *regexp.Regexp  // Matches key with the specified value
+	}
+	var kvFilters []kvFilter
+	for _, kv := range filterConfig.KeyValueFilters {
+		// Pattern to detect if the key exists in the line (case-insensitive)
+		keyRe, err := regexp.Compile("(?i)" + regexp.QuoteMeta(kv.Key))
+		if err != nil {
+			logger.Warn("Invalid key pattern '%s', skipping", kv.Key)
+			continue
+		}
+		// Pattern to match key with the exact value
+		// Handles formats like: key=value, key="value", key: value, key: "value", "key":"value", "key": "value"
+		escapedKey := regexp.QuoteMeta(kv.Key)
+		escapedVal := regexp.QuoteMeta(kv.Value)
+		fullRe, err := regexp.Compile("(?i)" + escapedKey + `\s*[:=]\s*"?` + escapedVal + `"?`)
+		if err != nil {
+			logger.Warn("Invalid key-value pattern for key='%s' value='%s', skipping", kv.Key, kv.Value)
+			continue
+		}
+		kvFilters = append(kvFilters, kvFilter{keyPattern: keyRe, fullPattern: fullRe})
+	}
+
+	filesFiltered := 0
+	totalLinesKept := 0
+	totalLinesRemoved := 0
+
+	for _, srcPath := range logFiles {
+		relPath, _ := filepath.Rel(extractDir, srcPath)
+		destPath := filepath.Join(filterBaseDir, relPath)
+
+		// Ensure destination directory exists
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			logger.Warn("Failed to create filter dir for %s: %v", relPath, err)
+			continue
+		}
+
+		// Read source file
+		srcFile, err := os.Open(srcPath)
+		if err != nil {
+			logger.Warn("Cannot read %s for filtering: %v", relPath, err)
+			continue
+		}
+
+		scanner := bufio.NewScanner(srcFile)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+
+		var filteredLines []string
+		linesRead := 0
+		linesKept := 0
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			linesRead++
+
+			keep := true
+
+			// Apply key-value filters: if line contains the key, it must have the matching value
+			for _, kv := range kvFilters {
+				if kv.keyPattern.MatchString(line) {
+					// Key found in this line — check if value matches
+					if !kv.fullPattern.MatchString(line) {
+						keep = false
+						break
+					}
+				}
+				// If key is NOT in the line, the line passes this filter (keep = true)
+			}
+
+			// Apply specific string filters: line must contain at least one
+			if keep && hasSpecificStrings {
+				found := false
+				for _, ss := range filterConfig.SpecificStrings {
+					if strings.Contains(line, ss) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					keep = false
+				}
+			}
+
+			if keep {
+				filteredLines = append(filteredLines, line)
+				linesKept++
+			}
+		}
+		srcFile.Close()
+
+		linesRemoved := linesRead - linesKept
+		totalLinesKept += linesKept
+		totalLinesRemoved += linesRemoved
+
+		// Only write the file if there are lines to keep
+		if linesKept > 0 {
+			destFile, err := os.Create(destPath)
+			if err != nil {
+				logger.Warn("Failed to create filtered file %s: %v", relPath, err)
+				continue
+			}
+			w := bufio.NewWriter(destFile)
+			for _, line := range filteredLines {
+				fmt.Fprintln(w, line)
+			}
+			w.Flush()
+			destFile.Close()
+			filesFiltered++
+
+			if linesRemoved > 0 {
+				logger.Debug("  Filtered %s: kept %d/%d lines (removed %d)", relPath, linesKept, linesRead, linesRemoved)
+			}
+		} else if linesRead > 0 {
+			logger.Debug("  Skipped %s: all %d lines filtered out", relPath, linesRead)
+		}
+	}
+
+	logger.Info("Message filtering complete:")
+	logger.Info("  Files with filtered output: %d/%d", filesFiltered, len(logFiles))
+	logger.Info("  Total lines kept: %d, removed: %d", totalLinesKept, totalLinesRemoved)
+	logger.Info("  Filtered logs saved to: %s", filterBaseDir)
+
+	return nil
+}
+
 // collectAppVersionsStandalone collects application version information and saves it locally
 func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 	if !config.AppVersionCollection.Enabled {
@@ -4884,6 +5109,21 @@ func main() {
 	// Copy logger_info.txt to the output directory so it lives alongside the downloaded files
 	if successCount > 0 {
 		logger.CopyLogFileTo(*outputDir)
+	}
+
+	// Run post-download message filtering if enabled
+	if config.LogCollection.MessageFilter.Enabled && successCount > 0 {
+		logger.Info("")
+		for _, remotePath := range selectedLogFiles {
+			filename := remotePath[strings.LastIndex(remotePath, "/")+1:]
+			localPath := filepath.Join(*outputDir, filename)
+
+			if strings.HasSuffix(localPath, ".tar.gz") {
+				if err := filterDownloadedLogs(localPath, *outputDir, config.LogCollection.MessageFilter); err != nil {
+					logger.Warn("Message filtering failed for %s: %v", filename, err)
+				}
+			}
+		}
 	}
 
 	fmt.Println("\nDownload complete!")

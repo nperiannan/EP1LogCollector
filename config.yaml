@@ -74,6 +74,15 @@ logCollection:
       - "errors=0"
     maxMatches: 20                  # Maximum matches per log file to include in summary
     contextLines: 2                 # Number of lines before/after each match to include
+  # Post-download message filtering (creates filtered copies in filter/ directory)
+  messageFilter:
+    enabled: false                  # Enable/disable message filtering
+    keyValueFilters:                # Keep lines where key is absent OR key has matching value
+      - key: "ownerID"
+        value: ""
+      - key: "serial"
+        value: ""
+    specificStrings: []             # Only keep lines containing at least one of these strings (empty = no filter)
 
 # General System Information Collection
 generalInfo:

@@ -3074,7 +3074,7 @@ func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
 
 	// Save the schedule listing as schedule_list.txt
 	writeFileToRemote(awsClient, fmt.Sprintf("%s/schedule_list.txt", temporalOutputDir),
-		fmt.Sprintf("# Temporal Schedule List\\n# Namespace: %s\\n# Collected: %s\\n%s\\n\\n%s",
+		fmt.Sprintf("# Temporal Schedule List\n# Namespace: %s\n# Collected: %s\n%s\n\n%s",
 			temporalNamespace, time.Now().Format("2006-01-02 15:04:05"),
 			strings.Repeat("-", 60),
 			string(listOutput)))
@@ -3092,12 +3092,13 @@ func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
 	if len(scheduleIDs) == 0 {
 		logger.Warn("No schedule IDs found")
 		writeFileToRemote(awsClient, fmt.Sprintf("%s/no_schedules_found.txt", temporalOutputDir),
-			fmt.Sprintf("No schedules found.\\nNamespace: %s\\nRaw listing output:\\n%s\\n",
+			fmt.Sprintf("No schedules found.\nNamespace: %s\nRaw listing output:\n%s\n",
 				temporalNamespace, listOutputStr))
 		return nil
 	}
 
 	logger.Info("Found %d schedule(s) to collect information for", len(scheduleIDs))
+	logger.Debug("Extracted schedule IDs: %v", scheduleIDs)
 	for i, schedID := range scheduleIDs {
 		logger.Info("  %d. %s", i+1, schedID)
 	}
@@ -3111,22 +3112,22 @@ func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
 		schedOutputFile := fmt.Sprintf("%s/schedule_%s.txt", temporalOutputDir, safeSchedID)
 
 		var schedContent strings.Builder
-		schedContent.WriteString(fmt.Sprintf("# Temporal Schedule Details\\n"))
-		schedContent.WriteString(fmt.Sprintf("# Schedule ID: %s\\n", scheduleID))
-		schedContent.WriteString(fmt.Sprintf("# Namespace: %s\\n", temporalNamespace))
-		schedContent.WriteString(fmt.Sprintf("# Collected: %s\\n", time.Now().Format("2006-01-02 15:04:05")))
-		schedContent.WriteString(fmt.Sprintf("#%s\\n\\n", strings.Repeat("-", 60)))
+		schedContent.WriteString(fmt.Sprintf("# Temporal Schedule Details\n"))
+		schedContent.WriteString(fmt.Sprintf("# Schedule ID: %s\n", scheduleID))
+		schedContent.WriteString(fmt.Sprintf("# Namespace: %s\n", temporalNamespace))
+		schedContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+		schedContent.WriteString(fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60)))
 
 		// Describe the schedule
 		logger.Debug("  Collecting schedule details...")
-		schedContent.WriteString("=" + strings.Repeat("=", 79) + "\\n")
-		schedContent.WriteString("  SCHEDULE DESCRIPTION\\n")
-		schedContent.WriteString("=" + strings.Repeat("=", 79) + "\\n\\n")
+		schedContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
+		schedContent.WriteString("  SCHEDULE DESCRIPTION\n")
+		schedContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
 		describeCmd := fmt.Sprintf(`kubectl exec %s -n common -- temporal schedule describe --namespace %s --schedule-id "%s" 2>&1`,
 			adminPod, temporalNamespace, scheduleID)
 		describeOutput := executeTemporalCommand(awsClient, describeCmd)
-		schedContent.WriteString(describeOutput + "\\n\\n")
+		schedContent.WriteString(describeOutput + "\n\n")
 
 		// Write the complete schedule file
 		writeFileToRemote(awsClient, schedOutputFile, schedContent.String())
@@ -3140,24 +3141,33 @@ func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
 
 // extractScheduleIDs parses schedule listing output and extracts schedule IDs
 // The `temporal schedule list` output format is typically:
-//   ScheduleId          WorkflowType        ...
-//   schedule-profile-   DeployProfile       ...
+//
+//	ScheduleId          WorkflowType        ...
+//	schedule-profile-   DeployProfile       ...
 func extractScheduleIDs(listOutput string, maxCount int) []string {
 	var scheduleIDs []string
-	lines := strings.Split(strings.TrimSpace(listOutput), "\\n")
+	lines := strings.Split(strings.TrimSpace(listOutput), "\n")
 
-	for i, line := range lines {
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || i == 0 {
-			// Skip empty lines and header line
+		if line == "" {
 			continue
 		}
 
-		// The schedule ID is typically the first column
+		// Skip header line (contains "ScheduleId" or starts with common header indicators)
+		if strings.Contains(strings.ToLower(line), "scheduleid") ||
+			strings.HasPrefix(line, "Schedule ID") ||
+			strings.HasPrefix(line, "---") ||
+			strings.HasPrefix(line, "===") {
+			continue
+		}
+
+		// The schedule ID is typically the first column - use Fields() to handle varying whitespace
 		fields := strings.Fields(line)
 		if len(fields) > 0 {
 			schedID := fields[0]
-			if schedID != "" && !strings.HasPrefix(schedID, "ScheduleId") {
+			// Validate that it looks like a schedule ID (not empty, not a header remnant)
+			if schedID != "" && !strings.Contains(schedID, "Schedule") {
 				scheduleIDs = append(scheduleIDs, schedID)
 				if len(scheduleIDs) >= maxCount {
 					break

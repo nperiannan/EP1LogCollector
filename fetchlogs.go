@@ -5371,6 +5371,139 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	return nil
 }
 
+// collectExosLogFiles downloads log files from an EXOS device using SFTP.
+// It first attempts to use the configured compression command to create a tar.gz
+// archive on the device, then downloads it. If compression fails, it auto-falls
+// back to downloading individual log files specified in fallbackFiles.
+func collectExosLogFiles(ds *DeviceSession, device NetworkDevice, dlc DeviceLogCollection, outputDir string) error {
+	logger := ds.Logger
+	logConfig := device.Logs
+	
+	logger.Info("Starting log file collection from '%s'...", device.Name)
+	
+	// Try compressed download first if enabled
+	if logConfig.CompressionEnabled && logConfig.CompressionCommand != "" {
+		logger.Info("Attempting compressed log collection...")
+		
+		// Execute compression command on device via CLI
+		cmdTimeout := time.Duration(dlc.CLISettings.CommandTimeout) * time.Second
+		if cmdTimeout == 0 {
+			cmdTimeout = 180 * time.Second
+		}
+		
+		output, err := ds.sendCommand(logConfig.CompressionCommand, cmdTimeout)
+		if err != nil {
+			logger.Warn("Compression command failed on '%s': %v", device.Name, err)
+			logger.Warn("Output: %s", truncateString(output, 200))
+			logger.Info("Falling back to individual file download...")
+		} else {
+			logger.Debug("Compression command output: %s", truncateString(output, 200))
+			
+			// Download compressed file via SFTP
+			remotePath := logConfig.CompressedFilePath
+			localFileName := filepath.Base(remotePath)
+			localPath := filepath.Join(outputDir, localFileName)
+			
+			if err := downloadFileFromDeviceSFTP(ds.Client, remotePath, localPath, logger); err != nil {
+				logger.Warn("Failed to download compressed file '%s' from '%s': %v", remotePath, device.Name, err)
+				logger.Info("Falling back to individual file download...")
+			} else {
+				logger.Info("Downloaded compressed logs: %s", localPath)
+				
+				// Cleanup compressed file on device if configured
+				if logConfig.RemoveCompressedFile {
+					rmCmd := fmt.Sprintf("rm %s", remotePath)
+					if _, err := ds.sendCommand(rmCmd, 10*time.Second); err != nil {
+						logger.Warn("Failed to cleanup compressed file on device: %v", err)
+					} else {
+						logger.Debug("Cleaned up compressed file on device: %s", remotePath)
+					}
+				}
+				
+				return nil // Compressed download succeeded
+			}
+		}
+	}
+	
+	// Fallback: download individual files
+	if len(logConfig.FallbackFiles) == 0 {
+		logger.Warn("No fallback files configured for device '%s'", device.Name)
+		return fmt.Errorf("no log files to download from %s", device.Name)
+	}
+	
+	logger.Info("Downloading %d individual log files from '%s'...", len(logConfig.FallbackFiles), device.Name)
+	
+	successCount := 0
+	failCount := 0
+	
+	for _, remotePath := range logConfig.FallbackFiles {
+		localFileName := filepath.Base(remotePath)
+		localPath := filepath.Join(outputDir, localFileName)
+		
+		logger.Info("Downloading: %s", remotePath)
+		if err := downloadFileFromDeviceSFTP(ds.Client, remotePath, localPath, logger); err != nil {
+			logger.Warn("Failed to download '%s' from '%s': %v (continuing...)", remotePath, device.Name, err)
+			failCount++
+			continue
+		}
+		
+		logger.Info("Downloaded: %s -> %s", remotePath, localPath)
+		successCount++
+	}
+	
+	logger.Info("Log file download complete: %d succeeded, %d failed", successCount, failCount)
+	
+	if successCount == 0 {
+		return fmt.Errorf("all %d log file downloads failed from %s", failCount, device.Name)
+	}
+	
+	return nil
+}
+
+// downloadFileFromDeviceSFTP uses SFTP to download a file directly from a network device.
+// This is used for collecting log files from EXOS switches.
+func downloadFileFromDeviceSFTP(client *ssh.Client, remotePath, localPath string, logger *Logger) error {
+	// Create SFTP client on the existing SSH connection
+	sftpClient, err := sftp.NewClient(client)
+	if err != nil {
+		return fmt.Errorf("failed to create SFTP client: %v", err)
+	}
+	defer sftpClient.Close()
+	
+	// Open remote file
+	remoteFile, err := sftpClient.Open(remotePath)
+	if err != nil {
+		return fmt.Errorf("failed to open remote file %s: %v", remotePath, err)
+	}
+	defer remoteFile.Close()
+	
+	// Get file info for size
+	stat, err := remoteFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat remote file %s: %v", remotePath, err)
+	}
+	
+	logger.Debug("Remote file %s size: %d bytes", remotePath, stat.Size())
+	
+	// Create local file
+	localFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local file %s: %v", localPath, err)
+	}
+	defer localFile.Close()
+	
+	// Copy with buffered IO
+	written, err := io.Copy(localFile, remoteFile)
+	if err != nil {
+		// Clean up partial file
+		os.Remove(localPath)
+		return fmt.Errorf("failed to download %s: %v", remotePath, err)
+	}
+	
+	logger.Debug("Downloaded %d bytes: %s -> %s", written, remotePath, localPath)
+	return nil
+}
+
 // Close cleanly shuts down the device session
 func (ds *DeviceSession) Close() {
 	if ds.Stdin != nil {
@@ -5438,9 +5571,14 @@ func collectDeviceLogsFromDevice(device NetworkDevice, dlc DeviceLogCollection, 
 		logger.Info("Diagnostic collection disabled for device '%s'", device.Name)
 	}
 	
-	// Collect logs if enabled (implementation in PR #4)
+	// Collect logs if enabled
 	if device.Logs.Enabled {
-		logger.Info("Log file collection will be implemented in PR #4")
+		if err := collectExosLogFiles(ds, device, dlc, deviceOutputDir); err != nil {
+			logger.Error("Log file collection failed on '%s': %v", device.Name, err)
+			// Continue - report error but don't abort
+		}
+	} else {
+		logger.Info("Log file collection disabled for device '%s'", device.Name)
 	}
 	
 	elapsed := time.Since(startTime)

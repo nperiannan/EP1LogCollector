@@ -163,6 +163,12 @@ options:
 - Filter by specific strings
 - Creates filtered copies in `filtered_logs_<timestamp>/`
 
+**Pod File Collection** (`podFileCollection.enabled`):
+- Collect specific files from inside pods
+- Supports wildcards (*.log, server*.log)
+- Configurable namespace, pod prefix, and file paths
+- Multiple collection configurations
+
 ### Templates
 
 Use placeholders in config values:
@@ -198,15 +204,26 @@ C:/Logs/
 │   │   └── app.log
 │   └── pod2/
 │       └── service.log
-└── General/                                # System info (inside archive)
-    ├── system_info.txt
-    ├── pods_all_namespaces.txt
-    └── nodes_detailed.txt
-└── Temporal/                               # Temporal data (inside archive)
-    ├── workflow_list.txt
-    ├── workflow_<id>_details.txt
-    ├── schedule_list.txt
-    └── schedule_<id>_details.txt
+
+Inside the archive (app_log_*.tar.gz):
+├── General/                                # System info (inside archive)
+│   ├── system_info.txt
+│   ├── pods_all_namespaces.txt
+│   └── nodes_detailed.txt
+├── Temporal/                               # Temporal data (inside archive)
+│   ├── workflow_list.txt
+│   ├── workflow_<id>_details.txt
+│   ├── schedule_list.txt
+│   └── schedule_<id>_details.txt
+└── PodFiles/                               # Pod-specific files (if enabled)
+    ├── common/
+    │   └── cs-configuration-xyz/
+    │       ├── server.log
+    │       ├── server_err.log
+    │       └── old_logs.log.gz
+    └── xiq/
+        └── hmweb-abc/
+            └── application.log
 ```
 
 ## Common Issues
@@ -257,6 +274,30 @@ messageFilter:
     - "Payment"          # Keep lines containing "Payment"
     - "Transaction"
 ```
+
+### Pod File Collection
+
+Collect specific files from inside pods:
+```yaml
+podFileCollection:
+  enabled: true
+  collections:
+    - namespace: "common"
+      podPrefix: "cs-configuration"
+      logPath: "/var/log/configuration/"
+      filePatterns:
+        - "server.log"
+        - "server_err.log"
+        - "*.log.gz"
+    - namespace: "xiq"
+      podPrefix: "hmweb"
+      logPath: "/opt/app/logs/"
+      filePatterns:
+        - "*.log"
+        - "application*.log"
+```
+
+Files are saved to: `<archive>/PodFiles/<namespace>/<pod-name>/<files>`
 
 ### Temporal Workflow Collection
 

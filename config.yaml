@@ -210,6 +210,9 @@ deviceLogCollection:
       - name: "running_config"
         command: "show configuration"
         description: "Running configuration"
+      - name: "openapi_logs"
+        command: "show openapi-server logs"
+        description: "OpenAPI server logs (may produce continuous output)"
   
   # VOSS Device Type Defaults
   vossDefaults:

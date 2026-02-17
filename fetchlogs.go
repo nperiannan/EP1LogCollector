@@ -5271,8 +5271,22 @@ func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (str
 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return output.String(), fmt.Errorf("command '%s' timed out after %v (collected %d bytes)",
-				command, timeout, output.Len())
+			// ================================================================
+			// TIMEOUT RECOVERY: Try Ctrl+C to interrupt the stuck command
+			// ================================================================
+			ds.Logger.Warn("Command '%s' timed out after %v, sending Ctrl+C to interrupt...", command, timeout)
+
+			recoveredOutput := output.String()
+			if ds.recoverWithCtrlC() {
+				ds.Logger.Info("Session recovered after Ctrl+C for command '%s'", command)
+				return recoveredOutput, fmt.Errorf("command '%s' timed out after %v (session recovered via Ctrl+C, collected %d bytes)",
+					command, timeout, len(recoveredOutput))
+			}
+
+			// Ctrl+C didn't work — session is unrecoverable
+			ds.Logger.Error("Session unrecoverable after Ctrl+C timeout for command '%s', session will be closed", command)
+			return recoveredOutput, fmt.Errorf("SESSION_UNRECOVERABLE: command '%s' timed out and Ctrl+C failed (collected %d bytes)",
+				command, len(recoveredOutput))
 		}
 
 		select {
@@ -5286,7 +5300,87 @@ func (ds *DeviceSession) sendCommand(command string, timeout time.Duration) (str
 			return output.String(), readErr
 
 		case <-time.After(remaining):
-			return output.String(), fmt.Errorf("command '%s' timed out after %v", command, timeout)
+			// Will be handled by the remaining <= 0 check on next iteration
+			ds.Logger.Warn("Command '%s' timed out after %v, sending Ctrl+C to interrupt...", command, timeout)
+
+			recoveredOutput := output.String()
+			if ds.recoverWithCtrlC() {
+				ds.Logger.Info("Session recovered after Ctrl+C for command '%s'", command)
+				return recoveredOutput, fmt.Errorf("command '%s' timed out after %v (session recovered via Ctrl+C, collected %d bytes)",
+					command, timeout, len(recoveredOutput))
+			}
+
+			ds.Logger.Error("Session unrecoverable after Ctrl+C timeout for command '%s', session will be closed", command)
+			return recoveredOutput, fmt.Errorf("SESSION_UNRECOVERABLE: command '%s' timed out and Ctrl+C failed (collected %d bytes)",
+				command, len(recoveredOutput))
+		}
+	}
+}
+
+// recoverWithCtrlC sends Ctrl+C (0x03) to interrupt a stuck command and waits
+// up to 10 seconds for the device prompt to reappear. Returns true if the
+// session was recovered (prompt detected), false if the session is unrecoverable.
+func (ds *DeviceSession) recoverWithCtrlC() bool {
+	ctrlCRecoveryTimeout := 10 * time.Second
+
+	// Send Ctrl+C (ETX, byte 0x03)
+	_, err := ds.Stdin.Write([]byte{0x03})
+	if err != nil {
+		ds.Logger.Error("Failed to send Ctrl+C to '%s': %v", ds.Device.Name, err)
+		return false
+	}
+	ds.Logger.Debug("Sent Ctrl+C to '%s', waiting up to %v for prompt...", ds.Device.Name, ctrlCRecoveryTimeout)
+
+	// Wait for prompt to reappear
+	var recovery bytes.Buffer
+	deadline := time.Now().Add(ctrlCRecoveryTimeout)
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			ds.Logger.Error("Prompt not detected within %v after Ctrl+C on '%s'", ctrlCRecoveryTimeout, ds.Device.Name)
+			return false
+		}
+
+		select {
+		case b := <-ds.byteChan:
+			recovery.WriteByte(b)
+			if isDevicePrompt(recovery.String(), ds.Device.Type) {
+				// Wait a brief settle period to confirm
+				settleDeadline := time.Now().Add(300 * time.Millisecond)
+				settled := true
+				for time.Now().Before(settleDeadline) {
+					sr := time.Until(settleDeadline)
+					if sr <= 0 {
+						break
+					}
+					select {
+					case mb := <-ds.byteChan:
+						recovery.WriteByte(mb)
+						settled = false
+					case <-time.After(sr):
+					}
+					if !settled {
+						// More data came, re-check if still a prompt
+						if !isDevicePrompt(recovery.String(), ds.Device.Type) {
+							settled = true // reset and continue main loop
+						}
+						break
+					}
+				}
+				if settled && isDevicePrompt(recovery.String(), ds.Device.Type) {
+					ds.Logger.Debug("Prompt detected after Ctrl+C on '%s'", ds.Device.Name)
+					return true
+				}
+			}
+
+		case readErr := <-ds.errChan:
+			ds.Logger.Error("Connection error after Ctrl+C on '%s': %v", ds.Device.Name, readErr)
+			return false
+
+		case <-time.After(remaining):
+			ds.Logger.Error("Prompt not detected within %v after Ctrl+C on '%s'", ctrlCRecoveryTimeout, ds.Device.Name)
+			return false
 		}
 	}
 }
@@ -5407,8 +5501,22 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	successCount := 0
 	failCount := 0
 	timeoutCount := 0
+	skippedCount := 0
+	sessionDead := false
 
 	for i, cmd := range commands {
+		// If session is unrecoverable, skip remaining commands
+		if sessionDead {
+			skippedCount++
+			logger.Warn("[%d/%d] Skipping '%s' — session unrecoverable", i+1, len(commands), cmd.Name)
+			fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n")
+			fmt.Fprintf(writer, "  Command %d/%d: %s\n", i+1, len(commands), cmd.Name)
+			fmt.Fprintf(writer, "  *** SKIPPED — session unrecoverable after previous Ctrl+C timeout ***\n")
+			fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n\n")
+			writer.Flush()
+			continue
+		}
+
 		cmdStartTime := time.Now()
 
 		logger.Info("[%d/%d] Executing: %s (%s)", i+1, len(commands), cmd.Name, cmd.Command)
@@ -5428,10 +5536,16 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 		cmdDuration := time.Since(cmdStartTime)
 
 		if err != nil {
-			if strings.Contains(err.Error(), "timed out") {
+			if strings.Contains(err.Error(), "SESSION_UNRECOVERABLE") {
 				timeoutCount++
-				logger.Warn("Command '%s' timed out after %v", cmd.Name, commandTimeout)
-				fmt.Fprintf(writer, "*** COMMAND TIMED OUT after %v ***\n", commandTimeout)
+				sessionDead = true
+				logger.Error("Command '%s' caused unrecoverable session — Ctrl+C failed, skipping remaining commands", cmd.Name)
+				fmt.Fprintf(writer, "*** COMMAND TIMED OUT — SESSION UNRECOVERABLE (Ctrl+C failed) ***\n")
+				fmt.Fprintf(writer, "Partial output collected (%d bytes):\n\n", len(output))
+			} else if strings.Contains(err.Error(), "timed out") {
+				timeoutCount++
+				logger.Warn("Command '%s' timed out after %v (session recovered via Ctrl+C)", cmd.Name, commandTimeout)
+				fmt.Fprintf(writer, "*** COMMAND TIMED OUT after %v (recovered via Ctrl+C) ***\n", commandTimeout)
 				fmt.Fprintf(writer, "Partial output collected (%d bytes):\n\n", len(output))
 			} else {
 				failCount++
@@ -5451,8 +5565,10 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 		fmt.Fprintf(writer, "\n  [Duration: %v | Status: ", cmdDuration)
 		if err == nil {
 			fmt.Fprintf(writer, "SUCCESS")
+		} else if strings.Contains(err.Error(), "SESSION_UNRECOVERABLE") {
+			fmt.Fprintf(writer, "UNRECOVERABLE")
 		} else if strings.Contains(err.Error(), "timed out") {
-			fmt.Fprintf(writer, "TIMEOUT")
+			fmt.Fprintf(writer, "TIMEOUT (recovered)")
 		} else {
 			fmt.Fprintf(writer, "FAILED")
 		}
@@ -5462,7 +5578,7 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 		writer.Flush()
 
 		// Delay between commands (skip after last command)
-		if i < len(commands)-1 && commandDelay > 0 {
+		if i < len(commands)-1 && commandDelay > 0 && !sessionDead {
 			time.Sleep(commandDelay)
 		}
 	}
@@ -5475,11 +5591,21 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	fmt.Fprintf(writer, "  Successful:      %d\n", successCount)
 	fmt.Fprintf(writer, "  Failed:          %d\n", failCount)
 	fmt.Fprintf(writer, "  Timed Out:       %d\n", timeoutCount)
+	if skippedCount > 0 {
+		fmt.Fprintf(writer, "  Skipped:         %d (session unrecoverable)\n", skippedCount)
+	}
 	fmt.Fprintf(writer, "  Completed:       %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintf(writer, "================================================================================\n")
 
 	logger.Info("Diagnostics saved to: %s", diagFilePath)
 	logger.Info("Results: %d succeeded, %d failed, %d timed out", successCount, failCount, timeoutCount)
+	if skippedCount > 0 {
+		logger.Warn("%d commands skipped due to unrecoverable session", skippedCount)
+	}
+
+	if sessionDead {
+		return fmt.Errorf("SESSION_UNRECOVERABLE: diagnostics aborted after Ctrl+C timeout")
+	}
 
 	return nil
 }
@@ -5802,8 +5928,22 @@ func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	successCount := 0
 	failCount := 0
 	timeoutCount := 0
+	skippedCount := 0
+	sessionDead := false
 
 	for i, cmd := range commands {
+		// If session is unrecoverable, skip remaining commands
+		if sessionDead {
+			skippedCount++
+			logger.Warn("[%d/%d] Skipping '%s' — session unrecoverable", i+1, len(commands), cmd.Name)
+			fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n")
+			fmt.Fprintf(writer, "  Command %d/%d: %s\n", i+1, len(commands), cmd.Name)
+			fmt.Fprintf(writer, "  *** SKIPPED — session unrecoverable after previous Ctrl+C timeout ***\n")
+			fmt.Fprintf(writer, "--------------------------------------------------------------------------------\n\n")
+			writer.Flush()
+			continue
+		}
+
 		cmdStartTime := time.Now()
 
 		logger.Info("[%d/%d] Executing: %s (%s)", i+1, len(commands), cmd.Name, cmd.Command)
@@ -5823,10 +5963,16 @@ func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 		cmdDuration := time.Since(cmdStartTime)
 
 		if err != nil {
-			if strings.Contains(err.Error(), "timed out") {
+			if strings.Contains(err.Error(), "SESSION_UNRECOVERABLE") {
 				timeoutCount++
-				logger.Warn("Command '%s' timed out after %v", cmd.Name, commandTimeout)
-				fmt.Fprintf(writer, "*** COMMAND TIMED OUT after %v ***\n", commandTimeout)
+				sessionDead = true
+				logger.Error("Command '%s' caused unrecoverable session — Ctrl+C failed, skipping remaining commands", cmd.Name)
+				fmt.Fprintf(writer, "*** COMMAND TIMED OUT — SESSION UNRECOVERABLE (Ctrl+C failed) ***\n")
+				fmt.Fprintf(writer, "Partial output collected (%d bytes):\n\n", len(output))
+			} else if strings.Contains(err.Error(), "timed out") {
+				timeoutCount++
+				logger.Warn("Command '%s' timed out after %v (session recovered via Ctrl+C)", cmd.Name, commandTimeout)
+				fmt.Fprintf(writer, "*** COMMAND TIMED OUT after %v (recovered via Ctrl+C) ***\n", commandTimeout)
 				fmt.Fprintf(writer, "Partial output collected (%d bytes):\n\n", len(output))
 			} else {
 				failCount++
@@ -5846,8 +5992,10 @@ func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 		fmt.Fprintf(writer, "\n  [Duration: %v | Status: ", cmdDuration)
 		if err == nil {
 			fmt.Fprintf(writer, "SUCCESS")
+		} else if strings.Contains(err.Error(), "SESSION_UNRECOVERABLE") {
+			fmt.Fprintf(writer, "UNRECOVERABLE")
 		} else if strings.Contains(err.Error(), "timed out") {
-			fmt.Fprintf(writer, "TIMEOUT")
+			fmt.Fprintf(writer, "TIMEOUT (recovered)")
 		} else {
 			fmt.Fprintf(writer, "FAILED")
 		}
@@ -5857,7 +6005,7 @@ func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 		writer.Flush()
 
 		// Delay between commands (skip after last command)
-		if i < len(commands)-1 && commandDelay > 0 {
+		if i < len(commands)-1 && commandDelay > 0 && !sessionDead {
 			time.Sleep(commandDelay)
 		}
 	}
@@ -5870,11 +6018,21 @@ func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	fmt.Fprintf(writer, "  Successful:      %d\n", successCount)
 	fmt.Fprintf(writer, "  Failed:          %d\n", failCount)
 	fmt.Fprintf(writer, "  Timed Out:       %d\n", timeoutCount)
+	if skippedCount > 0 {
+		fmt.Fprintf(writer, "  Skipped:         %d (session unrecoverable)\n", skippedCount)
+	}
 	fmt.Fprintf(writer, "  Completed:       %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintf(writer, "================================================================================\n")
 
 	logger.Info("Diagnostics saved to: %s", diagFilePath)
 	logger.Info("Results: %d succeeded, %d failed, %d timed out", successCount, failCount, timeoutCount)
+	if skippedCount > 0 {
+		logger.Warn("%d commands skipped due to unrecoverable session", skippedCount)
+	}
+
+	if sessionDead {
+		return fmt.Errorf("SESSION_UNRECOVERABLE: diagnostics aborted after Ctrl+C timeout")
+	}
 
 	return nil
 }
@@ -6184,6 +6342,10 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 		if device.Diagnostics.Enabled {
 			if err := collectExosDiagnostics(ds, device, dlc, deviceOutputDir); err != nil {
 				logger.Error("Diagnostic collection failed on '%s': %v", device.Name, err)
+				if strings.Contains(err.Error(), "SESSION_UNRECOVERABLE") {
+					logger.Warn("Session to '%s' is unrecoverable, skipping log file collection", device.Name)
+					break
+				}
 			}
 		} else {
 			logger.Info("Diagnostic collection disabled for device '%s'", device.Name)
@@ -6220,6 +6382,10 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 		if device.Diagnostics.Enabled {
 			if err := collectVossDiagnostics(ds, device, dlc, deviceOutputDir); err != nil {
 				logger.Error("Diagnostic collection failed on '%s': %v", device.Name, err)
+				if strings.Contains(err.Error(), "SESSION_UNRECOVERABLE") {
+					logger.Warn("Session to '%s' is unrecoverable, skipping log file collection", device.Name)
+					break
+				}
 			}
 		} else {
 			logger.Info("Diagnostic collection disabled for device '%s'", device.Name)

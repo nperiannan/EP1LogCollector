@@ -160,6 +160,19 @@ appVersionCollection:
       description: "NVO services namespace"
       podPrefixes: ["nvo-edge", "nvo-network"]
 
+# JIRA Integration Settings
+jira:
+  email: ""                         # Your Atlassian account email address
+  apiToken: ""                      # Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+  attachmentEnabled: false          # Enable/disable automatic file attachment to JIRA issues
+  baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance base URL
+  # 
+  # Usage: Run with --jira flag to attach downloaded files to a JIRA issue
+  # Example: ./fetchlogs --all --jira XCP-17614
+  # 
+  # Files attached: archive (.tar.gz), logger_info, app_versions, analytics report
+  # Authentication: Requires valid email and API token configured above
+
 # ============================================================================
 # Temporal Cheat Sheet
 # ============================================================================

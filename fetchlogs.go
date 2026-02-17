@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -482,6 +485,14 @@ type AppVersionNamespace struct {
 	PodPrefixes []string `yaml:"podPrefixes"`
 }
 
+// JiraConfig represents JIRA integration configuration
+type JiraConfig struct {
+	Email             string `yaml:"email"`
+	ApiToken          string `yaml:"apiToken"`
+	AttachmentEnabled bool   `yaml:"attachmentEnabled"`
+	BaseURL           string `yaml:"baseUrl"`
+}
+
 // Configuration structure for the application
 type Config struct {
 	Username         string `yaml:"username"`    // Global username for all connections
@@ -566,6 +577,8 @@ type Config struct {
 		PrintToLog     bool                  `yaml:"printToLog"`
 		Namespaces     []AppVersionNamespace `yaml:"namespaces"`
 	} `yaml:"appVersionCollection"`
+	// JIRA integration for attaching files
+	Jira JiraConfig `yaml:"jira"`
 }
 
 // LoadConfig loads the configuration from a YAML file
@@ -4758,6 +4771,110 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) error {
 	return nil
 }
 
+// attachFilesToJira uploads files to a JIRA issue using the JIRA REST API
+func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []string, logger *Logger) error {
+	// Validate configuration
+	if jiraConfig.Email == "" || jiraConfig.ApiToken == "" {
+		return fmt.Errorf("JIRA credentials not configured (email or apiToken missing)")
+	}
+
+	if jiraConfig.BaseURL == "" {
+		return fmt.Errorf("JIRA baseUrl not configured")
+	}
+
+	if issueKey == "" {
+		return fmt.Errorf("JIRA issue key is empty")
+	}
+
+	// Filter out non-existent files
+	existingFiles := []string{}
+	for _, path := range filePaths {
+		if _, err := os.Stat(path); err == nil {
+			existingFiles = append(existingFiles, path)
+		} else {
+			logger.Debug("Skipping non-existent file: %s", path)
+		}
+	}
+
+	if len(existingFiles) == 0 {
+		return fmt.Errorf("no files found to attach")
+	}
+
+	// Build the API endpoint
+	apiURL := fmt.Sprintf("%s/rest/api/3/issue/%s/attachments", jiraConfig.BaseURL, issueKey)
+
+	// Create multipart form data
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	for _, filePath := range existingFiles {
+		file, err := os.Open(filePath)
+		if err != nil {
+			logger.Warn("Failed to open file %s: %v", filePath, err)
+			continue
+		}
+
+		fileName := filepath.Base(filePath)
+		part, err := writer.CreateFormFile("file", fileName)
+		if err != nil {
+			file.Close()
+			return fmt.Errorf("failed to create form file for %s: %w", fileName, err)
+		}
+
+		_, err = io.Copy(part, file)
+		file.Close()
+		if err != nil {
+			return fmt.Errorf("failed to copy file %s to form: %w", fileName, err)
+		}
+
+		logger.Debug("Added file to upload: %s", fileName)
+	}
+
+	err := writer.Close()
+	if err != nil {
+		return fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", apiURL, body)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Atlassian-Token", "no-check")
+
+	// Set Basic Authentication
+	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", jiraConfig.Email, jiraConfig.ApiToken)))
+	req.Header.Set("Authorization", fmt.Sprintf("Basic %s", auth))
+
+	// Send request
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+	}
+
+	logger.Info("Uploading %d file(s) to JIRA issue %s...", len(existingFiles), issueKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Check response status
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		logger.Info("Successfully attached %d file(s) to JIRA issue %s", len(existingFiles), issueKey)
+		logger.Debug("JIRA API Response: %s", string(respBody))
+		return nil
+	}
+
+	return fmt.Errorf("JIRA API request failed with status %d: %s", resp.StatusCode, string(respBody))
+}
+
 func main() {
 	// Define command-line flags
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
@@ -4792,6 +4909,9 @@ func main() {
 	logFileName := flag.String("log-name", "", "Name for the log collection (without extension)")
 	userID := flag.String("user-id", "", "User ID for log collection (defaults to bastion username)")
 	timeDuration := flag.String("time-duration", "", "Collect logs from last X time (e.g., '15m', '30m', '1h', '2h'). Use '0' or 'disabled' to force full logs. Leave empty to use config setting")
+
+	// JIRA integration flag
+	jiraIssueID := flag.String("jira", "", "JIRA issue ID to attach files (e.g., XCP-17614). Requires jira config in config.yaml")
 
 	// Custom help message
 	flag.Usage = func() {
@@ -5577,6 +5697,58 @@ func main() {
 				if err := filterDownloadedLogs(localPath, *outputDir, config.LogCollection.MessageFilter); err != nil {
 					logger.Warn("Message filtering failed for %s: %v", filename, err)
 				}
+			}
+		}
+	}
+
+	// Attach files to JIRA issue if requested
+	if *jiraIssueID != "" && successCount > 0 {
+		logger.Info("")
+
+		// Check if JIRA attachment is enabled in config
+		if !config.Jira.AttachmentEnabled {
+			logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+		} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
+			logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
+			logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
+			logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+		} else {
+			// Collect all generated files for attachment
+			attachmentFiles := []string{}
+
+			// Add downloaded archive files
+			for _, remotePath := range selectedLogFiles {
+				filename := remotePath[strings.LastIndex(remotePath, "/")+1:]
+				localPath := filepath.Join(*outputDir, filename)
+				if _, err := os.Stat(localPath); err == nil {
+					attachmentFiles = append(attachmentFiles, localPath)
+				}
+			}
+
+			// Add logger_info file
+			loggerInfoPath := filepath.Join(*outputDir, fmt.Sprintf("logger_info_%s.txt", config.archiveTimestamp))
+			if _, err := os.Stat(loggerInfoPath); err == nil {
+				attachmentFiles = append(attachmentFiles, loggerInfoPath)
+			}
+
+			// Add app versions file
+			appVersionsPattern := fmt.Sprintf("*_app_versions_%s.txt", config.archiveTimestamp)
+			matches, _ := filepath.Glob(filepath.Join(*outputDir, appVersionsPattern))
+			attachmentFiles = append(attachmentFiles, matches...)
+
+			// Add analytics report file
+			analyticsReportPath := filepath.Join(*outputDir, fmt.Sprintf("log_analytics_report_%s.txt", config.archiveTimestamp))
+			if _, err := os.Stat(analyticsReportPath); err == nil {
+				attachmentFiles = append(attachmentFiles, analyticsReportPath)
+			}
+
+			// Attempt to attach files to JIRA
+			if len(attachmentFiles) > 0 {
+				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+				}
+			} else {
+				logger.Warn("No files found to attach to JIRA issue %s", *jiraIssueID)
 			}
 		}
 	}

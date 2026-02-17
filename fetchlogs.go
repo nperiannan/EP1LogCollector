@@ -2908,7 +2908,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfOutputFile := fmt.Sprintf("%s/%s.txt", temporalOutputDir, safeWfID)
 
 		var wfContent strings.Builder
-		wfContent.WriteString(fmt.Sprintf("# Temporal Workflow Details\n"))
+		wfContent.WriteString("# Temporal Workflow Details\n")
 		wfContent.WriteString(fmt.Sprintf("# Workflow ID: %s\n", workflowID))
 		wfContent.WriteString(fmt.Sprintf("# Namespace: %s\n", temporalNamespace))
 		wfContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
@@ -3268,7 +3268,7 @@ func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
 		schedOutputFile := fmt.Sprintf("%s/schedule_%s.txt", temporalOutputDir, safeSchedID)
 
 		var schedContent strings.Builder
-		schedContent.WriteString(fmt.Sprintf("# Temporal Schedule Details\n"))
+		schedContent.WriteString("# Temporal Schedule Details\n")
 		schedContent.WriteString(fmt.Sprintf("# Schedule ID: %s\n", scheduleID))
 		schedContent.WriteString(fmt.Sprintf("# Namespace: %s\n", temporalNamespace))
 		schedContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
@@ -3632,9 +3632,9 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 		return nil
 	}
 
-	logger.Info("=" + strings.Repeat("=", 69))
+	logger.Info("%s", "="+strings.Repeat("=", 69))
 	logger.Info("  LOG ANALYTICS - Analyzing downloaded archive for errors & issues")
-	logger.Info("=" + strings.Repeat("=", 69))
+	logger.Info("%s", "="+strings.Repeat("=", 69))
 
 	// Set defaults
 	if logAnalysisConfig.OutputFile == "" {
@@ -4331,9 +4331,9 @@ func truncateLine(line string, maxLen int) string {
 
 // printAnalyticsSummary outputs a concise summary to the console
 func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []CorrelatedIssue, totalMatches int) {
-	logger.Info("=" + strings.Repeat("=", 50))
+	logger.Info("%s", "="+strings.Repeat("=", 50))
 	logger.Info("  LOG ANALYTICS SUMMARY")
-	logger.Info("=" + strings.Repeat("=", 50))
+	logger.Info("%s", "="+strings.Repeat("=", 50))
 
 	if totalMatches == 0 {
 		logger.Info("  No issues found - all logs appear clean!")
@@ -4407,9 +4407,9 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 		return nil
 	}
 
-	logger.Info("=" + strings.Repeat("=", 69))
+	logger.Info("%s", "="+strings.Repeat("=", 69))
 	logger.Info("  MESSAGE FILTER - Filtering downloaded logs")
-	logger.Info("=" + strings.Repeat("=", 69))
+	logger.Info("%s", "="+strings.Repeat("=", 69))
 
 	if hasKeyValueFilters {
 		for _, kv := range filterConfig.KeyValueFilters {

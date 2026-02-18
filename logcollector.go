@@ -5483,9 +5483,10 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", jiraConfig.Email, apiToken)))
 	req.Header.Set("Authorization", fmt.Sprintf("Basic %s", auth))
 
-	// Send request
+	// Send request with extended timeout for large file uploads
+	// 10 minutes should be sufficient for multi-GB archives
 	client := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: 10 * time.Minute,
 	}
 
 	logger.Info("Uploading %d file(s) to JIRA issue %s...", len(existingFiles), issueKey)
@@ -7250,6 +7251,9 @@ func main() {
 	logLevelEnum := ParseLogLevel(*logLevel)
 	logger = NewLogger(logLevelEnum)
 	defer logger.Close()
+
+	// Initialize archiveTimestamp early so it's available for template replacement in outputDir
+	config.archiveTimestamp = time.Now().Format("20060102_150405")
 
 	// Log the selected operation mode
 	logger.Debug("Selected operation mode: %s", selectedMode)

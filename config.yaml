@@ -151,6 +151,7 @@ logCollection:
         logPath: "/var/log/configuration/"  # Path inside the pod
         filePatterns:               # File patterns to collect (supports wildcards)
           - "*.log"                 # ALL .log files (server.log, error.log, etc.)
+        matchPodName: false         # Collect all files matching pattern (default)
         # Wildcard Pattern Examples:
         #   "*.log"          → All files ending with .log
         #   "server*"        → All files starting with "server" (server.log, server_err.log)
@@ -163,6 +164,31 @@ logCollection:
         #   "2024-??-??.log" → All .log files with date format (e.g., 2024-01-15.log, 2024-02-20.log)
         #   "2024-0[1-2]-??.log" → All .log files from Jan and Feb 2024 (e.g., 2024-01-15.log, 2024-02-20.log)
         #   "2024-*-??.log" → All .log files from 2024 (e.g., 2024-01-15.log, 2024-02-20.log, 2024-03-10.log)
+      
+      # NVO Orchestration Wired - Only collect logs matching current pod name
+      - namespace: "nvo"
+        podPrefix: "nvo-orchestration-wired"
+        logPath: "/data/log/nvo-orchestration-wired/"
+        filePatterns:
+          - "*.log"                 # All log files
+        matchPodName: true          # Only collect files where filename starts with pod name
+        # Example: For pod "nvo-orchestration-wired-7c59fdd6d6-7sqwc", collects:
+        #   ✓ nvo-orchestration-wired-7c59fdd6d6-7sqwc-server.log
+        #   ✓ nvo-orchestration-wired-7c59fdd6d6-7sqwc-server_err.log
+        #   ✗ nvo-orchestration-wired-779b85dbd4-xkqls-server.log (old pod - skipped)
+      
+      # NVO Orchestration Wireless - Only collect logs matching current pod name
+      - namespace: "nvo"
+        podPrefix: "nvo-orchestration-wireless"
+        logPath: "/data/log/nvo-orchestration-wireless/"
+        filePatterns:
+          - "*.log"                 # All log files
+        matchPodName: true          # Only collect files where filename starts with pod name
+        # Example: For pod "nvo-orchestration-wireless-7dd4bcdf5b-ldxmn", collects:
+        #   ✓ nvo-orchestration-wireless-7dd4bcdf5b-ldxmn-server.log
+        #   ✓ nvo-orchestration-wireless-7dd4bcdf5b-ldxmn-server_err.log
+        #   ✗ nvo-orchestration-wireless-5bbd464f64-nltbz-server.log (old pod - skipped)
+      
       # Example: Add more collections as needed
       # - namespace: "xiq"
       #   podPrefix: "hmweb"
@@ -171,6 +197,7 @@ logCollection:
       #     - "*.log"
       #     - "application*.log"
       #     - "*.log.gz"
+      #   matchPodName: false
 # General System Information Collection
 generalInfo:
   enabled: false

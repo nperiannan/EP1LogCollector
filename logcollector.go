@@ -508,6 +508,7 @@ type PodFileCollection struct {
 	PodPrefix    string   `yaml:"podPrefix"`    // Pod name prefix to match
 	LogPath      string   `yaml:"logPath"`      // Path inside the pod (e.g., /var/log/configuration/)
 	FilePatterns []string `yaml:"filePatterns"` // File patterns to collect (e.g., *.log, server.log)
+	MatchPodName bool     `yaml:"matchPodName"` // Only collect files where filename starts with pod name
 }
 
 // Default log collection sources matching the shell script
@@ -3401,7 +3402,7 @@ func collectPodFiles(awsClient *ssh.Client, collections []PodFileCollection, tem
 				logger.Debug("    Looking for files matching: %s", pattern)
 
 				// List files matching the pattern
-				files, err := listFilesInPod(awsClient, collection.Namespace, pod, collection.LogPath, pattern)
+				files, err := listFilesInPod(awsClient, collection.Namespace, pod, collection.LogPath, pattern, collection.MatchPodName)
 				if err != nil {
 					logger.Warn("    Failed to list files in pod %s: %v", pod, err)
 					continue
@@ -3467,7 +3468,8 @@ func findPodsMatchingPrefix(awsClient *ssh.Client, namespace, podPrefix string) 
 }
 
 // listFilesInPod lists files in a pod directory matching a pattern
-func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern string) ([]string, error) {
+// If matchPodName is true, only returns files whose basename starts with the pod name
+func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern string, matchPodName bool) ([]string, error) {
 	session, err := awsClient.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %v", err)
@@ -3512,6 +3514,17 @@ func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern stri
 			if !strings.HasPrefix(file, "/") {
 				file = logPath + file
 			}
+			
+			// Filter by pod name if matchPodName is enabled
+			if matchPodName {
+				basename := filepath.Base(file)
+				// Only include files where basename starts with pod name
+				if !strings.HasPrefix(basename, pod) {
+					logger.Debug("      Skipping %s (does not match pod name %s)", basename, pod)
+					continue
+				}
+			}
+			
 			files = append(files, file)
 		}
 	}

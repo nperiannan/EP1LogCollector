@@ -7533,8 +7533,9 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 		return false
 	}
 
-	// Check if alias exists on AWS server using 'type' command in interactive bash
-	// Use 'bash -i -c' to ensure .bashrc is loaded (where aliases are typically defined)
+	// Check if alias exists on AWS server using 'type' command in login bash
+	// Use 'bash -l -c' to ensure .bashrc is loaded (where aliases are typically defined)
+	// Login shells automatically source .bash_profile (which loads .bashrc) without requiring a TTY
 	session, err := awsClient.NewSession()
 	if err != nil {
 		logger.Debug("  Failed to create SSH session to check alias '%s': %v", alias, err)
@@ -7542,10 +7543,10 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 	}
 	defer session.Close()
 
-	// Use bash -i -c to run in interactive mode (loads aliases from .bashrc)
-	checkCmd := fmt.Sprintf(`bash -i -c "type %s"`, alias)
+	// Use bash -l -c to run as login shell (loads aliases from .bashrc via .bash_profile)
+	checkCmd := fmt.Sprintf(`bash -l -c "type %s"`, alias)
 	logger.Debug("  Checking alias availability: %s", checkCmd)
-	
+
 	output, err := session.CombinedOutput(checkCmd)
 	outputStr := strings.TrimSpace(string(output))
 
@@ -7948,24 +7949,25 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 
 	// Use alias name directly (it's a bash alias on the AWS server)
 	// Don't resolve it - the AWS environment already has these aliases defined
-	// Build command: bash -i -c 'alias -c "SQL" --csv'
-	// 
+	// Build command: bash -l -c 'alias -c "SQL" --csv'
+	//
 	// Shell quoting strategy:
-	//   bash -i -c 'psqlplatdb -c "SELECT ... WHERE owner_id = '\''1096'\''" --csv'
+	//   bash -l -c 'psqlplatdb -c "SELECT ... WHERE owner_id = '\''1096'\''" --csv'
 	// We use single quotes for the outer bash command, so we need to:
 	//   1. Escape single quotes in SQL as '\'' (end quote, escaped quote, start quote)
 	//   2. Keep double quotes as-is (they work inside single quotes)
-	
+	// Note: -l flag makes bash a login shell, which automatically sources .bash_profile (loads .bashrc)
+
 	// Escape single quotes for shell (inside single-quoted string)
 	escapedSQL := strings.ReplaceAll(sql, `'`, `'\''`)
-	
+
 	// Build the psql command with double quotes around SQL
 	psqlCommand := fmt.Sprintf(`%s -c "%s" --csv`, alias, escapedSQL)
-	
-	// Wrap in bash -i -c with single quotes (so we don't need to escape double quotes)
-	fullCommand := fmt.Sprintf(`bash -i -c '%s'`, psqlCommand)
-	
-	logger.Debug("      Executing on AWS server (via bash -i -c): %s", psqlCommand)
+
+	// Wrap in bash -l -c with single quotes (login shell loads aliases without requiring TTY)
+	fullCommand := fmt.Sprintf(`bash -l -c '%s'`, psqlCommand)
+
+	logger.Debug("      Executing on AWS server (via bash -l -c): %s", psqlCommand)
 
 	// Execute command on AWS server via SSH
 	session, err := awsClient.NewSession()
@@ -7977,13 +7979,13 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 
 	output, err := session.CombinedOutput(fullCommand)
 	outputStr := string(output)
-	
+
 	if err != nil {
 		logger.Debug("      Command failed: %v", err)
 		logger.Debug("      Output: %s", outputStr)
 		return nil, fmt.Errorf("%v: %s", err, outputStr)
 	}
-	
+
 	logger.Debug("      Query executed successfully, parsing results...")
 
 	// Parse CSV output

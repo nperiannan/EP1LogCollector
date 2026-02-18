@@ -7529,10 +7529,12 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 	// Verify alias exists in config
 	_, ok := aliases[alias]
 	if !ok {
+		logger.Debug("  Alias '%s' not found in config", alias)
 		return false
 	}
 
-	// Check if alias exists on AWS server using 'type' command
+	// Check if alias exists on AWS server using 'type' command in interactive bash
+	// Use 'bash -i -c' to ensure .bashrc is loaded (where aliases are typically defined)
 	session, err := awsClient.NewSession()
 	if err != nil {
 		logger.Debug("  Failed to create SSH session to check alias '%s': %v", alias, err)
@@ -7540,18 +7542,22 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 	}
 	defer session.Close()
 
-	// Use 'type' command to check if the alias exists in the shell
-	// Check for the alias name directly (not the resolved command)
-	checkCmd := fmt.Sprintf("type %s", alias)
+	// Use bash -i -c to run in interactive mode (loads aliases from .bashrc)
+	checkCmd := fmt.Sprintf(`bash -i -c "type %s"`, alias)
+	logger.Debug("  Checking alias availability: %s", checkCmd)
+	
 	output, err := session.CombinedOutput(checkCmd)
+	outputStr := strings.TrimSpace(string(output))
 
 	if err != nil {
-		logger.Debug("  Alias '%s' not available on AWS server: %v", alias, err)
+		logger.Debug("  Alias check failed: %v", err)
+		logger.Debug("  Command output: %s", outputStr)
 		return false
 	}
 
 	// If 'type' command succeeded, the alias is available
-	logger.Debug("  Alias '%s' is available on AWS server: %s", alias, strings.TrimSpace(string(output)))
+	logger.Debug("  Alias '%s' is available on AWS server", alias)
+	logger.Debug("  Type output: %s", outputStr)
 	return true
 }
 
@@ -7942,35 +7948,53 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 
 	// Use alias name directly (it's a bash alias on the AWS server)
 	// Don't resolve it - the AWS environment already has these aliases defined
-	// Build command: alias -c "SQL" --csv
-	// Escape SQL for shell (double-quoted string)
-	escapedSQL := sql
-	escapedSQL = strings.ReplaceAll(escapedSQL, `\`, `\\`)  // Escape backslashes first
-	escapedSQL = strings.ReplaceAll(escapedSQL, `"`, `\"`)  // Escape double quotes
-	escapedSQL = strings.ReplaceAll(escapedSQL, `$`, `\$`)  // Escape dollar signs (prevent variable expansion)
-	escapedSQL = strings.ReplaceAll(escapedSQL, "`", "\\`")  // Escape backticks (prevent command substitution)
-
-	fullCommand := fmt.Sprintf(`%s -c "%s" --csv`, alias, escapedSQL)
-	logger.Debug("      Executing on AWS server: %s", fullCommand)
+	// Build command: bash -i -c 'alias -c "SQL" --csv'
+	// 
+	// Shell quoting strategy:
+	//   bash -i -c 'psqlplatdb -c "SELECT ... WHERE owner_id = '\''1096'\''" --csv'
+	// We use single quotes for the outer bash command, so we need to:
+	//   1. Escape single quotes in SQL as '\'' (end quote, escaped quote, start quote)
+	//   2. Keep double quotes as-is (they work inside single quotes)
+	
+	// Escape single quotes for shell (inside single-quoted string)
+	escapedSQL := strings.ReplaceAll(sql, `'`, `'\''`)
+	
+	// Build the psql command with double quotes around SQL
+	psqlCommand := fmt.Sprintf(`%s -c "%s" --csv`, alias, escapedSQL)
+	
+	// Wrap in bash -i -c with single quotes (so we don't need to escape double quotes)
+	fullCommand := fmt.Sprintf(`bash -i -c '%s'`, psqlCommand)
+	
+	logger.Debug("      Executing on AWS server (via bash -i -c): %s", psqlCommand)
 
 	// Execute command on AWS server via SSH
 	session, err := awsClient.NewSession()
 	if err != nil {
+		logger.Debug("      Failed to create SSH session: %v", err)
 		return nil, fmt.Errorf("failed to create SSH session: %v", err)
 	}
 	defer session.Close()
 
 	output, err := session.CombinedOutput(fullCommand)
+	outputStr := string(output)
+	
 	if err != nil {
-		return nil, fmt.Errorf("%v: %s", err, string(output))
+		logger.Debug("      Command failed: %v", err)
+		logger.Debug("      Output: %s", outputStr)
+		return nil, fmt.Errorf("%v: %s", err, outputStr)
 	}
+	
+	logger.Debug("      Query executed successfully, parsing results...")
 
 	// Parse CSV output
-	results, err := parseCSV(string(output))
+	results, err := parseCSV(outputStr)
 	if err != nil {
+		logger.Debug("      CSV parsing failed: %v", err)
+		logger.Debug("      Raw output: %s", outputStr)
 		return nil, fmt.Errorf("failed to parse query results: %v", err)
 	}
 
+	logger.Debug("      Parsed %d rows", len(results))
 	return results, nil
 }
 

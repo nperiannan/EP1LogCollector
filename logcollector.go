@@ -802,6 +802,166 @@ func LoadConfig(configPath string) (*Config, error) {
 	return &config, nil
 }
 
+// printCollectionSummary displays what will be collected before starting connections
+func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, listOnly bool, config *Config, logger *Logger) {
+	logger.Info("")
+	logger.Info("========================================")
+	logger.Info("PRE-FLIGHT COLLECTION SUMMARY")
+	logger.Info("========================================")
+	logger.Info("")
+	logger.Info("Operation Mode: %s", mode)
+	logger.Info("")
+
+	if listOnly {
+		logger.Info("Mode: LIST ONLY (no files will be downloaded)")
+		logger.Info("")
+		logger.Info("========================================")
+		return
+	}
+
+	collectionCount := 0
+
+	// Kubernetes Logs
+	if collectLogs {
+		collectionCount++
+		logger.Info("[%d] Kubernetes Log Collection: ENABLED", collectionCount)
+		if config.LogCollection.TimeBasedCollection.Enabled && config.LogCollection.TimeBasedCollection.Duration != "" {
+			logger.Info("    - Time-based collection: Last %s", config.LogCollection.TimeBasedCollection.Duration)
+		} else {
+			logger.Info("    - Time-based collection: Full logs")
+		}
+		if config.LogCollection.MessageFilter.Enabled {
+			logger.Info("    - Message filtering: ENABLED")
+			if config.LogCollection.MessageFilter.CombineReplicas {
+				logger.Info("    - Replica log merging: ENABLED")
+			}
+		}
+		if config.LogCollection.TemporalWorkflowCollection.Enabled {
+			logger.Info("    - Temporal workflows: %d workflows (prefix: %s)", 
+				config.LogCollection.TemporalWorkflowCollection.NumberOfWorkflows,
+				config.LogCollection.TemporalWorkflowCollection.WorkflowIdPrefix)
+		}
+		if config.LogCollection.TemporalScheduleCollection.Enabled {
+			logger.Info("    - Temporal schedules: %d schedules", 
+				config.LogCollection.TemporalScheduleCollection.NumberOfSchedules)
+		}
+		if config.LogCollection.PodFileCollection.Enabled && len(config.LogCollection.PodFileCollection.Collections) > 0 {
+			logger.Info("    - Pod file collection: %d pod(s) configured", len(config.LogCollection.PodFileCollection.Collections))
+			for _, podCol := range config.LogCollection.PodFileCollection.Collections {
+				logger.Info("      * %s/%s: %d pattern(s)", podCol.Namespace, podCol.PodPrefix, len(podCol.FilePatterns))
+			}
+		}
+		if config.LogCollection.LogAnalysis.Enabled {
+			logger.Info("    - Log analysis: ENABLED (%d error patterns)", len(config.LogCollection.LogAnalysis.ErrorPatterns))
+		}
+		logger.Info("")
+	}
+
+	// General System Information
+	if collectInfo {
+		collectionCount++
+		logger.Info("[%d] System Information Collection: ENABLED", collectionCount)
+		if len(config.GeneralInfo.Commands) > 0 {
+			logger.Info("    - Commands configured: %d", len(config.GeneralInfo.Commands))
+			for _, cmd := range config.GeneralInfo.Commands {
+				logger.Info("      * %s", cmd.Name)
+			}
+		} else {
+			logger.Info("    - No commands configured in config.yaml")
+		}
+		logger.Info("")
+	}
+
+	// Application Version Collection
+	if collectAppVersions {
+		collectionCount++
+		logger.Info("[%d] Application Version Collection: ENABLED", collectionCount)
+		if len(config.AppVersionCollection.Namespaces) > 0 {
+			logger.Info("    - Namespaces to check: %d", len(config.AppVersionCollection.Namespaces))
+			for _, ns := range config.AppVersionCollection.Namespaces {
+				logger.Info("      * %s: %d pod prefix(es)", ns.Namespace, len(ns.PodPrefixes))
+			}
+		} else {
+			logger.Info("    - No namespaces configured in config.yaml")
+		}
+		logger.Info("")
+	}
+
+	// Network Device Log Collection
+	if collectDeviceLogs {
+		collectionCount++
+		if config.DeviceLogCollection.Enabled {
+			enabledDevices := 0
+			for _, dev := range config.DeviceLogCollection.Devices {
+				if dev.Enabled {
+					enabledDevices++
+				}
+			}
+			logger.Info("[%d] Network Device Log Collection: ENABLED", collectionCount)
+			logger.Info("    - Enabled devices: %d of %d", enabledDevices, len(config.DeviceLogCollection.Devices))
+			if config.DeviceLogCollection.ParallelDownloads {
+				logger.Info("    - Parallel downloads: ENABLED")
+			}
+			for _, dev := range config.DeviceLogCollection.Devices {
+				if dev.Enabled {
+					logger.Info("      * %s (%s) - %s:%d", dev.Name, dev.Type, dev.IPAddress, dev.Port)
+				}
+			}
+		} else {
+			logger.Info("[%d] Network Device Log Collection: DISABLED in config", collectionCount)
+		}
+		logger.Info("")
+	}
+
+	// Database Query Collection
+	if collectDatabase {
+		collectionCount++
+		if config.DatabaseCollection.Enabled {
+			enabledDBs := 0
+			for _, db := range config.DatabaseCollection.Databases {
+				if db.Enabled {
+					enabledDBs++
+				}
+			}
+			logger.Info("[%d] Database Query Collection: ENABLED", collectionCount)
+			logger.Info("    - Enabled databases: %d of %d", enabledDBs, len(config.DatabaseCollection.Databases))
+			
+			// Show global parameters
+			if len(config.DatabaseCollection.Parameters) > 0 {
+				logger.Info("    - Global parameters:")
+				for key, value := range config.DatabaseCollection.Parameters {
+					if value != "" {
+						logger.Info("      * %s = %s", key, value)
+					}
+				}
+			}
+			
+			// Show enabled databases with query counts
+			for _, db := range config.DatabaseCollection.Databases {
+				if db.Enabled {
+					logger.Info("      * %s (%s): %d queries", db.Name, db.Alias, len(db.Queries))
+				}
+			}
+		} else {
+			logger.Info("[%d] Database Query Collection: DISABLED in config", collectionCount)
+		}
+		logger.Info("")
+	}
+
+	if collectionCount == 0 {
+		logger.Warn("No collections enabled!")
+		logger.Info("")
+	} else {
+		logger.Info("Total collections to perform: %d", collectionCount)
+		logger.Info("")
+	}
+
+	logger.Info("========================================")
+	logger.Info("Starting connection process...")
+	logger.Info("========================================")
+	logger.Info("")
+}
+
 func sshConnectBastion(username, password, host string, port int) (*ssh.Client, error) {
 	config := &ssh.ClientConfig{
 		User: username,
@@ -8548,6 +8708,9 @@ func main() {
 		fmt.Println("Or use -list=true to list available log files")
 		return
 	}
+
+	// Print pre-flight summary of what will be collected
+	printCollectionSummary(selectedMode, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, *listOnly, config, logger)
 
 	// Connect to bastion
 	logger.Info("Connecting to bastion host %s", *bastionHost)

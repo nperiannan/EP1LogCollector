@@ -7271,6 +7271,18 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 		logger.Info("")
 		logger.Info("Processing database: %s (alias: %s)", db.Name, db.Alias)
 
+		// Check if alias is available in config
+		if _, ok := dbc.Aliases[db.Alias]; !ok {
+			logger.Warn("  Alias '%s' not found in config - skipping database %s", db.Alias, db.Name)
+			continue
+		}
+
+		// Check if alias command is available in AWS environment
+		if !isAliasAvailable(db.Alias, dbc.Aliases, logger) {
+			logger.Warn("  Alias '%s' not available in environment - skipping database %s", db.Alias, db.Name)
+			continue
+		}
+
 		if err := executeDatabaseQueries(db, dbc, globalParams, dbOutputDir, timestamp, logger); err != nil {
 			logger.Error("Failed to execute queries for database %s: %v", db.Name, err)
 		}
@@ -7283,6 +7295,79 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 	logger.Info("========================================")
 
 	return dbOutputDir, nil
+}
+
+// isAliasAvailable checks if an alias command is available in the environment
+func isAliasAvailable(alias string, aliases map[string]string, logger *Logger) bool {
+	// Get the alias command
+	aliasCmd, ok := aliases[alias]
+	if !ok {
+		return false
+	}
+
+	// Resolve nested aliases to get the base command
+	resolvedCmd := resolveAliases(aliasCmd, aliases)
+
+	// Extract the first command (the executable)
+	cmdParts := strings.Fields(resolvedCmd)
+	if len(cmdParts) == 0 {
+		return false
+	}
+
+	baseCmd := cmdParts[0]
+
+	// Try to execute the command with --version or --help to check availability
+	// Use a very short timeout since we're just checking availability
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Try running the base command with --version (most commands support this)
+	cmd := exec.CommandContext(ctx, baseCmd, "--version")
+	err := cmd.Run()
+
+	// If --version worked, command is available
+	if err == nil {
+		logger.Debug("  Alias '%s' (command: %s) is available", alias, baseCmd)
+		return true
+	}
+
+	// If --version failed, try with --help
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+
+	cmd2 := exec.CommandContext(ctx2, baseCmd, "--help")
+	err2 := cmd2.Run()
+
+	if err2 == nil {
+		logger.Debug("  Alias '%s' (command: %s) is available", alias, baseCmd)
+		return true
+	}
+
+	// If both failed, try running the command with no args (some commands need this)
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel3()
+
+	cmd3 := exec.CommandContext(ctx3, baseCmd)
+	err3 := cmd3.Run()
+
+	// Even if it returns an error, if it's not "command not found", the command exists
+	if err3 != nil {
+		// Check if it's a "command not found" error
+		if exitErr, ok := err3.(*exec.ExitError); ok {
+			// Command ran but returned non-zero exit code = command exists
+			logger.Debug("  Alias '%s' (command: %s) is available (exit code: %d)", alias, baseCmd, exitErr.ExitCode())
+			return true
+		}
+		// exec.Error means command not found
+		if _, ok := err3.(*exec.Error); ok {
+			logger.Debug("  Alias '%s' (command: %s) not found in path", alias, baseCmd)
+			return false
+		}
+	}
+
+	// If we got here and no explicit "not found" error, assume available
+	logger.Debug("  Alias '%s' (command: %s) is available", alias, baseCmd)
+	return true
 }
 
 // executeDatabaseQueries executes all queries for a single database with automatic parameter resolution
@@ -7702,29 +7787,29 @@ func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string
 func validateSQLIsSelectOnly(sql string) error {
 	// Remove comments and normalize whitespace
 	cleanSQL := removeCommentsAndNormalize(sql)
-	
+
 	if cleanSQL == "" {
 		return fmt.Errorf("empty SQL query")
 	}
-	
+
 	// Check if query starts with SELECT (case-insensitive)
 	if !strings.HasPrefix(strings.ToUpper(cleanSQL), "SELECT") {
 		return fmt.Errorf("only SELECT queries are allowed (query starts with: %s)", strings.ToUpper(cleanSQL[:min(20, len(cleanSQL))]))
 	}
-	
+
 	// Check for forbidden keywords that could modify data
 	forbiddenKeywords := []string{
 		"INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
 		"TRUNCATE", "REPLACE", "MERGE", "GRANT", "REVOKE",
 		"EXECUTE", "EXEC", "CALL", "DO",
 	}
-	
+
 	for _, keyword := range forbiddenKeywords {
 		if containsKeyword(cleanSQL, keyword) {
 			return fmt.Errorf("forbidden keyword '%s' detected - only SELECT queries allowed", keyword)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -7742,7 +7827,7 @@ func removeCommentsAndNormalize(sql string) string {
 		}
 	}
 	result := strings.Join(cleaned, " ")
-	
+
 	// Remove multi-line comments (/* */)
 	for {
 		start := strings.Index(result, "/*")
@@ -7755,7 +7840,7 @@ func removeCommentsAndNormalize(sql string) string {
 		}
 		result = result[:start] + " " + result[start+end+2:]
 	}
-	
+
 	// Normalize whitespace
 	return strings.TrimSpace(strings.Join(strings.Fields(result), " "))
 }
@@ -7764,14 +7849,14 @@ func removeCommentsAndNormalize(sql string) string {
 func containsKeyword(sql string, keyword string) bool {
 	upperSQL := strings.ToUpper(sql)
 	upperKeyword := strings.ToUpper(keyword)
-	
+
 	// Simple word boundary check
 	idx := strings.Index(upperSQL, upperKeyword)
 	for idx >= 0 {
 		// Check if it's a whole word (not part of another word)
 		start := idx
 		end := idx + len(upperKeyword)
-		
+
 		// Check character before (should be non-alphanumeric or start of string)
 		if start > 0 {
 			prevChar := upperSQL[start-1]
@@ -7783,7 +7868,7 @@ func containsKeyword(sql string, keyword string) bool {
 				continue
 			}
 		}
-		
+
 		// Check character after (should be non-alphanumeric or end of string)
 		if end < len(upperSQL) {
 			nextChar := upperSQL[end]
@@ -7795,10 +7880,10 @@ func containsKeyword(sql string, keyword string) bool {
 				continue
 			}
 		}
-		
+
 		return true // Found as whole word
 	}
-	
+
 	return false
 }
 

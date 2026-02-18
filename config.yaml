@@ -271,8 +271,14 @@ databaseCollection:
   queryTimeout: 60                  # Query execution timeout in seconds
   
   # Database aliases from AWS environment
-  # Format: alias_name='psqlrds -U username -d database'
-  # The actual connection details are read from the AWS environment where psqlrds is configured
+  # Format: alias_name: "psqlrds -U username -d database"
+  # 
+  # NOTE: This is a reference list of available aliases. The tool will automatically
+  #       check if each alias exists in the AWS environment before executing queries.
+  #       If an alias is not available, that database will be gracefully skipped with
+  #       a warning message, and the tool will continue with other databases.
+  # 
+  # The actual connection details for psqlrds are read from the AWS environment.
   aliases:
     psqlrds: "psql -h aurora-dl2.cluster-cjmu4y64cxc2.us-east-2.rds.amazonaws.com"
     psqla3db: "psqlrds -U a3user -d a3"

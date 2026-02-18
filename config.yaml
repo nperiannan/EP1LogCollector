@@ -8,6 +8,22 @@ bastion:
   port: 22
   password: ""
   keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
+  
+  # Password Multi-Source Retrieval (Priority Order):
+  # 1. Environment Variable: BASTION_PASSWORD
+  #    Set with: set BASTION_PASSWORD=your_password (Windows) or export BASTION_PASSWORD=your_password (Linux/Mac)
+  # 
+  # 2. Windows Credential Manager (Windows only):
+  #    Securely stored by Windows, automatically saved on first use
+  #    View/edit in: Control Panel -> Credential Manager -> Windows Credentials
+  #    Target name: LogCollector:Bastion:username@host
+  # 
+  # 3. Config file (this file):
+  #    password: "your_password_here" (can be encrypted)
+  # 
+  # 4. Interactive Prompt:
+  #    If password not found in any source, you'll be prompted (hidden input)
+  #    Password will be automatically saved to Windows Credential Manager for future use
 
 # AWS Server Configuration
 aws:
@@ -243,20 +259,37 @@ appVersionCollection:
 
 # JIRA Integration Settings
 jira:
-  email: "nperiannan@extremenetworks.com" # Your Atlassian account email address
-  apiToken: ""                            # Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+  email: "{username}@extremenetworks.com" # Supports templates: {username}, {environment}
+  apiToken: ""                            # OPTIONAL: API token (see multi-source retrieval below)
   attachmentEnabled: true                 # Enable/disable automatic file attachment to JIRA issues
   baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance base URL
-  # Usage: Run with --jira flag to attach downloaded files to a JIRA issue
-  # Example: ./fetchlogs --all --jira XCP-17614
+  # API Token Multi-Source Retrieval (Priority Order):
+  # 1. Environment Variable: JIRA_API_TOKEN
+  #    Set with: set JIRA_API_TOKEN=your_token (Windows) or export JIRA_API_TOKEN=your_token (Linux/Mac)
   # 
-  # Files attached: archive (.tar.gz), logger_info, app_versions, analytics report
-  # Authentication: Requires valid email and API token configured above
+  # 2. Windows Credential Manager (Windows only):
+  #    Securely stored by Windows, automatically saved on first use
+  #    View/edit in: Control Panel -> Credential Manager -> Windows Credentials
+  #    Target name: LogCollector:JIRA:your-email@example.com
+  # 
+  # 3. Config file (this file):
+  #    apiToken: "your_token_here"
+  # 
+  # 4. Interactive Prompt:
+  #    If token not found in any source, you'll be prompted (hidden input)
+  #    Token will be automatically saved to Windows Credential Manager for future use
+  # 
+  # Generate API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+
+  # Usage: Run with --jira flag to attach downloaded files to a JIRA issue
+  # Example: ./logcollector --all --jira XCP-17614
+  # 
+  # Files attached: archive (.tar.gz), logger_info, app_versions, devicelogs, version_info
 
 # Network Device Log Collection Settings
 deviceLogCollection:
-  enabled: true                      # Master enable/disable for device log collection
-  outputDir: "Device"               # Subdirectory within main outputDir for device logs
+  enabled: false                     # Master enable/disable for device log collection
+  outputDir: "Device"                # Subdirectory within main outputDir for device logs
   parallelDownloads: true            # Download from multiple devices concurrently
   globalTimeout: 600                 # Total timeout per device (seconds)
   

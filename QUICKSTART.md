@@ -2,9 +2,9 @@
 
 A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
 
-## Latest Release: v1.2.2
+## Latest Release: v1.3.0
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.2)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.0)
 
 | Platform | Binary |
 |----------|--------|
@@ -12,6 +12,13 @@ A command-line tool to collect logs, system info, and application versions from 
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**What's New in v1.3.0:**
+- **Multi-source credential retrieval** - Bastion passwords and JIRA tokens stored securely in Windows Credential Manager
+- **One-time password entry** - Enter once, retrieved automatically on subsequent runs
+- **CI/CD support** - Environment variables (BASTION_PASSWORD, JIRA_API_TOKEN) for automation
+- **Template support** - JIRA email supports `{username}` and `{environment}` placeholders 
+- **Enhanced security** - Windows DPAPI encryption, accessible only by your user account
 
 **What's New in v1.2.2:**
 - **Automatic SFTP fallback** - When SCP fails (DNS resolution, network issues), automatically falls back to parallel SFTP for reliable downloads
@@ -91,7 +98,142 @@ options:
 **First Run:**
 - Leave `bastion.password` empty
 - Tool will prompt for password
-- Password gets encrypted and saved to config automatically
+- Password gets encrypted and saved to Windows Credential Manager automatically (Windows)
+- Subsequent runs retrieve password automatically (no prompts)
+
+## Credential Management (v1.3.0+)
+
+### How It Works
+
+Credentials are retrieved from **4 sources** in priority order:
+
+#### Bastion Password
+1. 🅱 **Environment Variable**: `BASTION_PASSWORD` (CI/CD, automation)
+2. 🔐 **Windows Credential Manager** (secure, encrypted by Windows)
+3. 🗄 **Config file** (config.yaml, AES-256-GCM encrypted)
+4. ⌨️ **Interactive prompt** (first-time, auto-saves to Credential Manager)
+
+**Stored as**: `LogCollector:Bastion:nperiannan@usnc-awsgtwy-02.extremenetworks.com`
+
+#### JIRA API Token
+1. 🅱 **Environment Variable**: `JIRA_API_TOKEN` (CI/CD, automation)
+2. 🔐 **Windows Credential Manager** (secure, encrypted by Windows)
+3. 🗄 **Config file** (config.yaml, plaintext)
+4. ⌨️ **Interactive prompt** (first-time, auto-saves to Credential Manager)
+
+**Stored as**: `LogCollector:JIRA:nperiannan@extremenetworks.com`
+
+### First-Run Experience
+
+**Step 1**: Configure config.yaml (leave passwords empty)
+```yaml
+username: nperiannan
+bastion:
+  host: usnc-awsgtwy-02.extremenetworks.com
+  password: ""  # Leave empty
+
+jira:
+  email: "{username}@extremenetworks.com"  # Use template
+  apiToken: ""  # Leave empty
+```
+
+**Step 2**: Run the tool
+```bash
+.\logcollector.exe --all
+```
+
+**Step 3**: Enter credentials when prompted (ONE TIME)
+```
+Enter bastion password: ****
+```
+
+**Step 4**: Credentials saved automatically
+✅ Windows Credential Manager stores password (encrypted)
+✅ Future runs retrieve automatically
+✅ No more prompts!
+
+### Viewing Credentials (Windows)
+
+**Method 1: Control Panel**
+1. Press `Win+R`
+2. Type: `control /name Microsoft.CredentialManager`
+3. Click: **Windows Credentials**
+4. Look for entries: `LogCollector:Bastion:*` and `LogCollector:JIRA:*`
+
+**Method 2: PowerShell**
+```powershell
+cmdkey /list | Select-String "LogCollector"
+```
+
+### Removing/Editing Credentials
+
+**Remove specific credential:**
+```powershell
+cmdkey /delete:"LogCollector:Bastion:nperiannan@usnc-awsgtwy-02.extremenetworks.com"
+cmdkey /delete:"LogCollector:JIRA:nperiannan@extremenetworks.com"
+```
+
+**Or use Control Panel:**
+1. Open Credential Manager (see above)
+2. Find `LogCollector:*` entry
+3. Click **Remove**
+4. Next run will prompt for credentials again
+
+### Using Environment Variables (CI/CD)
+
+**Windows PowerShell:**
+```powershell
+# Set credentials for session
+$env:BASTION_PASSWORD = "your_password"
+$env:JIRA_API_TOKEN = "atatt3xFfGF0abc123..."
+
+# Run tool (no prompts)
+.\logcollector.exe --all --jira XCP-12345
+```
+
+**Linux/macOS Bash:**
+```bash
+# Set credentials for session
+export BASTION_PASSWORD="your_password"
+export JIRA_API_TOKEN="atatt3xFfGF0abc123..."
+
+# Run tool (no prompts)
+./logcollector --all --jira XCP-12345
+```
+
+**Permanent (use carefully!):**
+```powershell
+# Windows (System Environment Variables)
+[Environment]::SetEnvironmentVariable("BASTION_PASSWORD", "your_password", "User")
+
+# Linux/Mac (~/.bashrc or ~/.zshrc)
+echo 'export BASTION_PASSWORD="your_password"' >> ~/.bashrc
+```
+
+### JIRA Email Templates
+
+Use placeholders in JIRA email configuration:
+
+```yaml
+jira:
+  email: "{username}@extremenetworks.com"  # → nperiannan@extremenetworks.com
+  # OR
+  email: "support-{environment}@company.com"  # → support-dev@company.com
+```
+
+**Supported placeholders:**
+- `{username}` → Your username from config
+- `{environment}` → Environment name from config
+
+### Security Benefits
+
+✅ **Windows DPAPI encryption** - Credentials encrypted by Windows Data Protection API  
+✅ **User-scoped** - Only accessible by your Windows user account  
+✅ **Login-protected** - Cannot be accessed when computer is locked  
+✅ **One-time setup** - Enter credentials once, used automatically thereafter  
+✅ **Backward compatible** - Old config files still work  
+✅ **Priority system** - Use env vars for CI/CD, Credential Manager for desktop  
+✅ **IT-manageable** - Can be deployed via Group Policy  
 
 ## How to Use
 
@@ -397,10 +539,12 @@ generalInfo:
 
 ## Security Notes
 
-- Passwords are encrypted with AES-256-GCM before saving
-- Temporary SSH keys are auto-deleted after use
-- StrictHostKeyChecking is disabled (no fingerprint prompts)
-- Avoid committing `config.yaml` with credentials to Git
+- **Multi-source credentials**: Environment variables → Windows Credential Manager → Config file → Interactive prompts
+- **Windows Credential Manager**: Credentials encrypted via DPAPI (Windows only)
+- **Config file passwords**: Encrypted with AES-256-GCM (legacy support)
+- **Temporary SSH keys**: Auto-deleted after use
+- **StrictHostKeyChecking**: Disabled (no fingerprint prompts)
+- **Best practice**: Use Windows Credential Manager or environment variables, avoid storing in config files
 
 ## Need Help?
 

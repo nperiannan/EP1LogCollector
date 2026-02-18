@@ -1969,7 +1969,7 @@ func downloadFileFromAWS(awsClient *ssh.Client, remotePath, localPath string, au
 		// Use native SCP (default - much faster)
 		logger.Info("Step 2: Downloading from bastion to local via native SCP (%.2f MB)...", float64(fileSize)/(1024*1024))
 		err = downloadFromBastionWithSCP(connParams, bastionTempPath, localPath, fileSize, remoteFileName)
-		
+
 		// If SCP fails, fallback to parallel SFTP
 		if err != nil {
 			logger.Warn("Native SCP failed (%v), falling back to parallel SFTP...", err)
@@ -5377,11 +5377,19 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) (string
 	return localFilePath, nil
 }
 
+// ================================================================
+// ================================================================
+// Credential Management Functions
+// Platform-specific implementations in:
+//   - credentials_windows.go (Windows Credential Manager)
+//   - credentials_other.go (Linux/macOS stubs - use env vars or config)
+// ================================================================
+
 // attachFilesToJira uploads files to a JIRA issue using the JIRA REST API
 func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []string, logger *Logger) error {
-	// Validate configuration
-	if jiraConfig.Email == "" || jiraConfig.ApiToken == "" {
-		return fmt.Errorf("JIRA credentials not configured (email or apiToken missing)")
+	// Validate basic configuration
+	if jiraConfig.Email == "" {
+		return fmt.Errorf("JIRA email not configured")
 	}
 
 	if jiraConfig.BaseURL == "" {
@@ -5390,6 +5398,12 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 
 	if issueKey == "" {
 		return fmt.Errorf("JIRA issue key is empty")
+	}
+
+	// Get API token from multiple sources (env var, keychain, config, prompt)
+	apiToken, err := getJIRAApiToken(&jiraConfig, logger)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve JIRA API token: %v", err)
 	}
 
 	// Filter out non-existent files
@@ -5436,13 +5450,14 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 		logger.Debug("Added file to upload: %s", fileName)
 	}
 
-	err := writer.Close()
+	err = writer.Close()
 	if err != nil {
 		return fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequest("POST", apiURL, body)
+	var req *http.Request
+	req, err = http.NewRequest("POST", apiURL, body)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -5451,8 +5466,8 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("X-Atlassian-Token", "no-check")
 
-	// Set Basic Authentication
-	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", jiraConfig.Email, jiraConfig.ApiToken)))
+	// Set Basic Authentication (use retrieved token)
+	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", jiraConfig.Email, apiToken)))
 	req.Header.Set("Authorization", fmt.Sprintf("Basic %s", auth))
 
 	// Send request
@@ -7226,6 +7241,13 @@ func main() {
 	// Log the selected operation mode
 	logger.Debug("Selected operation mode: %s", selectedMode)
 
+	// Apply template replacement to JIRA email field
+	if config.Jira.Email != "" {
+		config.Jira.Email = strings.ReplaceAll(config.Jira.Email, "{username}", config.Username)
+		config.Jira.Email = strings.ReplaceAll(config.Jira.Email, "{environment}", config.Environment)
+		logger.Debug("JIRA email after template replacement: %s", config.Jira.Email)
+	}
+
 	// Apply config defaults if flags weren't explicitly set
 	// We check if the flag values are still at their defaults
 	if *autoRetry == false && config.Options.AutoRetry {
@@ -7272,38 +7294,51 @@ func main() {
 	if *password == "" {
 		*password = config.Bastion.Password
 	}
+	if *bastionHost == "" {
+		*bastionHost = config.Bastion.Host
+	}
 
-	// Decrypt password if it's encrypted
+	// Get bastion password using multi-source retrieval (env var, keychain, config, prompt)
 	var decryptedPassword string
 	var passwordNeedsSaving bool
 
-	if *password != "" {
+	// Only retrieve password if we have both username and bastionHost (indicating SSH operations will be needed)
+	if !*interactive && *username != "" && *bastionHost != "" {
 		var err error
-		decryptedPassword, err = decryptPassword(*password)
+		decryptedPassword, passwordNeedsSaving, err = getBastionPassword(*username, *bastionHost, *password, logger)
 		if err != nil {
-			logger.Warn("Failed to decrypt password: %v", err)
-			logger.Warn("Please enter password again")
-			decryptedPassword = ""
-			*password = ""
-		}
-	}
-
-	// Prompt for password if empty or decryption failed
-	if decryptedPassword == "" && !*interactive {
-		newPass, err := promptPassword("Enter bastion password: ")
-		if err != nil {
-			logger.Error("Failed to read password: %v", err)
+			logger.Error("Failed to retrieve bastion password: %v", err)
 			return
 		}
-		decryptedPassword = newPass
-		passwordNeedsSaving = true
-	}
+		// Update password with retrieved value
+		*password = decryptedPassword
+	} else if *username != "" || *bastionHost != "" {
+		// Legacy fallback for interactive mode or partial configuration
+		// Decrypt password if it's encrypted
+		if *password != "" {
+			var err error
+			decryptedPassword, err = decryptPassword(*password)
+			if err != nil {
+				logger.Warn("Failed to decrypt password: %v", err)
+				logger.Warn("Please enter password again")
+				decryptedPassword = ""
+				*password = ""
+			}
+		}
 
-	// Update password with decrypted value
-	*password = decryptedPassword
+		// Prompt for password if empty or decryption failed
+		if decryptedPassword == "" && !*interactive {
+			newPass, err := promptPassword("Enter bastion password: ")
+			if err != nil {
+				logger.Error("Failed to read password: %v", err)
+				return
+			}
+			decryptedPassword = newPass
+			passwordNeedsSaving = true
+		}
 
-	if *bastionHost == "" {
-		*bastionHost = config.Bastion.Host
+		// Update password with decrypted value
+		*password = decryptedPassword
 	}
 	if *bastionPort == 0 {
 		if config.Bastion.Port != 0 {
@@ -7421,10 +7456,10 @@ func main() {
 			logger.Info("")
 			if !config.Jira.AttachmentEnabled {
 				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-			} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
-				logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
-				logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
-				logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+			} else if config.Jira.Email == "" {
+				logger.Warn("JIRA email not configured in config.yaml")
+				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
 			} else {
 				// Compress entire device logs directory into a single archive for JIRA
 				archiveName := filepath.Base(dlcOutDir) + ".tar.gz"
@@ -7585,10 +7620,10 @@ func main() {
 			logger.Info("")
 			if !config.Jira.AttachmentEnabled {
 				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-			} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
-				logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
-				logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
-				logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+			} else if config.Jira.Email == "" {
+				logger.Warn("JIRA email not configured in config.yaml")
+				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
 			} else {
 				attachmentFiles := []string{versionFilePath}
 				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
@@ -7632,10 +7667,10 @@ func main() {
 				logger.Info("")
 				if !config.Jira.AttachmentEnabled {
 					logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-				} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
-					logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
-					logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
-					logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+				} else if config.Jira.Email == "" {
+					logger.Warn("JIRA email not configured in config.yaml")
+					logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+					logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
 				} else {
 					attachmentFiles := []string{versionFilePath}
 					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
@@ -8019,10 +8054,10 @@ func main() {
 		// Check if JIRA attachment is enabled in config
 		if !config.Jira.AttachmentEnabled {
 			logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-		} else if config.Jira.Email == "" || config.Jira.ApiToken == "" {
-			logger.Warn("JIRA credentials not configured in config.yaml (email or apiToken missing)")
-			logger.Info("Please configure your JIRA credentials in config.yaml to use the attachment feature")
-			logger.Info("Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens")
+		} else if config.Jira.Email == "" {
+			logger.Warn("JIRA email not configured in config.yaml")
+			logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+			logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
 		} else {
 			// Collect all generated files for attachment
 			attachmentFiles := []string{}

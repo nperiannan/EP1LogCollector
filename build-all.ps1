@@ -1,8 +1,8 @@
 # build-all.ps1 - Build logcollector for all platforms
-# Usage: .\build-all.ps1 [-Version "1.2.1"]
+# Usage: .\build-all.ps1 [-Version "1.3.0"]
 
 param(
-    [string]$Version = "1.2.1"
+    [string]$Version = "1.3.0"
 )
 
 $ErrorActionPreference = "Stop"

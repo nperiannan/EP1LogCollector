@@ -4,9 +4,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 
 ## Download
 
-**Latest Release: v1.2.2**
+**Latest Release: v1.3.0**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.2)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.0)
 
 | Platform | Binary |
 |----------|--------|
@@ -14,6 +14,13 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**v1.3.0 Changes:**
+- **Multi-source credential retrieval** - Bastion passwords and JIRA tokens automatically stored in Windows Credential Manager
+- **Security enhancement** - Credentials encrypted by Windows DPAPI, accessible only by your user account
+- **First-run simplicity** - Enter credentials once, retrieved automatically thereafter
+- **CI/CD support** - Environment variables (BASTION_PASSWORD, JIRA_API_TOKEN) for automation
+- **Template support** - JIRA email field supports `{username}` and `{environment}` placeholders
 
 **v1.2.2 Changes:**
 - Automatic SFTP fallback when SCP fails (DNS resolution, network issues, etc.)
@@ -365,9 +372,78 @@ C:/Logs/
 
 See [QUICKSTART.md](QUICKSTART.md) for detailed configuration examples and advanced usage.
 
+## Credential Management
+
+**Multi-Source Credential Retrieval** (v1.3.0+):
+
+Credentials are retrieved from multiple sources in priority order:
+
+### Bastion Password
+**Priority Order:**
+1. **Environment Variable**: `BASTION_PASSWORD`
+2. **Windows Credential Manager** (Windows only, auto-saved on first use)
+3. **Config file** (config.yaml, encrypted with AES-256-GCM)
+4. **Interactive prompt** (saves to Credential Manager automatically)
+
+**Storage location**: `LogCollector:Bastion:username@host`
+
+### JIRA API Token
+**Priority Order:**
+1. **Environment Variable**: `JIRA_API_TOKEN`
+2. **Windows Credential Manager** (Windows only, auto-saved on first use)
+3. **Config file** (config.yaml, plaintext)
+4. **Interactive prompt** (saves to Credential Manager automatically)
+
+**Storage location**: `LogCollector:JIRA:email@domain.com`
+
+### First-Run Experience
+1. Run: `logcollector.exe --all`
+2. Tool prompts for bastion password (one time)
+3. Password automatically saved to Windows Credential Manager
+4. Future runs retrieve automatically (no prompts)
+
+### Viewing/Managing Credentials
+**Windows:**
+1. Press `Win+R`
+2. Type: `control /name Microsoft.CredentialManager`
+3. Click: **Windows Credentials**
+4. Find entries starting with `LogCollector:`
+
+**Environment Variables (CI/CD, automation):**
+```powershell
+# Windows PowerShell
+$env:BASTION_PASSWORD = "your_password"
+$env:JIRA_API_TOKEN = "your_token"
+.\logcollector.exe --all --jira XCP-12345
+```
+
+```bash
+# Linux/Mac
+export BASTION_PASSWORD="your_password"
+export JIRA_API_TOKEN="your_token"
+./logcollector --all --jira XCP-12345
+```
+
+### Template Support
+JIRA email field supports placeholders:
+```yaml
+jira:
+  email: "{username}@extremenetworks.com"  # Replaced with actual username
+```
+
+### Security Benefits
+- ✅ Credentials encrypted by Windows DPAPI
+- ✅ Protected by your Windows login
+- ✅ One-time setup
+- ✅ No plaintext credentials in config files
+- ✅ Backward compatible with existing configs
+- ✅ IT-manageable via Group Policy
+
 ## Security
 
-- Passwords encrypted with AES-256-GCM before saving
+- Multi-source credential retrieval (Windows Credential Manager, env vars, config, prompts)
+- Windows Credential Manager encryption via DPAPI (Windows only)
+- Passwords encrypted with AES-256-GCM before saving to config file
 - Temporary SSH keys auto-deleted after use
 - StrictHostKeyChecking disabled (no fingerprint prompts)
 - Do not commit config.yaml with credentials to Git

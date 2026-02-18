@@ -7526,41 +7526,25 @@ func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputD
 
 // isAliasAvailable checks if an alias command is available on the AWS server
 func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]string, logger *Logger) bool {
-	// Verify alias exists in config
+	// Verify alias exists in config and can be resolved to a full psql command
 	_, ok := aliases[alias]
 	if !ok {
 		logger.Debug("  Alias '%s' not found in config", alias)
 		return false
 	}
 
-	// Check if alias exists on AWS server using 'type' command as root user
-	// Database aliases are defined in root's .bashrc, so we need to run as root
-	// Note: Aliases are only expanded in interactive shells by default, so we need to:
-	//   1. Enable alias expansion with 'shopt -s expand_aliases'
-	//   2. Source .bashrc to load the aliases
-	session, err := awsClient.NewSession()
-	if err != nil {
-		logger.Debug("  Failed to create SSH session to check alias '%s': %v", alias, err)
-		return false
-	}
-	defer session.Close()
+	// Resolve the alias chain to get the full psql command
+	// e.g., psqlplatdb -> psqlrds -U postgres -d platform_common_db -> psql -h aurora-... -U postgres -d platform_common_db
+	resolved := resolveAliases(alias, aliases)
+	logger.Debug("  Alias '%s' resolves to: %s", alias, resolved)
 
-	// Use sudo su - with explicit alias expansion and .bashrc sourcing
-	checkCmd := fmt.Sprintf(`sudo su - -c "shopt -s expand_aliases; source ~/.bashrc; type %s"`, alias)
-	logger.Debug("  Checking alias availability: %s", checkCmd)
-
-	output, err := session.CombinedOutput(checkCmd)
-	outputStr := strings.TrimSpace(string(output))
-
-	if err != nil {
-		logger.Debug("  Alias check failed: %v", err)
-		logger.Debug("  Command output: %s", outputStr)
+	// Verify the resolved command starts with 'psql' (fully resolved)
+	if !strings.HasPrefix(resolved, "psql ") && resolved != "psql" {
+		logger.Debug("  Alias '%s' could not be fully resolved (got: %s)", alias, resolved)
 		return false
 	}
 
-	// If 'type' command succeeded, the alias is available
-	logger.Debug("  Alias '%s' is available on AWS server", alias)
-	logger.Debug("  Type output: %s", outputStr)
+	logger.Debug("  Alias '%s' is available (resolved from config)", alias)
 	return true
 }
 
@@ -7949,27 +7933,22 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 		return nil, fmt.Errorf("alias '%s' not found in config", alias)
 	}
 
-	// Use alias name directly (it's a bash alias on the AWS server)
-	// Don't resolve it - the AWS environment already has these aliases defined
-	// Aliases are defined in root's .bashrc, so we need to run commands as root
-	// Note: Aliases are only expanded in interactive shells by default, so we need to:
-	//   1. Enable alias expansion with 'shopt -s expand_aliases'
-	//   2. Source .bashrc to load the aliases
-	//
-	// Shell quoting strategy:
-	//   sudo su - -c 'shopt -s expand_aliases; source ~/.bashrc; psqlplatdb -c "SELECT ..." --csv'
-	// We use single quotes for the outer command wrapper, so we need to:
-	//   1. Escape single quotes in SQL as '\'' (end quote, escaped quote, start quote)
-	//   2. Keep double quotes as-is (they work inside single quotes)
+	// Resolve the alias chain from config to get the full psql command
+	// e.g., psqlplatdb -> psqlrds -U postgres -d platform_common_db
+	//                  -> psql -h aurora-dl2.cluster-... -U postgres -d platform_common_db
+	// This avoids all bash alias expansion issues in non-interactive SSH sessions
+	resolvedCmd := resolveAliases(alias, dbc.Aliases)
+	logger.Debug("      Alias '%s' resolved to: %s", alias, resolvedCmd)
 
-	// Escape single quotes for shell (inside single-quoted string)
+	// Escape single quotes in SQL for shell (inside single-quoted wrapper)
 	escapedSQL := strings.ReplaceAll(sql, `'`, `'\''`)
 
-	// Build the psql command with double quotes around SQL
-	psqlCommand := fmt.Sprintf(`%s -c "%s" --csv`, alias, escapedSQL)
+	// Build the full psql command with the resolved connection string
+	// e.g., psql -h aurora-... -U postgres -d platform_common_db -c "SELECT ..." --csv
+	psqlCommand := fmt.Sprintf(`%s -c "%s" --csv`, resolvedCmd, escapedSQL)
 
-	// Wrap in sudo su - -c with explicit alias expansion and .bashrc sourcing
-	fullCommand := fmt.Sprintf(`sudo su - -c 'shopt -s expand_aliases; source ~/.bashrc; %s'`, psqlCommand)
+	// Wrap in sudo su - -c to run as root (psql binary is in root's PATH)
+	fullCommand := fmt.Sprintf(`sudo su - -c '%s'`, psqlCommand)
 
 	logger.Debug("      Executing on AWS server (as root): %s", psqlCommand)
 

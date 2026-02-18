@@ -810,6 +810,9 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 	logger.Info("========================================")
 	logger.Info("")
 	logger.Info("Operation Mode: %s", mode)
+	if config.Environment != "" {
+		logger.Info("Environment: %s", strings.ToUpper(config.Environment))
+	}
 	logger.Info("")
 
 	if listOnly {
@@ -837,12 +840,12 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 			}
 		}
 		if config.LogCollection.TemporalWorkflowCollection.Enabled {
-			logger.Info("    - Temporal workflows: %d workflows (prefix: %s)", 
+			logger.Info("    - Temporal workflows: %d workflows (prefix: %s)",
 				config.LogCollection.TemporalWorkflowCollection.NumberOfWorkflows,
 				config.LogCollection.TemporalWorkflowCollection.WorkflowIdPrefix)
 		}
 		if config.LogCollection.TemporalScheduleCollection.Enabled {
-			logger.Info("    - Temporal schedules: %d schedules", 
+			logger.Info("    - Temporal schedules: %d schedules",
 				config.LogCollection.TemporalScheduleCollection.NumberOfSchedules)
 		}
 		if config.LogCollection.PodFileCollection.Enabled && len(config.LogCollection.PodFileCollection.Collections) > 0 {
@@ -925,7 +928,7 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 			}
 			logger.Info("[%d] Database Query Collection: ENABLED", collectionCount)
 			logger.Info("    - Enabled databases: %d of %d", enabledDBs, len(config.DatabaseCollection.Databases))
-			
+
 			// Show global parameters
 			if len(config.DatabaseCollection.Parameters) > 0 {
 				logger.Info("    - Global parameters:")
@@ -935,7 +938,7 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 					}
 				}
 			}
-			
+
 			// Show enabled databases with query counts
 			for _, db := range config.DatabaseCollection.Databases {
 				if db.Enabled {
@@ -2821,6 +2824,55 @@ func performFinalVerification(filePath string, expectedSize int64) error {
 	return nil
 }
 
+// isCommandSafeForSystemInfo validates that a command is safe (read-only)
+func isCommandSafeForSystemInfo(command string) (bool, string) {
+	// Normalize command to lowercase for checking
+	cmdLower := strings.ToLower(strings.TrimSpace(command))
+	
+	// Remove sudo prefix for checking
+	cmdLower = strings.TrimPrefix(cmdLower, "sudo ")
+	cmdLower = strings.TrimPrefix(cmdLower, "sudo su - -c ")
+	cmdLower = strings.Trim(cmdLower, "'\"")
+	
+	// List of forbidden keywords that indicate config changes or destructive operations
+	forbiddenKeywords := []string{
+		"configure", "config", "set", "create", "delete", "remove", "rm",
+		"restart", "reboot", "shutdown", "kill", "stop", "start",
+		"update", "upgrade", "patch", "apply", "edit", "modify",
+		"add", "insert", "drop", "truncate", "destroy",
+		"exec", "execute", "run", "launch",
+		"scale", "rollout", "deploy",
+	}
+	
+	// Check for forbidden keywords
+	for _, keyword := range forbiddenKeywords {
+		// Check if keyword appears as a standalone word (not part of another word)
+		if strings.Contains(cmdLower, " "+keyword+" ") || 
+		   strings.HasPrefix(cmdLower, keyword+" ") || 
+		   strings.HasSuffix(cmdLower, " "+keyword) ||
+		   cmdLower == keyword {
+			return false, fmt.Sprintf("Command contains forbidden keyword '%s' - only read-only commands (show/get/describe/list) are allowed", keyword)
+		}
+	}
+	
+	// Additional check for common safe command patterns
+	safePatterns := []string{"kubectl get", "kubectl describe", "kubectl top", "kubectl logs", "show", "display", "list", "cat", "grep", "find", "ls", "ps", "netstat", "df", "du"}
+	hasSafePattern := false
+	for _, pattern := range safePatterns {
+		if strings.Contains(cmdLower, pattern) {
+			hasSafePattern = true
+			break
+		}
+	}
+	
+	// If no safe pattern found, warn but allow (for custom commands)
+	if !hasSafePattern {
+		logger.Debug("Command does not match common safe patterns but no forbidden keywords detected: %s", command)
+	}
+	
+	return true, ""
+}
+
 // collectGeneralInfo executes general system information commands and saves outputs to files on the remote server
 func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 	Enabled   bool                 `yaml:"enabled"`
@@ -2892,6 +2944,14 @@ func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 		command := cmd.Command
 		command = strings.ReplaceAll(command, "{environment}", actualNamespace)
 		command = strings.ReplaceAll(command, "{username}", username)
+		
+		// Validate command safety
+		isSafe, reason := isCommandSafeForSystemInfo(command)
+		if !isSafe {
+			logger.Warn("SKIPPING command '%s': %s", cmd.Name, reason)
+			logger.Warn("  Command: %s", command)
+			continue
+		}
 
 		// Create session for this command
 		cmdSession, err := awsClient.NewSession()
@@ -8691,7 +8751,7 @@ func main() {
 	}
 
 	// Check if any operations are requested before attempting connections
-	hasOperations := collectLogs || collectInfo || collectAppVersions || collectDeviceLogs || *listOnly
+	hasOperations := collectLogs || collectInfo || collectAppVersions || collectDeviceLogs || collectDatabase || *listOnly
 
 	if !hasOperations {
 		fmt.Println("No operations requested.")

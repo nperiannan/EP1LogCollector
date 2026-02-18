@@ -5451,6 +5451,68 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 		return fmt.Errorf("no files found to attach")
 	}
 
+	// Upload files in parallel
+	logger.Info("Uploading %d file(s) to JIRA issue %s...", len(existingFiles), issueKey)
+	
+	type uploadResult struct {
+		fileName string
+		err      error
+	}
+	
+	resultChan := make(chan uploadResult, len(existingFiles))
+	var wg sync.WaitGroup
+	
+	// Launch parallel upload goroutines
+	for _, filePath := range existingFiles {
+		wg.Add(1)
+		go func(fPath string) {
+			defer wg.Done()
+			fileName := filepath.Base(fPath)
+			
+			logger.Info("Attaching file: %s", fileName)
+			
+			err := attachSingleFileToJira(jiraConfig, issueKey, fPath, apiToken, logger)
+			
+			if err != nil {
+				logger.Error("Failed to attach %s: %v", fileName, err)
+				resultChan <- uploadResult{fileName: fileName, err: err}
+			} else {
+				logger.Info("Successfully attached: %s", fileName)
+				resultChan <- uploadResult{fileName: fileName, err: nil}
+			}
+		}(filePath)
+	}
+	
+	// Wait for all uploads to complete
+	wg.Wait()
+	close(resultChan)
+	
+	// Collect results
+	successCount := 0
+	failedFiles := []string{}
+	
+	for result := range resultChan {
+		if result.err == nil {
+			successCount++
+		} else {
+			failedFiles = append(failedFiles, result.fileName)
+		}
+	}
+	
+	// Print summary
+	if successCount > 0 {
+		logger.Info("Successfully attached %d file(s) to JIRA issue %s", successCount, issueKey)
+	}
+	
+	if len(failedFiles) > 0 {
+		return fmt.Errorf("failed to attach %d file(s): %v", len(failedFiles), failedFiles)
+	}
+	
+	return nil
+}
+
+// attachSingleFileToJira uploads a single file to a JIRA issue
+func attachSingleFileToJira(jiraConfig JiraConfig, issueKey string, filePath string, apiToken string, logger *Logger) error {
 	// Build the API endpoint
 	apiURL := fmt.Sprintf("%s/rest/api/3/issue/%s/attachments", jiraConfig.BaseURL, issueKey)
 
@@ -5458,27 +5520,22 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
-	for _, filePath := range existingFiles {
-		file, err := os.Open(filePath)
-		if err != nil {
-			logger.Warn("Failed to open file %s: %v", filePath, err)
-			continue
-		}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
 
-		fileName := filepath.Base(filePath)
-		part, err := writer.CreateFormFile("file", fileName)
-		if err != nil {
-			file.Close()
-			return fmt.Errorf("failed to create form file for %s: %w", fileName, err)
-		}
-
-		_, err = io.Copy(part, file)
+	fileName := filepath.Base(filePath)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
 		file.Close()
-		if err != nil {
-			return fmt.Errorf("failed to copy file %s to form: %w", fileName, err)
-		}
+		return fmt.Errorf("failed to create form file: %w", err)
+	}
 
-		logger.Debug("Added file to upload: %s", fileName)
+	_, err = io.Copy(part, file)
+	file.Close()
+	if err != nil {
+		return fmt.Errorf("failed to copy file to form: %w", err)
 	}
 
 	err = writer.Close()
@@ -5487,8 +5544,7 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	}
 
 	// Create HTTP request
-	var req *http.Request
-	req, err = http.NewRequest("POST", apiURL, body)
+	req, err := http.NewRequest("POST", apiURL, body)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -5497,17 +5553,14 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("X-Atlassian-Token", "no-check")
 
-	// Set Basic Authentication (use retrieved token)
+	// Set Basic Authentication
 	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", jiraConfig.Email, apiToken)))
 	req.Header.Set("Authorization", fmt.Sprintf("Basic %s", auth))
 
 	// Send request with extended timeout for large file uploads
-	// 10 minutes should be sufficient for multi-GB archives
 	client := &http.Client{
 		Timeout: 10 * time.Minute,
 	}
-
-	logger.Info("Uploading %d file(s) to JIRA issue %s...", len(existingFiles), issueKey)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -5520,8 +5573,7 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 
 	// Check response status
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logger.Info("Successfully attached %d file(s) to JIRA issue %s", len(existingFiles), issueKey)
-		logger.Debug("JIRA API Response: %s", string(respBody))
+		logger.Debug("JIRA API Response for %s: %s", fileName, string(respBody))
 		return nil
 	}
 
@@ -7271,7 +7323,7 @@ func main() {
 	// Determine and prepare outputDir BEFORE logger initialization
 	// This ensures logger_info.txt is created in the correct directory from the start
 	var loggerOutputDir string
-	
+
 	if selectedMode == "device-logs" {
 		// For device-logs mode: Device_<timestamp> subdirectory
 		deviceLogFolderName := fmt.Sprintf("Device_%s", config.archiveTimestamp)
@@ -7299,7 +7351,7 @@ func main() {
 		*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
 		loggerOutputDir = *outputDir
 	}
-	
+
 	// Create output directory before logger initialization
 	if loggerOutputDir != "" && loggerOutputDir != "." {
 		if err := os.MkdirAll(loggerOutputDir, 0755); err != nil {

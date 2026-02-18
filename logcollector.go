@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -5664,54 +5663,6 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config, outputD
 //   - credentials_other.go (Linux/macOS stubs - use env vars or config)
 // ================================================================
 
-// getJIRAApiToken retrieves the JIRA API token from multiple sources
-func getJIRAApiToken(jiraConfig *JiraConfig, logger *Logger) (string, error) {
-	// 1. Check environment variable first
-	if token := os.Getenv("JIRA_API_TOKEN"); token != "" {
-		logger.Debug("Using JIRA API token from environment variable")
-		return token, nil
-	}
-
-	// 2. Check config file
-	if jiraConfig.ApiToken != "" {
-		logger.Debug("Using JIRA API token from config file")
-		return jiraConfig.ApiToken, nil
-	}
-
-	// 3. Prompt user for token
-	fmt.Print("Enter JIRA API token: ")
-	fmt.Scanln(&jiraConfig.ApiToken)
-	if jiraConfig.ApiToken != "" {
-		return jiraConfig.ApiToken, nil
-	}
-
-	return "", fmt.Errorf("JIRA API token not provided")
-}
-
-// getBastionPassword retrieves bastion password from various sources
-func getBastionPassword(username, host, providedPassword string, logger *Logger) (string, bool, error) {
-	// If password is provided as argument, use it
-	if providedPassword != "" {
-		// Check if it's encrypted
-		if strings.HasPrefix(providedPassword, "encrypted:") {
-			decrypted, err := decryptPassword(providedPassword)
-			if err != nil {
-				return "", false, fmt.Errorf("failed to decrypt password: %v", err)
-			}
-			return decrypted, false, nil
-		}
-		return providedPassword, false, nil
-	}
-
-	// Prompt for password
-	password, err := promptPassword(fmt.Sprintf("Enter password for %s@%s: ", username, host))
-	if err != nil {
-		return "", false, err
-	}
-	
-	return password, true, nil
-}
-
 // attachFilesToJira uploads files to a JIRA issue using the JIRA REST API
 func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []string, logger *Logger) error {
 	// Validate basic configuration
@@ -7458,7 +7409,7 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 // ============================================================================
 
 // processDatabaseCollection executes database queries and saves results
-func processDatabaseCollection(config Config, baseOutputDir string, timestamp string, logger *Logger) (string, error) {
+func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputDir string, timestamp string, logger *Logger) (string, error) {
 	dbc := config.DatabaseCollection
 
 	if !dbc.Enabled {
@@ -7553,11 +7504,13 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 			continue
 		}
 
-		// NOTE: Removed alias availability check - database commands are executed locally
-		// and require appropriate database clients (psql, mysql, etc.) to be installed.
-		// If command is not available, the query execution will fail with a clear error.
+		// Check if alias is available on AWS server before attempting queries
+		if !isAliasAvailable(awsClient, db.Alias, dbc.Aliases, logger) {
+			logger.Warn("Alias '%s' not available on AWS server - skipping database %s", db.Alias, db.Name)
+			continue
+		}
 
-		if err := executeDatabaseQueries(db, dbc, globalParams, dbOutputDir, timestamp, logger); err != nil {
+		if err := executeDatabaseQueries(awsClient, db, dbc, globalParams, dbOutputDir, timestamp, logger); err != nil {
 			logger.Error("Failed to execute queries for database %s: %v", db.Name, err)
 		}
 	}
@@ -7571,8 +7524,8 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 	return dbOutputDir, nil
 }
 
-// isAliasAvailable checks if an alias command is available in the environment
-func isAliasAvailable(alias string, aliases map[string]string, logger *Logger) bool {
+// isAliasAvailable checks if an alias command is available on the AWS server
+func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]string, logger *Logger) bool {
 	// Get the alias command
 	aliasCmd, ok := aliases[alias]
 	if !ok {
@@ -7590,62 +7543,30 @@ func isAliasAvailable(alias string, aliases map[string]string, logger *Logger) b
 
 	baseCmd := cmdParts[0]
 
-	// Try to execute the command with --version or --help to check availability
-	// Use a very short timeout since we're just checking availability
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	// Check if alias exists on AWS server using 'type' command
+	session, err := awsClient.NewSession()
+	if err != nil {
+		logger.Debug("  Failed to create SSH session to check alias '%s': %v", alias, err)
+		return false
+	}
+	defer session.Close()
 
-	// Try running the base command with --version (most commands support this)
-	cmd := exec.CommandContext(ctx, baseCmd, "--version")
-	err := cmd.Run()
+	// Use 'type' command to check if the alias/command exists in the shell
+	checkCmd := fmt.Sprintf("type %s", baseCmd)
+	output, err := session.CombinedOutput(checkCmd)
 
-	// If --version worked, command is available
-	if err == nil {
-		logger.Debug("  Alias '%s' (command: %s) is available", alias, baseCmd)
-		return true
+	if err != nil {
+		logger.Debug("  Alias '%s' (command: %s) not available on AWS server: %v", alias, baseCmd, err)
+		return false
 	}
 
-	// If --version failed, try with --help
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel2()
-
-	cmd2 := exec.CommandContext(ctx2, baseCmd, "--help")
-	err2 := cmd2.Run()
-
-	if err2 == nil {
-		logger.Debug("  Alias '%s' (command: %s) is available", alias, baseCmd)
-		return true
-	}
-
-	// If both failed, try running the command with no args (some commands need this)
-	ctx3, cancel3 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel3()
-
-	cmd3 := exec.CommandContext(ctx3, baseCmd)
-	err3 := cmd3.Run()
-
-	// Even if it returns an error, if it's not "command not found", the command exists
-	if err3 != nil {
-		// Check if it's a "command not found" error
-		if exitErr, ok := err3.(*exec.ExitError); ok {
-			// Command ran but returned non-zero exit code = command exists
-			logger.Debug("  Alias '%s' (command: %s) is available (exit code: %d)", alias, baseCmd, exitErr.ExitCode())
-			return true
-		}
-		// exec.Error means command not found
-		if _, ok := err3.(*exec.Error); ok {
-			logger.Debug("  Alias '%s' (command: %s) not found in path", alias, baseCmd)
-			return false
-		}
-	}
-
-	// If we got here and no explicit "not found" error, assume available
-	logger.Debug("  Alias '%s' (command: %s) is available", alias, baseCmd)
+	// If 'type' command succeeded, the alias/command is available
+	logger.Debug("  Alias '%s' (command: %s) is available on AWS server: %s", alias, baseCmd, strings.TrimSpace(string(output)))
 	return true
 }
 
 // executeDatabaseQueries executes all queries for a single database with automatic parameter resolution
-func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalParams map[string][]string, outputDir string, timestamp string, logger *Logger) error {
+func executeDatabaseQueries(awsClient *ssh.Client, db DatabaseConfig, dbc DatabaseCollection, globalParams map[string][]string, outputDir string, timestamp string, logger *Logger) error {
 	// Create database-specific output file
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_queries_%s.txt", db.Name, timestamp))
 	f, err := os.Create(outputFile)
@@ -7691,7 +7612,7 @@ func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalPar
 
 			// Execute query
 			logger.Info("  Executing query: %s", query.Name)
-			results, err := executeQueryWithGlobalParams(db.Alias, query, globalParams, db.Name, dbc, logger)
+			results, err := executeQueryWithGlobalParams(awsClient, db.Alias, query, globalParams, db.Name, dbc, logger)
 
 			if err != nil {
 				logger.Error("    Failed: %v", err)
@@ -7824,7 +7745,7 @@ func checkParameterAvailability(requiredParams []string, globalParams map[string
 }
 
 // executeQueryWithGlobalParams executes a query with parameter substitution from globalParams
-func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParams map[string][]string, dbName string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+func executeQueryWithGlobalParams(awsClient *ssh.Client, alias string, query DatabaseQuery, globalParams map[string][]string, dbName string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
 	// Extract required parameters from SQL
 	requiredParams := extractParametersFromSQL(query.SQL)
 
@@ -7881,7 +7802,7 @@ func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParam
 				}
 			}
 
-			results, err := executeSingleQuery(alias, query.SQL, singleParams, dbc, logger)
+			results, err := executeSingleQuery(awsClient, alias, query.SQL, singleParams, dbc, logger)
 			if err != nil {
 				logger.Warn("      Failed for %s=%s: %v", multiValueParam, value, err)
 				continue
@@ -7902,7 +7823,7 @@ func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParam
 	}
 
 	// Single execution
-	return executeSingleQuery(alias, query.SQL, paramValues, dbc, logger)
+	return executeSingleQuery(awsClient, alias, query.SQL, paramValues, dbc, logger)
 }
 
 // extractParametersFromResults extracts specified column values from query results
@@ -7949,7 +7870,7 @@ func extractParametersFromResults(results [][]string, paramNames []string) map[s
 }
 
 // executeQueryWithParams executes a SQL query with parameter substitution (deprecated - keeping for compatibility)
-func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+func executeQueryWithParams(awsClient *ssh.Client, alias string, query DatabaseQuery, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
 	// Find parameter with multiple values (dependency case)
 	var multiValueParam string
 	var multiValues []string
@@ -7978,7 +7899,7 @@ func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[s
 				}
 			}
 
-			results, err := executeSingleQuery(alias, query.SQL, singleParams, dbc, logger)
+			results, err := executeSingleQuery(awsClient, alias, query.SQL, singleParams, dbc, logger)
 			if err != nil {
 				logger.Warn("      Failed for %s=%s: %v", multiValueParam, value, err)
 				continue
@@ -7999,11 +7920,11 @@ func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[s
 	}
 
 	// Single execution
-	return executeSingleQuery(alias, query.SQL, paramValues, dbc, logger)
+	return executeSingleQuery(awsClient, alias, query.SQL, paramValues, dbc, logger)
 }
 
-// executeSingleQuery executes a single SQL query via psql alias
-func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+// executeSingleQuery executes a single SQL query via psql alias on the AWS server
+func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
 	// Substitute parameters in SQL
 	sql := sqlTemplate
 	for param, values := range paramValues {
@@ -8036,14 +7957,18 @@ func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string
 	cmdParts := strings.Fields(resolvedCmd)
 	cmdParts = append(cmdParts, "-c", sql, "--csv")
 
-	logger.Debug("      Executing: %s", strings.Join(cmdParts, " "))
+	// Build full command string for remote execution
+	fullCommand := strings.Join(cmdParts, " ")
+	logger.Debug("      Executing on AWS server: %s", fullCommand)
 
-	// Execute command with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(dbc.QueryTimeout)*time.Second)
-	defer cancel()
+	// Execute command on AWS server via SSH
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH session: %v", err)
+	}
+	defer session.Close()
 
-	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
-	output, err := cmd.CombinedOutput()
+	output, err := session.CombinedOutput(fullCommand)
 	if err != nil {
 		return nil, fmt.Errorf("%v: %s", err, string(output))
 	}
@@ -8734,60 +8659,6 @@ func main() {
 		return
 	}
 
-	// --database mode: collect only database query results
-	// This mode does NOT require bastion/AWS — it runs psql commands locally
-	if selectedMode == "database" {
-		logger.Info("Running in database mode (database query collection only)...")
-
-		if !config.DatabaseCollection.Enabled {
-			logger.Warn("Database collection is disabled in config.yaml (databaseCollection.enabled: false)")
-			logger.Info("Please enable databaseCollection in config.yaml and configure your databases")
-			return
-		}
-
-		// Logger is already created in the correct directory,
-		// so we pass config.archiveTimestamp to reuse the same directory
-		dbOutDir, err := processDatabaseCollection(*config, *outputDir, config.archiveTimestamp, logger)
-		if err != nil {
-			logger.Error("Database collection failed: %v", err)
-		}
-		// No need to move/copy logger_info.txt - it's already in the right place!
-
-		// Attach database query files to JIRA if requested
-		if *jiraIssueID != "" && dbOutDir != "" {
-			logger.Info("")
-			if !config.Jira.AttachmentEnabled {
-				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-			} else if config.Jira.Email == "" {
-				logger.Warn("JIRA email not configured in config.yaml")
-				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
-				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
-			} else {
-				// Compress entire database results directory into a single archive for JIRA
-				archiveName := filepath.Base(dbOutDir) + ".tar.gz"
-				archivePath := filepath.Join(filepath.Dir(dbOutDir), archiveName)
-				logger.Info("Compressing database results for JIRA attachment: %s", archiveName)
-				if err := compressDirectoryToTarGz(dbOutDir, archivePath, logger); err != nil {
-					logger.Error("Failed to compress database results directory: %v", err)
-				} else {
-					logger.Info("Database results compressed: %s", archivePath)
-					attachmentFiles := []string{archivePath}
-					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
-						logger.Error("Failed to attach database files to JIRA issue %s: %v", *jiraIssueID, err)
-					} else {
-						// Clean up the compressed archive after successful JIRA upload
-						if err := os.Remove(archivePath); err != nil {
-							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
-						} else {
-							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
-						}
-					}
-				}
-			}
-		}
-		return
-	}
-
 	// Validate required parameters
 	if *username == "" || *password == "" || *bastionHost == "" {
 		fmt.Println("Error: Missing required parameters")
@@ -8933,6 +8804,60 @@ func main() {
 				attachmentFiles := []string{versionFilePath}
 				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+				}
+			}
+		}
+		return
+	}
+
+	// --database mode: collect only database query results
+	// This mode requires AWS connection to execute database commands remotely
+	if selectedMode == "database" {
+		logger.Info("Running in database mode (database query collection only)...")
+
+		if !config.DatabaseCollection.Enabled {
+			logger.Warn("Database collection is disabled in config.yaml (databaseCollection.enabled: false)")
+			logger.Info("Please enable databaseCollection in config.yaml and configure your databases")
+			return
+		}
+
+		// Execute database queries on AWS server via SSH
+		dbOutDir, err := processDatabaseCollection(awsClient, *config, *outputDir, config.archiveTimestamp, logger)
+		if err != nil {
+			logger.Error("Database collection failed: %v", err)
+			return
+		}
+		logger.Info("Database query collection completed successfully!")
+
+		// Attach database query files to JIRA if requested
+		if *jiraIssueID != "" && dbOutDir != "" {
+			logger.Info("")
+			if !config.Jira.AttachmentEnabled {
+				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+			} else if config.Jira.Email == "" {
+				logger.Warn("JIRA email not configured in config.yaml")
+				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
+			} else {
+				// Compress entire database results directory into a single archive for JIRA
+				archiveName := filepath.Base(dbOutDir) + ".tar.gz"
+				archivePath := filepath.Join(filepath.Dir(dbOutDir), archiveName)
+				logger.Info("Compressing database results for JIRA attachment: %s", archiveName)
+				if err := compressDirectoryToTarGz(dbOutDir, archivePath, logger); err != nil {
+					logger.Error("Failed to compress database results directory: %v", err)
+				} else {
+					logger.Info("Database results compressed: %s", archivePath)
+					attachmentFiles := []string{archivePath}
+					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						logger.Error("Failed to attach database files to JIRA issue %s: %v", *jiraIssueID, err)
+					} else {
+						// Clean up the compressed archive after JIRA upload attempt
+						if err := os.Remove(archivePath); err != nil {
+							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+						} else {
+							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+						}
+					}
 				}
 			}
 		}
@@ -9284,7 +9209,7 @@ func main() {
 	if collectDatabase && config.DatabaseCollection.Enabled {
 		logger.Info("")
 		logger.Info("Starting database query collection...")
-		dbOutDir, dbErr := processDatabaseCollection(*config, *outputDir, config.archiveTimestamp, logger)
+		dbOutDir, dbErr := processDatabaseCollection(awsClient, *config, *outputDir, config.archiveTimestamp, logger)
 		if dbErr != nil {
 			logger.Error("Database collection failed: %v", dbErr)
 		}

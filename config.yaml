@@ -324,9 +324,13 @@ databaseCollection:
           parameters: ["asset_device_id", "serial_number"]  # Extract multiple columns from results
         - name: "get_inferred_device_info"
           sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{asset_device_id}'"
-          # Uses asset_device_id from previous query
+          # Uses asset_device_id from previous query (namespace optional within same database)
   
   # Query Execution Features (v1.3.3 build #21):
+  # 
+  # SECURITY: Only SELECT queries are allowed. Any query containing INSERT, UPDATE,
+  #           DELETE, DROP, CREATE, ALTER, TRUNCATE, or other data-modifying keywords
+  #           will be rejected. This is a log collector tool - it should not modify data.
   # 
   # 1. MULTI-VALUE PARAMETERS (CSV support):
   #    Configure multiple values separated by commas in parameters:
@@ -372,6 +376,7 @@ databaseCollection:
   #      1. Exact match: globalParams["param_name"]
   #      2. Current DB namespace: globalParams["current_db.param_name"]
   #      3. Any DB namespace: Search for "*.param_name" pattern
+  #    Note: Within the same database, namespace prefix is optional (fallback works)
   # 
   # Example Usage:
   #   parameters:

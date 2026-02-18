@@ -7247,7 +7247,7 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 	logger.Info("Database Query Collection")
 	logger.Info("Enabled databases: %d of %d", len(enabledDBs), len(dbc.Databases))
 	logger.Info("Output directory: %s", dbOutputDir)
-	
+
 	// Log global parameters
 	if len(globalParams) > 0 {
 		logger.Info("Global Parameters:")
@@ -7308,7 +7308,7 @@ func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalPar
 
 	// Execute queries (with automatic ordering based on parameter availability)
 	remainingQueries := append([]DatabaseQuery{}, db.Queries...) // Copy slice
-	maxAttempts := len(db.Queries) * 2 // Prevent infinite loops
+	maxAttempts := len(db.Queries) * 2                           // Prevent infinite loops
 	attempts := 0
 
 	for len(remainingQueries) > 0 && attempts < maxAttempts {
@@ -7317,13 +7317,13 @@ func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalPar
 
 		for i := 0; i < len(remainingQueries); {
 			query := remainingQueries[i]
-			
+
 			// Extract required parameters from SQL
 			requiredParams := extractParametersFromSQL(query.SQL)
-			
+
 			// Check if all required parameters are available
 			canExecute, missingParams := checkParameterAvailability(requiredParams, globalParams, db.Name)
-			
+
 			if !canExecute {
 				logger.Debug("  Query '%s' deferred - missing parameters: %v", query.Name, missingParams)
 				i++ // Keep in remaining queue
@@ -7333,14 +7333,14 @@ func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalPar
 			// Execute query
 			logger.Info("  Executing query: %s", query.Name)
 			results, err := executeQueryWithGlobalParams(db.Alias, query, globalParams, db.Name, dbc, logger)
-			
+
 			if err != nil {
 				logger.Error("    Failed: %v", err)
 				f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
 				f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
 				f.WriteString(fmt.Sprintf("Status: FAILED\n"))
 				f.WriteString(fmt.Sprintf("Error: %v\n\n", err))
-				
+
 				// Remove from queue (don't retry failed queries)
 				remainingQueries = append(remainingQueries[:i], remainingQueries[i+1:]...)
 				continue
@@ -7379,17 +7379,17 @@ func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalPar
 			// Extract parameters from results if specified
 			if len(query.Parameters) > 0 && len(results) > 1 {
 				extractedValues := extractParametersFromResults(results, query.Parameters)
-				
+
 				// Add extracted parameters to global params with namespace
 				for paramName, values := range extractedValues {
 					namespacedKey := fmt.Sprintf("%s.%s", db.Name, paramName)
 					globalParams[namespacedKey] = values
-					
+
 					// Also add without namespace if not already exists (for convenience)
 					if _, exists := globalParams[paramName]; !exists {
 						globalParams[paramName] = values
 					}
-					
+
 					if len(values) == 1 {
 						logger.Info("    Extracted parameter: %s = %s", namespacedKey, values[0])
 					} else {
@@ -7434,19 +7434,19 @@ func extractParametersFromSQL(sql string) []string {
 // checkParameterAvailability checks if all required parameters are available in globalParams
 func checkParameterAvailability(requiredParams []string, globalParams map[string][]string, dbName string) (bool, []string) {
 	var missing []string
-	
+
 	for _, param := range requiredParams {
 		// Try exact match first
 		if values, ok := globalParams[param]; ok && len(values) > 0 {
 			continue
 		}
-		
+
 		// Try with current database namespace
 		namespacedParam := fmt.Sprintf("%s.%s", dbName, param)
 		if values, ok := globalParams[namespacedParam]; ok && len(values) > 0 {
 			continue
 		}
-		
+
 		// Try to find it in any other database namespace
 		found := false
 		for key, values := range globalParams {
@@ -7455,12 +7455,12 @@ func checkParameterAvailability(requiredParams []string, globalParams map[string
 				break
 			}
 		}
-		
+
 		if !found {
 			missing = append(missing, param)
 		}
 	}
-	
+
 	return len(missing) == 0, missing
 }
 
@@ -7468,7 +7468,7 @@ func checkParameterAvailability(requiredParams []string, globalParams map[string
 func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParams map[string][]string, dbName string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
 	// Extract required parameters from SQL
 	requiredParams := extractParametersFromSQL(query.SQL)
-	
+
 	// Build parameter values map (resolve from globalParams)
 	paramValues := make(map[string][]string)
 	for _, param := range requiredParams {
@@ -7477,14 +7477,14 @@ func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParam
 			paramValues[param] = values
 			continue
 		}
-		
+
 		// Try with current database namespace
 		namespacedParam := fmt.Sprintf("%s.%s", dbName, param)
 		if values, ok := globalParams[namespacedParam]; ok && len(values) > 0 {
 			paramValues[param] = values
 			continue
 		}
-		
+
 		// Try to find it in any other database namespace
 		for key, values := range globalParams {
 			if strings.HasSuffix(key, "."+param) && len(values) > 0 {
@@ -7493,7 +7493,7 @@ func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParam
 			}
 		}
 	}
-	
+
 	// Find parameter with multiple values
 	var multiValueParam string
 	var multiValues []string
@@ -7504,7 +7504,7 @@ func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParam
 			break
 		}
 	}
-	
+
 	// If we have a multi-value parameter, execute query for each value
 	if multiValueParam != "" {
 		logger.Debug("      Executing query %d times (one per value of '%s')", len(multiValues), multiValueParam)
@@ -7549,13 +7549,13 @@ func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParam
 // extractParametersFromResults extracts specified column values from query results
 func extractParametersFromResults(results [][]string, paramNames []string) map[string][]string {
 	extracted := make(map[string][]string)
-	
+
 	if len(results) < 2 { // Need at least header + 1 data row
 		return extracted
 	}
-	
+
 	header := results[0]
-	
+
 	for _, paramName := range paramNames {
 		// Find column index
 		columnIndex := -1
@@ -7565,11 +7565,11 @@ func extractParametersFromResults(results [][]string, paramNames []string) map[s
 				break
 			}
 		}
-		
+
 		if columnIndex == -1 {
 			continue // Column not found
 		}
-		
+
 		// Extract values from all data rows
 		values := []string{}
 		for i := 1; i < len(results); i++ {
@@ -7580,12 +7580,12 @@ func extractParametersFromResults(results [][]string, paramNames []string) map[s
 				}
 			}
 		}
-		
+
 		if len(values) > 0 {
 			extracted[paramName] = values
 		}
 	}
-	
+
 	return extracted
 }
 
@@ -7659,6 +7659,11 @@ func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string
 		return nil, fmt.Errorf("query contains unsubstituted parameters: %s", sql)
 	}
 
+	// SECURITY: Validate SQL is SELECT-only (log collector should not modify data)
+	if err := validateSQLIsSelectOnly(sql); err != nil {
+		return nil, fmt.Errorf("SQL validation failed: %v", err)
+	}
+
 	// Build psql command using alias
 	aliasCmd, ok := dbc.Aliases[alias]
 	if !ok {
@@ -7691,6 +7696,118 @@ func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string
 	}
 
 	return results, nil
+}
+
+// validateSQLIsSelectOnly ensures the SQL query is a safe SELECT statement
+func validateSQLIsSelectOnly(sql string) error {
+	// Remove comments and normalize whitespace
+	cleanSQL := removeCommentsAndNormalize(sql)
+	
+	if cleanSQL == "" {
+		return fmt.Errorf("empty SQL query")
+	}
+	
+	// Check if query starts with SELECT (case-insensitive)
+	if !strings.HasPrefix(strings.ToUpper(cleanSQL), "SELECT") {
+		return fmt.Errorf("only SELECT queries are allowed (query starts with: %s)", strings.ToUpper(cleanSQL[:min(20, len(cleanSQL))]))
+	}
+	
+	// Check for forbidden keywords that could modify data
+	forbiddenKeywords := []string{
+		"INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
+		"TRUNCATE", "REPLACE", "MERGE", "GRANT", "REVOKE",
+		"EXECUTE", "EXEC", "CALL", "DO",
+	}
+	
+	for _, keyword := range forbiddenKeywords {
+		if containsKeyword(cleanSQL, keyword) {
+			return fmt.Errorf("forbidden keyword '%s' detected - only SELECT queries allowed", keyword)
+		}
+	}
+	
+	return nil
+}
+
+// removeCommentsAndNormalize removes SQL comments and normalizes whitespace
+func removeCommentsAndNormalize(sql string) string {
+	// Remove single-line comments (--)
+	lines := strings.Split(sql, "\n")
+	var cleaned []string
+	for _, line := range lines {
+		if idx := strings.Index(line, "--"); idx >= 0 {
+			line = line[:idx]
+		}
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	result := strings.Join(cleaned, " ")
+	
+	// Remove multi-line comments (/* */)
+	for {
+		start := strings.Index(result, "/*")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(result[start:], "*/")
+		if end == -1 {
+			break
+		}
+		result = result[:start] + " " + result[start+end+2:]
+	}
+	
+	// Normalize whitespace
+	return strings.TrimSpace(strings.Join(strings.Fields(result), " "))
+}
+
+// containsKeyword checks if SQL contains a keyword (word boundary aware)
+func containsKeyword(sql string, keyword string) bool {
+	upperSQL := strings.ToUpper(sql)
+	upperKeyword := strings.ToUpper(keyword)
+	
+	// Simple word boundary check
+	idx := strings.Index(upperSQL, upperKeyword)
+	for idx >= 0 {
+		// Check if it's a whole word (not part of another word)
+		start := idx
+		end := idx + len(upperKeyword)
+		
+		// Check character before (should be non-alphanumeric or start of string)
+		if start > 0 {
+			prevChar := upperSQL[start-1]
+			if (prevChar >= 'A' && prevChar <= 'Z') || (prevChar >= '0' && prevChar <= '9') || prevChar == '_' {
+				idx = strings.Index(upperSQL[end:], upperKeyword)
+				if idx >= 0 {
+					idx += end
+				}
+				continue
+			}
+		}
+		
+		// Check character after (should be non-alphanumeric or end of string)
+		if end < len(upperSQL) {
+			nextChar := upperSQL[end]
+			if (nextChar >= 'A' && nextChar <= 'Z') || (nextChar >= '0' && nextChar <= '9') || nextChar == '_' {
+				idx = strings.Index(upperSQL[end:], upperKeyword)
+				if idx >= 0 {
+					idx += end
+				}
+				continue
+			}
+		}
+		
+		return true // Found as whole word
+	}
+	
+	return false
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // resolveAliases recursively resolves alias definitions

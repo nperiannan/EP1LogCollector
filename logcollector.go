@@ -7535,6 +7535,9 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 
 	// Check if alias exists on AWS server using 'type' command as root user
 	// Database aliases are defined in root's .bashrc, so we need to run as root
+	// Note: Aliases are only expanded in interactive shells by default, so we need to:
+	//   1. Enable alias expansion with 'shopt -s expand_aliases'
+	//   2. Source .bashrc to load the aliases
 	session, err := awsClient.NewSession()
 	if err != nil {
 		logger.Debug("  Failed to create SSH session to check alias '%s': %v", alias, err)
@@ -7542,8 +7545,8 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 	}
 	defer session.Close()
 
-	// Use sudo su - to run as root (where aliases are defined)
-	checkCmd := fmt.Sprintf(`sudo su - -c "type %s"`, alias)
+	// Use sudo su - with explicit alias expansion and .bashrc sourcing
+	checkCmd := fmt.Sprintf(`sudo su - -c "shopt -s expand_aliases; source ~/.bashrc; type %s"`, alias)
 	logger.Debug("  Checking alias availability: %s", checkCmd)
 
 	output, err := session.CombinedOutput(checkCmd)
@@ -7949,9 +7952,12 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 	// Use alias name directly (it's a bash alias on the AWS server)
 	// Don't resolve it - the AWS environment already has these aliases defined
 	// Aliases are defined in root's .bashrc, so we need to run commands as root
+	// Note: Aliases are only expanded in interactive shells by default, so we need to:
+	//   1. Enable alias expansion with 'shopt -s expand_aliases'
+	//   2. Source .bashrc to load the aliases
 	//
 	// Shell quoting strategy:
-	//   sudo su - -c 'psqlplatdb -c "SELECT ... WHERE owner_id = '\''1096'\''" --csv'
+	//   sudo su - -c 'shopt -s expand_aliases; source ~/.bashrc; psqlplatdb -c "SELECT ..." --csv'
 	// We use single quotes for the outer command wrapper, so we need to:
 	//   1. Escape single quotes in SQL as '\'' (end quote, escaped quote, start quote)
 	//   2. Keep double quotes as-is (they work inside single quotes)
@@ -7962,8 +7968,8 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 	// Build the psql command with double quotes around SQL
 	psqlCommand := fmt.Sprintf(`%s -c "%s" --csv`, alias, escapedSQL)
 
-	// Wrap in sudo su - -c to run as root (where aliases are defined)
-	fullCommand := fmt.Sprintf(`sudo su - -c '%s'`, psqlCommand)
+	// Wrap in sudo su - -c with explicit alias expansion and .bashrc sourcing
+	fullCommand := fmt.Sprintf(`sudo su - -c 'shopt -s expand_aliases; source ~/.bashrc; %s'`, psqlCommand)
 
 	logger.Debug("      Executing on AWS server (as root): %s", psqlCommand)
 

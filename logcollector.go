@@ -1969,6 +1969,13 @@ func downloadFileFromAWS(awsClient *ssh.Client, remotePath, localPath string, au
 		// Use native SCP (default - much faster)
 		logger.Info("Step 2: Downloading from bastion to local via native SCP (%.2f MB)...", float64(fileSize)/(1024*1024))
 		err = downloadFromBastionWithSCP(connParams, bastionTempPath, localPath, fileSize, remoteFileName)
+		
+		// If SCP fails, fallback to parallel SFTP
+		if err != nil {
+			logger.Warn("Native SCP failed (%v), falling back to parallel SFTP...", err)
+			scpDownloadStartTime = time.Now() // Reset timer for SFTP attempt
+			err = downloadFromBastionParallel(connParams, bastionTempPath, localPath, fileSize, numChunks, remoteFileName)
+		}
 	}
 
 	if err != nil {
@@ -3514,7 +3521,7 @@ func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern stri
 			if !strings.HasPrefix(file, "/") {
 				file = logPath + file
 			}
-			
+
 			// Filter by pod name if matchPodName is enabled
 			if matchPodName {
 				basename := filepath.Base(file)
@@ -3524,7 +3531,7 @@ func listFilesInPod(awsClient *ssh.Client, namespace, pod, logPath, pattern stri
 					continue
 				}
 			}
-			
+
 			files = append(files, file)
 		}
 	}

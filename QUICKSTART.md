@@ -2,9 +2,9 @@
 
 A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
 
-## Latest Release: v1.2.1
+## Latest Release: v1.2.2
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.1)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.2)
 
 | Platform | Binary |
 |----------|--------|
@@ -13,7 +13,10 @@ A command-line tool to collect logs, system info, and application versions from 
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
 
-**What's New in v1.2.1:**
+**What's New in v1.2.2:**
+- **Automatic SFTP fallback** - When SCP fails (DNS resolution, network issues), automatically falls back to parallel SFTP for reliable downloads
+
+**v1.2.1 Features:**
 - **Pod file filtering** - New `matchPodName` option collects only current pod logs, excluding old pod logs in persistent directories
 
 **v1.2.0 Features:**

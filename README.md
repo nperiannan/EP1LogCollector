@@ -4,9 +4,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 
 ## Download
 
-**Latest Release: v1.2.1**
+**Latest Release: v1.2.2**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.1)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.2)
 
 | Platform | Binary |
 |----------|--------|
@@ -14,6 +14,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**v1.2.2 Changes:**
+- Automatic SFTP fallback when SCP fails (DNS resolution, network issues, etc.)
 
 **v1.2.1 Changes:**
 - Pod file collection: `matchPodName` option to filter logs by current pod name (excludes old pod logs)

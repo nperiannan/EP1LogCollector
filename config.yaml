@@ -6,8 +6,8 @@ environment: dl2r1
 bastion:
   host: usnc-awsgtwy-02.extremenetworks.com
   port: 22
-  password: ""                   # Leave empty - tool will prompt and encrypt
-  # keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
+  password: ""
+  keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
 
 # AWS Server Configuration
 aws:
@@ -29,7 +29,7 @@ options:
 
 # Kubernetes Log Collection Settings
 logCollection:
-  enabled: false                     # Enable/disable log collection
+  enabled: true                     # Enable/disable log collection
   logFileName: app_log
   tempDir: "{environment}_{username}_templogs"
   useTimestamp: true
@@ -55,7 +55,7 @@ logCollection:
     namespace: "configuration"      # Temporal namespace to query
   # Log analysis and error detection
   logAnalysis:
-    enabled: false                  # Enable automatic log analysis for errors/issues
+    enabled: true                  # Enable automatic log analysis for errors/issues
     outputFile: "log_analysis_summary.txt"  # Output file name for analysis results
     errorPatterns:                  # Patterns to search for in collected logs (case-insensitive)
       - "error"
@@ -78,7 +78,7 @@ logCollection:
       - "\"level\":\"debug\""
       - "error_count=0"
       - "errors=0"
-    maxMatches: 20                  # Maximum matches per log file to include in summary
+    maxMatches: 99                  # Maximum matches per log file to include in summary
     contextLines: 2                 # Number of lines before/after each match to include
     # Transaction/Correlation ID tracking for cross-file correlation
     correlationKeys:                # Extract correlation IDs to group related errors across files
@@ -130,7 +130,7 @@ logCollection:
         severity: "HIGH"
   # Post-download message filtering (creates filtered copies in filter/ directory)
   messageFilter:
-    enabled: false                  # Enable/disable message filtering
+    enabled: true                   # Enable/disable message filtering
     keyValueFilters:                # Keep lines where key is absent OR key has matching value
       - key: "ownerID"
         value: "1096"
@@ -220,7 +220,6 @@ jira:
   apiToken: ""                            # Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
   attachmentEnabled: true                 # Enable/disable automatic file attachment to JIRA issues
   baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance base URL
-  # 
   # Usage: Run with --jira flag to attach downloaded files to a JIRA issue
   # Example: ./fetchlogs --all --jira XCP-17614
   # 
@@ -381,7 +380,7 @@ deviceLogCollection:
 
     - name: "Man-flo-0035"
       type: "voss"
-      enabled: true
+      enabled: false
       ipAddress: "10.139.121.231"
       port: 22
       username: "rwa"

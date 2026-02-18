@@ -7474,9 +7474,10 @@ func main() {
 			logger.Error("Device log collection failed: %v", err)
 		}
 
-		// Move logger_info.txt directly into the Device_timestamp directory
+		// Copy logger_info.txt to the Device_timestamp directory and remove from PWD
+		// Use CopyLogFileTo which explicitly deletes the original after copying
 		if dlcOutDir != "" {
-			logger.MoveLogFileTo(dlcOutDir)
+			logger.CopyLogFileTo(dlcOutDir, config.archiveTimestamp)
 		}
 
 		// Attach device log files to JIRA if requested

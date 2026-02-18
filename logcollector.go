@@ -646,11 +646,9 @@ type DeviceLogCollection struct {
 
 // DatabaseQuery represents a single SQL query to execute
 type DatabaseQuery struct {
-	Name            string   `yaml:"name"`            // Query name
-	SQL             string   `yaml:"sql"`             // SQL query with parameter placeholders
-	Parameters      []string `yaml:"parameters"`      // Parameter names required for this query
-	DependsOn       string   `yaml:"dependsOn"`       // Name of query this depends on
-	ReferenceColumn string   `yaml:"referenceColumn"` // Column from dependent query to use as parameter
+	Name       string   `yaml:"name"`       // Query name
+	SQL        string   `yaml:"sql"`        // SQL query with parameter placeholders like {param_name}
+	Parameters []string `yaml:"parameters"` // Column names to extract FROM results and add TO global parameters
 }
 
 // DatabaseConfig represents configuration for a single database
@@ -663,12 +661,12 @@ type DatabaseConfig struct {
 
 // DatabaseCollection contains configuration for database query collection
 type DatabaseCollection struct {
-	Enabled      bool                       `yaml:"enabled"`      // Master enable/disable
-	OutputDir    string                     `yaml:"outputDir"`    // Output directory for query results
-	Parameters   map[string]string          `yaml:"parameters"`   // Global parameters (serial_number, owner_id)
-	QueryTimeout int                        `yaml:"queryTimeout"` // Query timeout in seconds
-	Aliases      map[string]string          `yaml:"aliases"`      // Database aliases map
-	Databases    []DatabaseConfig           `yaml:"databases"`    // List of databases with queries
+	Enabled      bool              `yaml:"enabled"`      // Master enable/disable
+	OutputDir    string            `yaml:"outputDir"`    // Output directory for query results
+	Parameters   map[string]string `yaml:"parameters"`   // Global parameters (serial_number, owner_id)
+	QueryTimeout int               `yaml:"queryTimeout"` // Query timeout in seconds
+	Aliases      map[string]string `yaml:"aliases"`      // Database aliases map
+	Databases    []DatabaseConfig  `yaml:"databases"`    // List of databases with queries
 }
 
 // Configuration structure for the application
@@ -7205,11 +7203,6 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 		return "", nil
 	}
 
-	// Check if required parameters are provided
-	if dbc.Parameters["serial_number"] == "" && dbc.Parameters["owner_id"] == "" {
-		logger.Warn("No parameters provided (serial_number, owner_id). Database queries may require parameters")
-	}
-
 	// Determine timestamp
 	if timestamp == "" {
 		timestamp = time.Now().Format("20060102_150405")
@@ -7231,15 +7224,40 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 		}
 	}
 
+	// Parse global parameters (support comma-separated values)
+	globalParams := make(map[string][]string)
+	for key, value := range dbc.Parameters {
+		if value != "" {
+			// Split by comma and trim whitespace
+			parts := strings.Split(value, ",")
+			values := []string{}
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					values = append(values, trimmed)
+				}
+			}
+			if len(values) > 0 {
+				globalParams[key] = values
+			}
+		}
+	}
+
 	logger.Info("========================================")
 	logger.Info("Database Query Collection")
 	logger.Info("Enabled databases: %d of %d", len(enabledDBs), len(dbc.Databases))
 	logger.Info("Output directory: %s", dbOutputDir)
-	if dbc.Parameters["serial_number"] != "" {
-		logger.Info("Serial Number: %s", dbc.Parameters["serial_number"])
-	}
-	if dbc.Parameters["owner_id"] != "" {
-		logger.Info("Owner ID: %s", dbc.Parameters["owner_id"])
+	
+	// Log global parameters
+	if len(globalParams) > 0 {
+		logger.Info("Global Parameters:")
+		for key, values := range globalParams {
+			if len(values) == 1 {
+				logger.Info("  %s: %s", key, values[0])
+			} else {
+				logger.Info("  %s: %s (%d values)", key, strings.Join(values, ", "), len(values))
+			}
+		}
 	}
 	logger.Info("========================================")
 
@@ -7252,8 +7270,8 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 	for _, db := range enabledDBs {
 		logger.Info("")
 		logger.Info("Processing database: %s (alias: %s)", db.Name, db.Alias)
-		
-		if err := executeDatabaseQueries(db, dbc, dbOutputDir, timestamp, logger); err != nil {
+
+		if err := executeDatabaseQueries(db, dbc, globalParams, dbOutputDir, timestamp, logger); err != nil {
 			logger.Error("Failed to execute queries for database %s: %v", db.Name, err)
 		}
 	}
@@ -7263,12 +7281,12 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 	logger.Info("Database query collection complete!")
 	logger.Info("Output directory: %s", dbOutputDir)
 	logger.Info("========================================")
-	
+
 	return dbOutputDir, nil
 }
 
-// executeDatabaseQueries executes all queries for a single database
-func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, outputDir string, timestamp string, logger *Logger) error {
+// executeDatabaseQueries executes all queries for a single database with automatic parameter resolution
+func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, globalParams map[string][]string, outputDir string, timestamp string, logger *Logger) error {
 	// Create database-specific output file
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_queries_%s.txt", db.Name, timestamp))
 	f, err := os.Create(outputFile)
@@ -7281,108 +7299,202 @@ func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, outputDir
 	header := fmt.Sprintf("# Database Query Results: %s\n", db.Name)
 	header += fmt.Sprintf("# Timestamp: %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	header += fmt.Sprintf("# Alias: %s\n", db.Alias)
-	if dbc.Parameters["serial_number"] != "" {
-		header += fmt.Sprintf("# Serial Number: %s\n", dbc.Parameters["serial_number"])
-	}
-	if dbc.Parameters["owner_id"] != "" {
-		header += fmt.Sprintf("# Owner ID: %s\n", dbc.Parameters["owner_id"])
-	}
 	header += strings.Repeat("=", 80) + "\n\n"
 	f.WriteString(header)
 
-	// Track query results for dependency resolution
-	queryResults := make(map[string][][]string) // queryName -> rows (each row is []string)
+	// Track completed queries and their results
+	completedQueries := make(map[string]bool)
+	queryResults := make(map[string][][]string)
 
-	// Execute queries in order (respecting dependencies)
-	for _, query := range db.Queries {
-		logger.Info("  Executing query: %s", query.Name)
-		
-		// Resolve parameters
-		paramValues := make(map[string][]string)
-		
-		// Check if this query depends on a previous query
-		if query.DependsOn != "" {
-			if query.ReferenceColumn == "" {
-				logger.Error("    Query '%s' depends on '%s' but no referenceColumn specified", query.Name, query.DependsOn)
+	// Execute queries (with automatic ordering based on parameter availability)
+	remainingQueries := append([]DatabaseQuery{}, db.Queries...) // Copy slice
+	maxAttempts := len(db.Queries) * 2 // Prevent infinite loops
+	attempts := 0
+
+	for len(remainingQueries) > 0 && attempts < maxAttempts {
+		attempts++
+		progressMade := false
+
+		for i := 0; i < len(remainingQueries); {
+			query := remainingQueries[i]
+			
+			// Extract required parameters from SQL
+			requiredParams := extractParametersFromSQL(query.SQL)
+			
+			// Check if all required parameters are available
+			canExecute, missingParams := checkParameterAvailability(requiredParams, globalParams, db.Name)
+			
+			if !canExecute {
+				logger.Debug("  Query '%s' deferred - missing parameters: %v", query.Name, missingParams)
+				i++ // Keep in remaining queue
 				continue
 			}
+
+			// Execute query
+			logger.Info("  Executing query: %s", query.Name)
+			results, err := executeQueryWithGlobalParams(db.Alias, query, globalParams, db.Name, dbc, logger)
 			
-			// Get results from dependent query
-			dependentResults, ok := queryResults[query.DependsOn]
-			if !ok {
-				logger.Error("    Query '%s' depends on '%s' which hasn't been executed yet", query.Name, query.DependsOn)
+			if err != nil {
+				logger.Error("    Failed: %v", err)
+				f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
+				f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
+				f.WriteString(fmt.Sprintf("Status: FAILED\n"))
+				f.WriteString(fmt.Sprintf("Error: %v\n\n", err))
+				
+				// Remove from queue (don't retry failed queries)
+				remainingQueries = append(remainingQueries[:i], remainingQueries[i+1:]...)
 				continue
 			}
-			
-			if len(dependentResults) == 0 {
-				logger.Warn("    Query '%s' depends on '%s' but it returned no results", query.Name, query.DependsOn)
-				continue
-			}
-			
-			// Extract reference column values from dependent query results
-			refValues := extractColumnValues(dependentResults, query.ReferenceColumn)
-			if len(refValues) == 0 {
-				logger.Warn("    Column '%s' not found in query '%s' results", query.ReferenceColumn, query.DependsOn)
-				continue
-			}
-			
-			paramValues[query.ReferenceColumn] = refValues
-			logger.Debug("    Found %d value(s) for parameter '%s' from query '%s'", len(refValues), query.ReferenceColumn, query.DependsOn)
-		}
-		
-		// Add global parameters
-		for _, paramName := range query.Parameters {
-			if paramValue, ok := dbc.Parameters[paramName]; ok && paramValue != "" {
-				paramValues[paramName] = []string{paramValue}
-			}
-		}
-		
-		// Execute query (possibly multiple times for multi-value parameters)
-		results, err := executeQueryWithParams(db.Alias, query, paramValues, dbc, logger)
-		if err != nil {
-			logger.Error("    Failed to execute query '%s': %v", query.Name, err)
+
+			// Store results
+			queryResults[query.Name] = results
+			completedQueries[query.Name] = true
+			progressMade = true
+
+			// Write results to file
 			f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
-			f.WriteString(fmt.Sprintf("Status: FAILED\n"))
-			f.WriteString(fmt.Sprintf("Error: %v\n\n", err))
-			continue
-		}
-		
-		// Store results for dependency resolution
-		queryResults[query.Name] = results
-		
-		// Write results to file
-		f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
-		f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
-		f.WriteString(fmt.Sprintf("Status: SUCCESS\n"))
-		f.WriteString(fmt.Sprintf("Rows returned: %d\n", len(results)))
-		f.WriteString(strings.Repeat("-", 80) + "\n")
-		
-		if len(results) > 0 {
-			// Write results in table format
-			for i, row := range results {
-				if i == 0 {
-					// Header row
-					f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
-					f.WriteString(strings.Repeat("-", 80) + "\n")
-				} else {
-					f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
+			f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
+			f.WriteString(fmt.Sprintf("Status: SUCCESS\n"))
+			f.WriteString(fmt.Sprintf("Rows returned: %d\n", len(results)-1)) // -1 for header
+			f.WriteString(strings.Repeat("-", 80) + "\n")
+
+			if len(results) > 0 {
+				// Write results in table format
+				for rowIdx, row := range results {
+					if rowIdx == 0 {
+						// Header row
+						f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
+					} else {
+						// Data row
+						f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
+					}
+				}
+			} else {
+				f.WriteString("No results found.\n")
+			}
+			f.WriteString("\n\n")
+
+			logger.Info("    Query completed: %d row(s) returned", len(results)-1)
+
+			// Extract parameters from results if specified
+			if len(query.Parameters) > 0 && len(results) > 1 {
+				extractedValues := extractParametersFromResults(results, query.Parameters)
+				
+				// Add extracted parameters to global params with namespace
+				for paramName, values := range extractedValues {
+					namespacedKey := fmt.Sprintf("%s.%s", db.Name, paramName)
+					globalParams[namespacedKey] = values
+					
+					// Also add without namespace if not already exists (for convenience)
+					if _, exists := globalParams[paramName]; !exists {
+						globalParams[paramName] = values
+					}
+					
+					if len(values) == 1 {
+						logger.Info("    Extracted parameter: %s = %s", namespacedKey, values[0])
+					} else {
+						logger.Info("    Extracted parameter: %s = %s (%d values)", namespacedKey, strings.Join(values, ", "), len(values))
+					}
 				}
 			}
-		} else {
-			f.WriteString("No results found.\n")
+
+			// Remove from remaining queue
+			remainingQueries = append(remainingQueries[:i], remainingQueries[i+1:]...)
 		}
-		f.WriteString("\n\n")
-		
-		logger.Info("    Query completed: %d row(s) returned", len(results)-1) // -1 for header row
+
+		// If no progress was made, we have circular dependencies or missing data
+		if !progressMade {
+			logger.Warn("  Unable to execute %d remaining queries - missing required parameters", len(remainingQueries))
+			for _, query := range remainingQueries {
+				requiredParams := extractParametersFromSQL(query.SQL)
+				_, missingParams := checkParameterAvailability(requiredParams, globalParams, db.Name)
+				logger.Warn("    Query '%s' requires: %v", query.Name, missingParams)
+			}
+			break
+		}
 	}
 
 	logger.Info("  Results saved to: %s", filepath.Base(outputFile))
 	return nil
 }
 
-// executeQueryWithParams executes a SQL query with parameter substitution
-func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
-	// Find parameter with multiple values (dependency case)
+// extractParametersFromSQL finds all {parameter} placeholders in SQL
+func extractParametersFromSQL(sql string) []string {
+	var params []string
+	re := regexp.MustCompile(`\{([a-zA-Z0-9_.]+)\}`)
+	matches := re.FindAllStringSubmatch(sql, -1)
+	for _, match := range matches {
+		if len(match) > 1 {
+			params = append(params, match[1])
+		}
+	}
+	return params
+}
+
+// checkParameterAvailability checks if all required parameters are available in globalParams
+func checkParameterAvailability(requiredParams []string, globalParams map[string][]string, dbName string) (bool, []string) {
+	var missing []string
+	
+	for _, param := range requiredParams {
+		// Try exact match first
+		if values, ok := globalParams[param]; ok && len(values) > 0 {
+			continue
+		}
+		
+		// Try with current database namespace
+		namespacedParam := fmt.Sprintf("%s.%s", dbName, param)
+		if values, ok := globalParams[namespacedParam]; ok && len(values) > 0 {
+			continue
+		}
+		
+		// Try to find it in any other database namespace
+		found := false
+		for key, values := range globalParams {
+			if strings.HasSuffix(key, "."+param) && len(values) > 0 {
+				found = true
+				break
+			}
+		}
+		
+		if !found {
+			missing = append(missing, param)
+		}
+	}
+	
+	return len(missing) == 0, missing
+}
+
+// executeQueryWithGlobalParams executes a query with parameter substitution from globalParams
+func executeQueryWithGlobalParams(alias string, query DatabaseQuery, globalParams map[string][]string, dbName string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+	// Extract required parameters from SQL
+	requiredParams := extractParametersFromSQL(query.SQL)
+	
+	// Build parameter values map (resolve from globalParams)
+	paramValues := make(map[string][]string)
+	for _, param := range requiredParams {
+		// Try exact match first
+		if values, ok := globalParams[param]; ok && len(values) > 0 {
+			paramValues[param] = values
+			continue
+		}
+		
+		// Try with current database namespace
+		namespacedParam := fmt.Sprintf("%s.%s", dbName, param)
+		if values, ok := globalParams[namespacedParam]; ok && len(values) > 0 {
+			paramValues[param] = values
+			continue
+		}
+		
+		// Try to find it in any other database namespace
+		for key, values := range globalParams {
+			if strings.HasSuffix(key, "."+param) && len(values) > 0 {
+				paramValues[param] = values
+				break
+			}
+		}
+	}
+	
+	// Find parameter with multiple values
 	var multiValueParam string
 	var multiValues []string
 	for param, values := range paramValues {
@@ -7395,10 +7507,10 @@ func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[s
 	
 	// If we have a multi-value parameter, execute query for each value
 	if multiValueParam != "" {
-		logger.Debug("      Executing query %d times for each value of '%s'", len(multiValues), multiValueParam)
+		logger.Debug("      Executing query %d times (one per value of '%s')", len(multiValues), multiValueParam)
 		var allResults [][]string
 		var headerAdded bool
-		
+
 		for _, value := range multiValues {
 			// Create parameter map with this single value
 			singleParams := make(map[string][]string)
@@ -7409,13 +7521,13 @@ func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[s
 					singleParams[k] = v
 				}
 			}
-			
+
 			results, err := executeSingleQuery(alias, query.SQL, singleParams, dbc, logger)
 			if err != nil {
 				logger.Warn("      Failed for %s=%s: %v", multiValueParam, value, err)
 				continue
 			}
-			
+
 			if len(results) > 0 {
 				if !headerAdded {
 					allResults = append(allResults, results[0]) // Add header
@@ -7426,10 +7538,107 @@ func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[s
 				}
 			}
 		}
-		
+
 		return allResults, nil
 	}
+
+	// Single execution
+	return executeSingleQuery(alias, query.SQL, paramValues, dbc, logger)
+}
+
+// extractParametersFromResults extracts specified column values from query results
+func extractParametersFromResults(results [][]string, paramNames []string) map[string][]string {
+	extracted := make(map[string][]string)
 	
+	if len(results) < 2 { // Need at least header + 1 data row
+		return extracted
+	}
+	
+	header := results[0]
+	
+	for _, paramName := range paramNames {
+		// Find column index
+		columnIndex := -1
+		for i, col := range header {
+			if strings.EqualFold(col, paramName) {
+				columnIndex = i
+				break
+			}
+		}
+		
+		if columnIndex == -1 {
+			continue // Column not found
+		}
+		
+		// Extract values from all data rows
+		values := []string{}
+		for i := 1; i < len(results); i++ {
+			if columnIndex < len(results[i]) {
+				value := strings.TrimSpace(results[i][columnIndex])
+				if value != "" {
+					values = append(values, value)
+				}
+			}
+		}
+		
+		if len(values) > 0 {
+			extracted[paramName] = values
+		}
+	}
+	
+	return extracted
+}
+
+// executeQueryWithParams executes a SQL query with parameter substitution (deprecated - keeping for compatibility)
+func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+	// Find parameter with multiple values (dependency case)
+	var multiValueParam string
+	var multiValues []string
+	for param, values := range paramValues {
+		if len(values) > 1 {
+			multiValueParam = param
+			multiValues = values
+			break
+		}
+	}
+
+	// If we have a multi-value parameter, execute query for each value
+	if multiValueParam != "" {
+		logger.Debug("      Executing query %d times for each value of '%s'", len(multiValues), multiValueParam)
+		var allResults [][]string
+		var headerAdded bool
+
+		for _, value := range multiValues {
+			// Create parameter map with this single value
+			singleParams := make(map[string][]string)
+			for k, v := range paramValues {
+				if k == multiValueParam {
+					singleParams[k] = []string{value}
+				} else {
+					singleParams[k] = v
+				}
+			}
+
+			results, err := executeSingleQuery(alias, query.SQL, singleParams, dbc, logger)
+			if err != nil {
+				logger.Warn("      Failed for %s=%s: %v", multiValueParam, value, err)
+				continue
+			}
+
+			if len(results) > 0 {
+				if !headerAdded {
+					allResults = append(allResults, results[0]) // Add header
+					headerAdded = true
+				}
+				if len(results) > 1 {
+					allResults = append(allResults, results[1:]...) // Add data rows
+				}
+			}
+		}
+
+		return allResults, nil
+	}
+
 	// Single execution
 	return executeSingleQuery(alias, query.SQL, paramValues, dbc, logger)
 }
@@ -7444,43 +7653,43 @@ func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string
 			sql = strings.ReplaceAll(sql, placeholder, values[0])
 		}
 	}
-	
+
 	// Check for unsubstituted parameters
 	if strings.Contains(sql, "{") && strings.Contains(sql, "}") {
 		return nil, fmt.Errorf("query contains unsubstituted parameters: %s", sql)
 	}
-	
+
 	// Build psql command using alias
 	aliasCmd, ok := dbc.Aliases[alias]
 	if !ok {
 		return nil, fmt.Errorf("alias '%s' not found in config", alias)
 	}
-	
+
 	// Expand nested aliases (e.g., psqlassetsdb uses psqlrds)
 	resolvedCmd := resolveAliases(aliasCmd, dbc.Aliases)
-	
+
 	// Build full command: resolved_alias -c "SQL" --csv
 	cmdParts := strings.Fields(resolvedCmd)
 	cmdParts = append(cmdParts, "-c", sql, "--csv")
-	
+
 	logger.Debug("      Executing: %s", strings.Join(cmdParts, " "))
-	
+
 	// Execute command with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(dbc.QueryTimeout)*time.Second)
 	defer cancel()
-	
+
 	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("%v: %s", err, string(output))
 	}
-	
+
 	// Parse CSV output
 	results, err := parseCSV(string(output))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse query results: %v", err)
 	}
-	
+
 	return results, nil
 }
 
@@ -7491,7 +7700,7 @@ func resolveAliases(command string, aliases map[string]string) string {
 	if len(parts) == 0 {
 		return command
 	}
-	
+
 	firstWord := parts[0]
 	if replacement, ok := aliases[firstWord]; ok {
 		// Replace the alias with its definition and keep the rest
@@ -7502,7 +7711,7 @@ func resolveAliases(command string, aliases map[string]string) string {
 		// Recursively resolve in case the replacement contains more aliases
 		return resolveAliases(resolved, aliases)
 	}
-	
+
 	return command
 }
 
@@ -7510,13 +7719,13 @@ func resolveAliases(command string, aliases map[string]string) string {
 func parseCSV(csvData string) ([][]string, error) {
 	var results [][]string
 	lines := strings.Split(csvData, "\n")
-	
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		
+
 		// Simple CSV parsing (handles basic cases)
 		fields := strings.Split(line, ",")
 		for i, field := range fields {
@@ -7524,7 +7733,7 @@ func parseCSV(csvData string) ([][]string, error) {
 		}
 		results = append(results, fields)
 	}
-	
+
 	return results, nil
 }
 
@@ -7533,7 +7742,7 @@ func extractColumnValues(results [][]string, columnName string) []string {
 	if len(results) == 0 {
 		return nil
 	}
-	
+
 	// Find column index from header row
 	header := results[0]
 	columnIndex := -1
@@ -7543,11 +7752,11 @@ func extractColumnValues(results [][]string, columnName string) []string {
 			break
 		}
 	}
-	
+
 	if columnIndex == -1 {
 		return nil
 	}
-	
+
 	// Extract values from data rows
 	var values []string
 	for i := 1; i < len(results); i++ {
@@ -7558,7 +7767,7 @@ func extractColumnValues(results [][]string, columnName string) []string {
 			}
 		}
 	}
-	
+
 	return values
 }
 

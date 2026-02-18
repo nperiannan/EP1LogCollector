@@ -265,7 +265,7 @@ databaseCollection:
   # Global parameters that can be used in SQL queries
   parameters:
     serial_number: ""               # Device serial number (e.g., "12345678")
-    owner_id: ""                    # Owner/tenant ID (e.g., "1096")
+    owner_id: "1096"                    # Owner/tenant ID (e.g., "1096")
   
   # Connection and query timeouts
   queryTimeout: 60                  # Query execution timeout in seconds
@@ -288,53 +288,110 @@ databaseCollection:
     psqlsystemdb: "psqlrds -U systemuser -d systemdb"
     psqltemporaldb: "psqlrds -U temporaluser temporaldb"
   
-  # Database queries
+  # Database queries with automatic cross-database parameter sharing
   databases:
     # Assets Database
     - name: "assetsdb"
       alias: "psqlassetsdb"
-      enabled: true
+      enabled: false
       queries:
         - name: "get_device_by_serial"
           sql: "SELECT asset_device_id, serial_number, owner_id, device_name, mac_address FROM devices WHERE serial_number = '{serial_number}'"
-          parameters: ["serial_number"]
+          parameters: ["asset_device_id"]  # Extract asset_device_id from results and add to global parameters
         - name: "get_device_history"
           sql: "SELECT * FROM device_history WHERE asset_device_id = '{asset_device_id}' ORDER BY created_at DESC LIMIT 20"
-          dependsOn: "get_device_by_serial"
-          referenceColumn: "asset_device_id"
+          # Uses asset_device_id extracted from previous query (automatic dependency resolution)
     
     # Config Database
     - name: "configdb_1"
       alias: "psqlconfigdb_1"
-      enabled: true
+      enabled: false
       queries:
         - name: "get_device_config"
           sql: "SELECT config_id, device_id, serial_number, config_data FROM device_configs WHERE serial_number = '{serial_number}'"
-          parameters: ["serial_number"]
+          parameters: ["config_id"]  # Extract config_id from results
         - name: "get_config_history"
           sql: "SELECT * FROM config_history WHERE config_id = '{config_id}' ORDER BY updated_at DESC LIMIT 10"
-          dependsOn: "get_device_config"
-          referenceColumn: "config_id"
+          # Uses config_id extracted from previous query
     
     # Platform Common Database
     - name: "platform_common_db"
       alias: "psqlplatdb"
       enabled: true
       queries:
-        - name: "get_tenant_info"
-          sql: "SELECT tenant_id, tenant_name, owner_id, status FROM tenants WHERE owner_id = '{owner_id}'"
-          parameters: ["owner_id"]
-        - name: "get_platform_events"
-          sql: "SELECT * FROM platform_events WHERE tenant_id = '{tenant_id}' ORDER BY event_time DESC LIMIT 50"
-          dependsOn: "get_tenant_info"
-          referenceColumn: "tenant_id"
+        - name: "get_asset_devices_by_owner"
+          sql: "SELECT serial_number, created_at, initial_collection_done, asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'"
+          parameters: ["asset_device_id", "serial_number"]  # Extract multiple columns from results
+        - name: "get_inferred_device_info"
+          sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{asset_device_id}'"
+          # Uses asset_device_id from previous query
   
-  # Query Execution Notes:
-  # - Queries use the database alias to execute (e.g., psqlassetsdb -c "SELECT ...")
-  # - Parameters like {serial_number} and {owner_id} come from databaseCollection.parameters
-  # - Dependent queries use {column_name} from previous query results
-  # - If reference column has multiple rows, query executes once per row value
-  # - Each database's output is saved to a separate file in outputDir
+  # Query Execution Features (v1.3.3 build #21):
+  # 
+  # 1. MULTI-VALUE PARAMETERS (CSV support):
+  #    Configure multiple values separated by commas in parameters:
+  #      parameters:
+  #        owner_id: "1096, 2345, 3456"
+  #        serial_number: "SN001, SN002, SN003"
+  #    Query automatically executes N times (once per value), results aggregated.
+  # 
+  # 2. PARAMETER EXTRACTION (cross-database sharing):
+  #    Extract column values from query results and add to global parameters:
+  #      queries:
+  #        - name: "query1"
+  #          sql: "SELECT asset_device_id, owner_id FROM devices WHERE ..."
+  #          parameters: ["asset_device_id", "owner_id"]  # Extract these columns
+  #    Creates: platform_common_db.asset_device_id, platform_common_db.owner_id
+  #    Also creates fallback: asset_device_id, owner_id (if not already defined)
+  # 
+  # 3. CROSS-DATABASE PARAMETER USAGE:
+  #    Parameters extracted by one database can be used by other databases:
+  #      Database 1 (platform_common_db):
+  #        - Extract: asset_device_id = [12345, 67890]
+  #      Database 2 (assetsdb):
+  #        - Use: sql: "SELECT * FROM devices WHERE asset_device_id = '{asset_device_id}'"
+  #      Database 3 (configdb_1):
+  #        - Use: sql: "SELECT * FROM configs WHERE asset_device_id = '{asset_device_id}'"
+  # 
+  # 4. NAMESPACE COLLISION PREVENTION:
+  #    Parameters are namespaced by database name to prevent collisions:
+  #      - platform_common_db.asset_device_id (with namespace)
+  #      - asset_device_id (without namespace, fallback)
+  #    Use in SQL: {asset_device_id} or {platform_common_db.asset_device_id}
+  # 
+  # 5. AUTOMATIC DEPENDENCY RESOLUTION:
+  #    No manual dependsOn/referenceColumn needed!
+  #    Code automatically:
+  #      - Detects required parameters from SQL: {param_name}
+  #      - Defers queries missing parameters
+  #      - Executes queries when parameters become available
+  #      - Detects circular dependencies
+  # 
+  # 6. THREE-TIER PARAMETER LOOKUP:
+  #    When resolving {param_name}, code tries:
+  #      1. Exact match: globalParams["param_name"]
+  #      2. Current DB namespace: globalParams["current_db.param_name"]
+  #      3. Any DB namespace: Search for "*.param_name" pattern
+  # 
+  # Example Usage:
+  #   parameters:
+  #     owner_id: "1096, 2345"  # 2 owners
+  #   
+  #   databases:
+  #     - name: "platform_common_db"
+  #       queries:
+  #         - sql: "SELECT asset_device_id FROM asset_device WHERE owner_id = '{owner_id}' LIMIT 5"
+  #           parameters: ["asset_device_id"]
+  #           # Executes 2 times (owner_id=1096, owner_id=2345)
+  #           # Returns 10 devices total
+  #           # Extracts: platform_common_db.asset_device_id = [10 values]
+  #     
+  #     - name: "assetsdb"
+  #       queries:
+  #         - sql: "SELECT * FROM devices WHERE asset_device_id = '{asset_device_id}'"
+  #           # Uses asset_device_id from platform_common_db
+  #           # Executes 10 times (once per device)
+  #           # Results aggregated automatically
 
 # JIRA Integration Settings
 jira:

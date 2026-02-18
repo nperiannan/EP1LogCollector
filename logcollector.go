@@ -90,13 +90,24 @@ type Logger struct {
 	logFile  *os.File
 }
 
-// NewLogger creates a new logger instance with the specified minimum log level
-func NewLogger(minLevel LogLevel) *Logger {
+// NewLogger creates a new logger instance with the specified minimum log level.
+// If outputDir is empty, creates logger_info.txt in PWD.
+// If outputDir is provided, creates logger_info.txt in that directory.
+func NewLogger(minLevel LogLevel, outputDir string) *Logger {
 	l := &Logger{minLevel: minLevel}
+	
+	// Determine log file path
+	var logFilePath string
+	if outputDir != "" {
+		logFilePath = filepath.Join(outputDir, "logger_info.txt")
+	} else {
+		logFilePath = "logger_info.txt"
+	}
+	
 	// Create log file for capturing all output
-	f, err := os.OpenFile("logger_info.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		fmt.Printf("Warning: Could not create logger_info.txt: %v\n", err)
+		fmt.Printf("Warning: Could not create %s: %v\n", logFilePath, err)
 	} else {
 		l.logFile = f
 		// Write header
@@ -7254,13 +7265,37 @@ func main() {
 		collectDeviceLogs = config.DeviceLogCollection.Enabled
 	}
 
-	// Initialize the global logger with the log level setting
-	logLevelEnum := ParseLogLevel(*logLevel)
-	logger = NewLogger(logLevelEnum)
-	defer logger.Close()
-
 	// Initialize archiveTimestamp early so it's available for template replacement in outputDir
 	config.archiveTimestamp = time.Now().Format("20060102_150405")
+
+	// Determine logger output directory based on mode
+	var loggerOutputDir string
+	if selectedMode == "device-logs" {
+		// For device-logs mode, calculate output directory path (must match processDeviceLogCollection logic)
+		deviceLogFolderName := fmt.Sprintf("Device_%s", config.archiveTimestamp)
+		if *outputDir != "" {
+			// Command-line outputDir takes precedence
+			loggerOutputDir = filepath.Join(*outputDir, deviceLogFolderName)
+		} else {
+			// Standalone mode: use config outputDir or current directory
+			baseDir := config.DeviceLogCollection.OutputDir
+			if baseDir == "" {
+				baseDir = "."
+			}
+			loggerOutputDir = filepath.Join(baseDir, deviceLogFolderName)
+		}
+		// Create directory if it doesn't exist
+		if err := os.MkdirAll(loggerOutputDir, 0755); err != nil {
+			fmt.Printf("Warning: Could not create output directory %s: %v\n", loggerOutputDir, err)
+			loggerOutputDir = "" // Fall back to PWD
+		}
+	}
+	// For other modes, logger stays in PWD (will be moved later with archive)
+
+	// Initialize the global logger with the log level setting
+	logLevelEnum := ParseLogLevel(*logLevel)
+	logger = NewLogger(logLevelEnum, loggerOutputDir)
+	defer logger.Close()
 
 	// Log the selected operation mode
 	logger.Debug("Selected operation mode: %s", selectedMode)
@@ -7469,16 +7504,13 @@ func main() {
 			return
 		}
 
-		dlcOutDir, err := processDeviceLogCollection(*config, *outputDir, "", logger)
+		// Logger is already created in the correct directory,
+		// so we pass config.archiveTimestamp to reuse the same directory
+		dlcOutDir, err := processDeviceLogCollection(*config, *outputDir, config.archiveTimestamp, logger)
 		if err != nil {
 			logger.Error("Device log collection failed: %v", err)
 		}
-
-		// Copy logger_info.txt to the Device_timestamp directory and remove from PWD
-		// Use CopyLogFileTo which explicitly deletes the original after copying
-		if dlcOutDir != "" {
-			logger.CopyLogFileTo(dlcOutDir, config.archiveTimestamp)
-		}
+		// No need to move/copy logger_info.txt - it's already in the right place!
 
 		// Attach device log files to JIRA if requested
 		if *jiraIssueID != "" && dlcOutDir != "" {

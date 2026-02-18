@@ -667,13 +667,13 @@ type Config struct {
 			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
 		} `yaml:"temporalScheduleCollection"`
 		LogAnalysis struct {
-			Enabled          bool     `yaml:"enabled"`          // Enable automatic log analysis
-			OutputFile       string   `yaml:"outputFile"`       // Output file name for analysis report
-			ErrorPatterns    []string `yaml:"errorPatterns"`    // Patterns to search for (case-insensitive)
-			ExcludeKeywords  []string `yaml:"excludeKeywords"`  // Keywords to exclude from matches (case-insensitive)
-			MaxMatches       int      `yaml:"maxMatches"`       // Max matches per log file
-			ContextLines     int      `yaml:"contextLines"`     // Lines before/after each match
-			CorrelationKeys  []struct {
+			Enabled         bool     `yaml:"enabled"`         // Enable automatic log analysis
+			OutputFile      string   `yaml:"outputFile"`      // Output file name for analysis report
+			ErrorPatterns   []string `yaml:"errorPatterns"`   // Patterns to search for (case-insensitive)
+			ExcludeKeywords []string `yaml:"excludeKeywords"` // Keywords to exclude from matches (case-insensitive)
+			MaxMatches      int      `yaml:"maxMatches"`      // Max matches per log file
+			ContextLines    int      `yaml:"contextLines"`    // Lines before/after each match
+			CorrelationKeys []struct {
 				Pattern string `yaml:"pattern"` // Regex pattern to match correlation IDs
 				Type    string `yaml:"type"`    // Type name (transaction, request, correlation, trace)
 			} `yaml:"correlationKeys"` // Extract correlation IDs for cross-file grouping
@@ -685,15 +685,15 @@ type Config struct {
 			} `yaml:"errorGroups"` // Semantic error grouping
 		} `yaml:"logAnalysis"`
 		MessageFilter struct {
-			Enabled          bool `yaml:"enabled"` // Enable/disable post-download message filtering
-			KeyValueFilters  []struct {
+			Enabled         bool `yaml:"enabled"` // Enable/disable post-download message filtering
+			KeyValueFilters []struct {
 				Key   string `yaml:"key"`   // Key to look for in log lines (e.g., ownerID, serial)
 				Value string `yaml:"value"` // Value to match (lines with key but different value are excluded)
 			} `yaml:"keyValueFilters"` // Keep lines where key is absent OR key has specified value
-			SpecificStrings  []string `yaml:"specificStrings"` // Only keep lines containing these exact strings
-			CombineReplicas  bool     `yaml:"combineReplicas"` // Merge replica pod logs into single file per service
-			ReplicaPattern   string   `yaml:"replicaPattern"`  // Regex pattern to detect replica suffix
-			SortByTimestamp  bool     `yaml:"sortByTimestamp"` // Sort combined logs chronologically
+			SpecificStrings  []string `yaml:"specificStrings"`  // Only keep lines containing these exact strings
+			CombineReplicas  bool     `yaml:"combineReplicas"`  // Merge replica pod logs into single file per service
+			ReplicaPattern   string   `yaml:"replicaPattern"`   // Regex pattern to detect replica suffix
+			SortByTimestamp  bool     `yaml:"sortByTimestamp"`  // Sort combined logs chronologically
 			TimestampPattern string   `yaml:"timestampPattern"` // Regex to extract timestamp from log lines
 		} `yaml:"messageFilter"`
 		PodFileCollection struct {
@@ -3613,14 +3613,14 @@ func sanitizeFilename(name string) string {
 
 // LogMatch represents a single error/pattern match found in a log file
 type LogMatch struct {
-	FileName      string   // Name of the log file
-	LineNumber    int      // 1-based line number of the match
-	MatchedLine   string   // The actual line that matched
-	Pattern       string   // The pattern that matched
-	BeforeLines   []string // Context lines before the match
-	AfterLines    []string // Context lines after the match
+	FileName       string            // Name of the log file
+	LineNumber     int               // 1-based line number of the match
+	MatchedLine    string            // The actual line that matched
+	Pattern        string            // The pattern that matched
+	BeforeLines    []string          // Context lines before the match
+	AfterLines     []string          // Context lines after the match
 	CorrelationIDs map[string]string // Extracted correlation IDs: type -> ID (e.g., "transaction" -> "TXN-12345")
-	Timestamp     time.Time // Parsed timestamp from the log line
+	Timestamp      time.Time         // Parsed timestamp from the log line
 }
 
 // CorrelatedIssue represents a group of related errors found across multiple files
@@ -3634,15 +3634,15 @@ type CorrelatedIssue struct {
 
 // CorrelationIDIssue represents errors grouped by correlation ID (transaction ID, request ID, etc.)
 type CorrelationIDIssue struct {
-	CorrelationID   string      // The correlation ID value (e.g., "TXN-12345")
-	CorrelationType string      // Type of correlation ID (transaction, request, trace, etc.)
-	Matches         []LogMatch  // All log matches with this correlation ID
-	Files           []string    // Files where this correlation ID appears
-	StartTime       time.Time   // Earliest timestamp (root cause candidate)
-	EndTime         time.Time   // Latest timestamp
+	CorrelationID   string        // The correlation ID value (e.g., "TXN-12345")
+	CorrelationType string        // Type of correlation ID (transaction, request, trace, etc.)
+	Matches         []LogMatch    // All log matches with this correlation ID
+	Files           []string      // Files where this correlation ID appears
+	StartTime       time.Time     // Earliest timestamp (root cause candidate)
+	EndTime         time.Time     // Latest timestamp
 	Duration        time.Duration // Time span from first to last occurrence
-	Severity        string      // Estimated severity based on error patterns
-	Description     string      // Auto-generated description
+	Severity        string        // Estimated severity based on error patterns
+	Description     string        // Auto-generated description
 }
 
 // FileAnalysisSummary holds analysis results for a single file
@@ -3656,13 +3656,13 @@ type FileAnalysisSummary struct {
 // analyzeDownloadedLogs extracts a downloaded .tar.gz archive and analyzes all log files
 // for error patterns, correlates issues across files, and generates a comprehensive report
 func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig struct {
-	Enabled           bool     `yaml:"enabled"`
-	OutputFile        string   `yaml:"outputFile"`
-	ErrorPatterns     []string `yaml:"errorPatterns"`
-	ExcludeKeywords   []string `yaml:"excludeKeywords"`
-	MaxMatches        int      `yaml:"maxMatches"`
-	ContextLines      int      `yaml:"contextLines"`
-	CorrelationKeys   []struct {
+	Enabled         bool     `yaml:"enabled"`
+	OutputFile      string   `yaml:"outputFile"`
+	ErrorPatterns   []string `yaml:"errorPatterns"`
+	ExcludeKeywords []string `yaml:"excludeKeywords"`
+	MaxMatches      int      `yaml:"maxMatches"`
+	ContextLines    int      `yaml:"contextLines"`
+	CorrelationKeys []struct {
 		Pattern string `yaml:"pattern"`
 		Type    string `yaml:"type"`
 	} `yaml:"correlationKeys"`
@@ -4167,7 +4167,7 @@ func correlateErrors(summaries []FileAnalysisSummary, globalPatternCounts map[st
 func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDIssue {
 	// Map: correlationID -> list of matches with that ID
 	correlationMap := make(map[string][]LogMatch)
-	
+
 	// Collect all matches with correlation IDs
 	for _, summary := range summaries {
 		for _, match := range summary.Matches {
@@ -4181,15 +4181,15 @@ func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDI
 			}
 		}
 	}
-	
+
 	var issues []CorrelationIDIssue
-	
+
 	for key, matches := range correlationMap {
 		// Skip if only one occurrence (not very useful for correlation)
 		if len(matches) < 2 {
 			continue
 		}
-		
+
 		// Sort by timestamp to establish timeline
 		sort.Slice(matches, func(i, j int) bool {
 			if matches[i].Timestamp.IsZero() || matches[j].Timestamp.IsZero() {
@@ -4197,12 +4197,12 @@ func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDI
 			}
 			return matches[i].Timestamp.Before(matches[j].Timestamp)
 		})
-		
+
 		// Extract correlation type and ID from key
 		parts := strings.SplitN(key, ":", 2)
 		corrType := parts[0]
 		corrID := parts[1]
-		
+
 		// Collect unique files
 		fileSet := make(map[string]bool)
 		var startTime, endTime time.Time
@@ -4217,13 +4217,13 @@ func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDI
 				}
 			}
 		}
-		
+
 		var files []string
 		for file := range fileSet {
 			files = append(files, file)
 		}
 		sort.Strings(files)
-		
+
 		// Determine severity based on error patterns in matches
 		severity := "MEDIUM"
 		for _, match := range matches {
@@ -4237,20 +4237,20 @@ func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDI
 				}
 			}
 		}
-		
+
 		// Generate description
 		duration := time.Duration(0)
 		if !startTime.IsZero() && !endTime.IsZero() {
 			duration = endTime.Sub(startTime)
 		}
-		
-		description := fmt.Sprintf("Correlation ID '%s' (%s) appears in %d error(s) across %d file(s)", 
+
+		description := fmt.Sprintf("Correlation ID '%s' (%s) appears in %d error(s) across %d file(s)",
 			corrID, corrType, len(matches), len(files))
 		if duration > 0 {
 			description += fmt.Sprintf(" over %v", duration)
 		}
 		description += ". This indicates a transaction/request that encountered errors across multiple services."
-		
+
 		issue := CorrelationIDIssue{
 			CorrelationID:   corrID,
 			CorrelationType: corrType,
@@ -4264,7 +4264,7 @@ func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDI
 		}
 		issues = append(issues, issue)
 	}
-	
+
 	// Sort by severity and then by number of occurrences
 	sort.Slice(issues, func(i, j int) bool {
 		sevOrder := map[string]int{"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -4273,7 +4273,7 @@ func correlateByCorrelationIDs(summaries []FileAnalysisSummary) []CorrelationIDI
 		}
 		return len(issues[i].Matches) > len(issues[j].Matches)
 	})
-	
+
 	return issues
 }
 
@@ -4331,13 +4331,13 @@ func generateIssueDescription(pattern string, totalCount int, files []string) st
 func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 	correlatedIssues []CorrelatedIssue, globalPatternCounts map[string]int,
 	config struct {
-		Enabled           bool     `yaml:"enabled"`
-		OutputFile        string   `yaml:"outputFile"`
-		ErrorPatterns     []string `yaml:"errorPatterns"`
-		ExcludeKeywords   []string `yaml:"excludeKeywords"`
-		MaxMatches        int      `yaml:"maxMatches"`
-		ContextLines      int      `yaml:"contextLines"`
-		CorrelationKeys   []struct {
+		Enabled         bool     `yaml:"enabled"`
+		OutputFile      string   `yaml:"outputFile"`
+		ErrorPatterns   []string `yaml:"errorPatterns"`
+		ExcludeKeywords []string `yaml:"excludeKeywords"`
+		MaxMatches      int      `yaml:"maxMatches"`
+		ContextLines    int      `yaml:"contextLines"`
+		CorrelationKeys []struct {
 			Pattern string `yaml:"pattern"`
 			Type    string `yaml:"type"`
 		} `yaml:"correlationKeys"`
@@ -4347,7 +4347,7 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 			Patterns []string `yaml:"patterns"`
 			Severity string   `yaml:"severity"`
 		} `yaml:"errorGroups"`
-	}, totalMatches int, archivePath string,  correlationIDIssues []CorrelationIDIssue) error {
+	}, totalMatches int, archivePath string, correlationIDIssues []CorrelationIDIssue) error {
 
 	file, err := os.Create(reportPath)
 	if err != nil {
@@ -4462,19 +4462,19 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 			fmt.Fprintf(w, "  Correlation ID: %s (%s)\n", issue.CorrelationID, issue.CorrelationType)
 			fmt.Fprintf(w, "  Severity:       %s\n", issue.Severity)
 			fmt.Fprintf(w, "  Occurrences:    %d error(s) across %d file(s)\n", len(issue.Matches), len(issue.Files))
-			
+
 			if !issue.StartTime.IsZero() && !issue.EndTime.IsZero() {
 				fmt.Fprintf(w, "  Time Span:      %s to %s (%v duration)\n",
 					issue.StartTime.Format("15:04:05.000"),
 					issue.EndTime.Format("15:04:05.000"),
 					issue.Duration)
 			}
-			
+
 			fmt.Fprintln(w, "  Affected Files:")
 			for _, f := range issue.Files {
 				fmt.Fprintf(w, "    - %s\n", f)
 			}
-			
+
 			// Show error timeline if we have timestamps
 			hasTimestamps := false
 			for _, match := range issue.Matches {
@@ -4483,7 +4483,7 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 					break
 				}
 			}
-			
+
 			if hasTimestamps {
 				fmt.Fprintln(w, "  Error Timeline (chronological order):")
 				for i, match := range issue.Matches {
@@ -4493,18 +4493,18 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 					} else {
 						timeStr = "??:??:??.???"
 					}
-					
+
 					rootCauseIndicator := ""
 					if i == 0 && !match.Timestamp.IsZero() {
 						rootCauseIndicator = " [POTENTIAL ROOT CAUSE]"
 					}
-					
+
 					fmt.Fprintf(w, "    [%s] %s - Pattern: '%s'%s\n",
 						timeStr,
 						filepath.Base(match.FileName),
 						match.Pattern,
 						rootCauseIndicator)
-					
+
 					// Show a snippet of the matched line
 					snippet := match.MatchedLine
 					if len(snippet) > 80 {
@@ -4513,7 +4513,7 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 					fmt.Fprintf(w, "               %s\n", strings.TrimSpace(snippet))
 				}
 			}
-			
+
 			fmt.Fprintf(w, "  Assessment: %s\n", issue.Description)
 			fmt.Fprintln(w, "  "+strings.Repeat("-", 70))
 			fmt.Fprintln(w)
@@ -4717,8 +4717,8 @@ func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []C
 //   - combineReplicas: If enabled, merges logs from replica pods into single files (e.g., nvo-edge-abc + nvo-edge-xyz → nvo-edge.log)
 //   - sortByTimestamp: If enabled, sorts combined logs chronologically by timestamp
 func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
-	Enabled          bool `yaml:"enabled"`
-	KeyValueFilters  []struct {
+	Enabled         bool `yaml:"enabled"`
+	KeyValueFilters []struct {
 		Key   string `yaml:"key"`
 		Value string `yaml:"value"`
 	} `yaml:"keyValueFilters"`
@@ -4863,8 +4863,8 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 
 	// Structure to hold filtered lines with optional timestamp
 	type FilteredLine struct {
-		Line      string
-		Timestamp time.Time
+		Line       string
+		Timestamp  time.Time
 		SourceFile string
 	}
 
@@ -4877,7 +4877,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	// Process each file: filter and collect lines
 	for _, srcPath := range logFiles {
 		relPath, _ := filepath.Rel(extractDir, srcPath)
-		
+
 		// Read source file
 		srcFile, err := os.Open(srcPath)
 		if err != nil {
@@ -4925,7 +4925,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 					Line:       line,
 					SourceFile: relPath,
 				}
-				
+
 				// Try to extract timestamp if sorting is enabled
 				if filterConfig.SortByTimestamp && timestampRegex != nil {
 					if tsMatch := timestampRegex.FindString(line); tsMatch != "" {
@@ -4936,7 +4936,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 						}
 					}
 				}
-				
+
 				filteredLines = append(filteredLines, fl)
 				linesKept++
 			}
@@ -4954,7 +4954,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 
 		if linesKept > 0 {
 			filesProcessed++
-			
+
 			// Determine base name for grouping
 			baseName := relPath
 			if filterConfig.CombineReplicas && replicaRegex != nil {
@@ -4963,7 +4963,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 				dir := filepath.Dir(relPath)
 				file := filepath.Base(relPath)
 				podDir := filepath.Base(dir)
-				
+
 				// Strip replica suffix from pod directory name
 				if replicaRegex.MatchString(podDir) {
 					podDir = replicaRegex.ReplaceAllString(podDir, "")
@@ -4971,10 +4971,10 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 					baseName = filepath.Join(dir, file)
 				}
 			}
-			
+
 			// Add to group
 			baseNameGroups[baseName] = append(baseNameGroups[baseName], filteredLines...)
-			
+
 			if linesRemoved > 0 {
 				logger.Debug("  Filtered %s: kept %d/%d lines (removed %d)", relPath, linesKept, linesRead, linesRemoved)
 			}
@@ -4986,16 +4986,16 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	// Write combined files
 	filesWritten := 0
 	replicasCombined := 0
-	
+
 	for baseName, lines := range baseNameGroups {
 		destPath := filepath.Join(filterBaseDir, baseName)
-		
+
 		// Count source files for this base name (replica count)
 		sourceFiles := make(map[string]bool)
 		for _, fl := range lines {
 			sourceFiles[fl.SourceFile] = true
 		}
-		
+
 		// Sort by timestamp if enabled
 		if filterConfig.SortByTimestamp {
 			sort.SliceStable(lines, func(i, j int) bool {
@@ -5014,20 +5014,20 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 				return false
 			})
 		}
-		
+
 		// Create output directory
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			logger.Warn("Failed to create filter dir for %s: %v", baseName, err)
 			continue
 		}
-		
+
 		// Write combined file
 		destFile, err := os.Create(destPath)
 		if err != nil {
 			logger.Warn("Failed to create filtered file %s: %v", baseName, err)
 			continue
 		}
-		
+
 		w := bufio.NewWriter(destFile)
 		for _, fl := range lines {
 			fmt.Fprintln(w, fl.Line)
@@ -5035,7 +5035,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 		w.Flush()
 		destFile.Close()
 		filesWritten++
-		
+
 		if len(sourceFiles) > 1 {
 			replicasCombined++
 			logger.Debug("  Combined %d replica(s) into %s (%d lines)", len(sourceFiles), baseName, len(lines))
@@ -5066,10 +5066,10 @@ func parseTimestamp(ts string) time.Time {
 		"[2006-01-02 15:04:05]",
 		"[2006-01-02T15:04:05]",
 	}
-	
+
 	// Remove brackets if present
 	ts = strings.Trim(ts, "[]")
-	
+
 	for _, format := range formats {
 		if t, err := time.Parse(format, ts); err == nil {
 			return t
@@ -7504,12 +7504,13 @@ func main() {
 		if err := saveConfigWithEncryptedPassword(*configFile, config, *password); err != nil {
 			logger.Warn("Failed to save encrypted password: %v", err)
 		} else {
-			// Display encrypted password for user to copy if needed
+			// Display encrypted password for user to copy if needed (terminal only, not in logger_info)
 			encryptedPass, encErr := encryptPassword(*password)
 			if encErr == nil {
 				logger.Info("Password encrypted and saved to config.yaml")
-				logger.Info("Encrypted Password (copy the below \"ENC:...\" if needed):")
-				logger.Info("\"%s\"", encryptedPass)
+				// Display encrypted password in terminal only (not in logger_info.txt for security)
+				fmt.Println("[INFO] Encrypted Password (copy the below \"ENC:...\" if needed):")
+				fmt.Printf("[INFO] \"%s\"\n", encryptedPass)
 			}
 		}
 	}

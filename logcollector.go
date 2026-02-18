@@ -5164,6 +5164,16 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) (string
 		outputDir = "."
 	}
 
+	// Apply template replacement to outputDir
+	outputDir = strings.ReplaceAll(outputDir, "{timestamp}", timestampStr)
+	outputDir = strings.ReplaceAll(outputDir, "{username}", config.Username)
+	outputDir = strings.ReplaceAll(outputDir, "{environment}", config.Environment)
+
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create output directory: %v", err)
+	}
+
 	// Create local output file path
 	localFilePath := filepath.Join(outputDir, outputFileName)
 
@@ -7090,7 +7100,7 @@ func main() {
 	useSFTP := flag.Bool("sftp", false, "Use parallel SFTP for downloads instead of native SCP")
 
 	// Operation mode flags (mutually exclusive - only one should be used)
-	modeAll := flag.Bool("all", false, "Collect logs + system info + app versions (override config.yaml)")
+	modeAll := flag.Bool("all", false, "Collect logs + system info + app versions + device logs (if enabled in config)")
 	modeLogs := flag.Bool("logs-only", false, "Collect only logs without system info or app versions")
 	modeSysInfo := flag.Bool("sys-info", false, "Collect only general system info (kubectl commands, system stats)")
 	modeVersion := flag.Bool("version", false, "Collect only application version information")
@@ -7112,7 +7122,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Operation Modes (mutually exclusive):\n")
 		fmt.Fprintf(os.Stderr, "  (no mode)          Use config.yaml settings (default)\n")
-		fmt.Fprintf(os.Stderr, "  --all              Collect logs + system info + app versions (override config)\n")
+		fmt.Fprintf(os.Stderr, "  --all              Collect logs + system info + app versions + device logs (if enabled)\n")
 		fmt.Fprintf(os.Stderr, "  --logs-only        Collect only logs\n")
 		fmt.Fprintf(os.Stderr, "  --sys-info         Collect only general system info (kubectl commands)\n")
 		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n")
@@ -7379,6 +7389,10 @@ func main() {
 	if *outputDir == "" {
 		if config.Logs.OutputDir != "" {
 			*outputDir = config.Logs.OutputDir
+			// Apply template replacement to outputDir
+			*outputDir = strings.ReplaceAll(*outputDir, "{timestamp}", config.archiveTimestamp)
+			*outputDir = strings.ReplaceAll(*outputDir, "{username}", config.Username)
+			*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
 		} else {
 			*outputDir = "." // Default to current directory
 		}
@@ -7513,7 +7527,7 @@ func main() {
 		fmt.Println("  appVersionCollection.enabled: true")
 		fmt.Println("")
 		fmt.Println("Or use operation mode flags:")
-		fmt.Println("  --all        : Collect logs + system info + app versions")
+		fmt.Println("  --all        : Collect logs + system info + app versions + device logs (if enabled)")
 		fmt.Println("  --logs-only  : Collect only logs")
 		fmt.Println("  --sys-info   : Collect only general system info")
 		fmt.Println("  --version    : Collect only app version information")

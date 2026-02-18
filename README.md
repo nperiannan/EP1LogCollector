@@ -4,9 +4,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 
 ## Download
 
-**Latest Release: v1.1.0**
+**Latest Release: v1.2.0**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.1.0)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.0)
 
 | Platform | Binary |
 |----------|--------|
@@ -15,11 +15,13 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
 
-**v1.1.0 Changes:**
-- Renamed to LogCollector (was fetchlogs)
-- Loki-style strict inclusion filter
-- Build versioning (`-v` flag)
-- Automated build system
+**v1.2.0 Changes:**
+- Loki-style replica log merging (combines replica pod logs into single files)
+- Transaction ID correlation (groups related errors by correlation IDs)
+- Timestamp sorting (chronological ordering of merged logs)
+- Semantic error grouping (categorizes errors by type)
+- Enhanced analytics report with transaction/request correlation section
+- Security: encrypted passwords excluded from logger_info.txt
 
 ## What It Does
 

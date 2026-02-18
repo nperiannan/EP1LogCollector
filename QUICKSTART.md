@@ -2,9 +2,9 @@
 
 A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
 
-## Latest Release: v1.1.0
+## Latest Release: v1.2.0
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.1.0)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.0)
 
 | Platform | Binary |
 |----------|--------|
@@ -13,11 +13,13 @@ A command-line tool to collect logs, system info, and application versions from 
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
 
-**What's New in v1.1.0:**
-- Renamed to **LogCollector** (was fetchlogs)
-- Loki-style strict inclusion filter
-- Build versioning with `-v` flag
-- Automated build system with version injection
+**What's New in v1.2.0:**
+- **Loki-style replica log merging** - Combines replica pod logs into single files
+- **Transaction ID correlation** - Groups related errors by correlation IDs across files
+- **Timestamp sorting** - Chronological ordering of merged logs
+- **Semantic error grouping** - Categorizes errors by type (Database, Permission, Network, Resource)
+- **Enhanced analytics** - Transaction/request correlation section in reports
+- **Security improvement** - Encrypted passwords excluded from logger_info.txt
 
 ## Prerequisites
 
@@ -39,7 +41,7 @@ A command-line tool to collect logs, system info, and application versions from 
 ### 1. Get the Tool
 
 **Option A: Download Pre-built Binary (Recommended)**
-- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.1.0)
+- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.0)
 - Extract/rename to `logcollector.exe` (Windows) or `logcollector` (Linux/Mac)
 - Check version: `logcollector.exe -v` or `./logcollector -v`
 

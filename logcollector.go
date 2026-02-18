@@ -151,10 +151,17 @@ func (l *Logger) MoveLogFileTo(outputDir string) {
 	}
 
 	// Write existing content to new file
-	newFile.Write(content)
+	if _, err := newFile.Write(content); err != nil {
+		fmt.Printf("Warning: Failed to write to new log file: %v\n", err)
+		newFile.Close()
+		return
+	}
 
 	// Remove old file
-	os.Remove(oldPath)
+	if err := os.Remove(oldPath); err != nil {
+		fmt.Printf("Warning: Could not remove original logger_info.txt: %v\n", err)
+		// Continue anyway - the new file exists
+	}
 
 	// Switch to new file
 	l.logFile = newFile

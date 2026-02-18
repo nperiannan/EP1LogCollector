@@ -95,7 +95,7 @@ type Logger struct {
 // If outputDir is provided, creates logger_info.txt in that directory.
 func NewLogger(minLevel LogLevel, outputDir string) *Logger {
 	l := &Logger{minLevel: minLevel}
-	
+
 	// Determine log file path
 	var logFilePath string
 	if outputDir != "" {
@@ -103,7 +103,7 @@ func NewLogger(minLevel LogLevel, outputDir string) *Logger {
 	} else {
 		logFilePath = "logger_info.txt"
 	}
-	
+
 	// Create log file for capturing all output
 	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -7265,34 +7265,50 @@ func main() {
 		collectDeviceLogs = config.DeviceLogCollection.Enabled
 	}
 
-	// Initialize archiveTimestamp early so it's available for template replacement in outputDir
+	// Initialize archiveTimestamp early so it's available for template replacement
 	config.archiveTimestamp = time.Now().Format("20060102_150405")
 
-	// Determine logger output directory based on mode
+	// Determine and prepare outputDir BEFORE logger initialization
+	// This ensures logger_info.txt is created in the correct directory from the start
 	var loggerOutputDir string
+	
 	if selectedMode == "device-logs" {
-		// For device-logs mode, calculate output directory path (must match processDeviceLogCollection logic)
+		// For device-logs mode: Device_<timestamp> subdirectory
 		deviceLogFolderName := fmt.Sprintf("Device_%s", config.archiveTimestamp)
 		if *outputDir != "" {
-			// Command-line outputDir takes precedence
 			loggerOutputDir = filepath.Join(*outputDir, deviceLogFolderName)
 		} else {
-			// Standalone mode: use config outputDir or current directory
 			baseDir := config.DeviceLogCollection.OutputDir
 			if baseDir == "" {
 				baseDir = "."
 			}
 			loggerOutputDir = filepath.Join(baseDir, deviceLogFolderName)
 		}
-		// Create directory if it doesn't exist
+	} else {
+		// For other modes (--all, --logs, --info, etc.): use outputDir from config or flag
+		if *outputDir == "" {
+			if config.Logs.OutputDir != "" {
+				*outputDir = config.Logs.OutputDir
+			} else {
+				*outputDir = "." // Default to current directory
+			}
+		}
+		// Apply template replacement to outputDir
+		*outputDir = strings.ReplaceAll(*outputDir, "{timestamp}", config.archiveTimestamp)
+		*outputDir = strings.ReplaceAll(*outputDir, "{username}", config.Username)
+		*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
+		loggerOutputDir = *outputDir
+	}
+	
+	// Create output directory before logger initialization
+	if loggerOutputDir != "" && loggerOutputDir != "." {
 		if err := os.MkdirAll(loggerOutputDir, 0755); err != nil {
 			fmt.Printf("Warning: Could not create output directory %s: %v\n", loggerOutputDir, err)
 			loggerOutputDir = "" // Fall back to PWD
 		}
 	}
-	// For other modes, logger stays in PWD (will be moved later with archive)
 
-	// Initialize the global logger with the log level setting
+	// Initialize the global logger in the correct output directory
 	logLevelEnum := ParseLogLevel(*logLevel)
 	logger = NewLogger(logLevelEnum, loggerOutputDir)
 	defer logger.Close()
@@ -7435,17 +7451,8 @@ func main() {
 			*logPattern = "/var/log/*.log /var/log/*.gz" // Default
 		}
 	}
-	if *outputDir == "" {
-		if config.Logs.OutputDir != "" {
-			*outputDir = config.Logs.OutputDir
-			// Apply template replacement to outputDir
-			*outputDir = strings.ReplaceAll(*outputDir, "{timestamp}", config.archiveTimestamp)
-			*outputDir = strings.ReplaceAll(*outputDir, "{username}", config.Username)
-			*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
-		} else {
-			*outputDir = "." // Default to current directory
-		}
-	}
+	// outputDir already set and template-replaced during logger initialization
+	// No need to set it again here
 	// Apply template replacement to tempDir
 	logger.Debug("Original config.LogCollection.TempDir: '%s'", config.LogCollection.TempDir)
 	if config.LogCollection.TempDir != "" {
@@ -8088,10 +8095,7 @@ func main() {
 		}
 	}
 
-	// Copy logger_info.txt to the output directory so it lives alongside the downloaded files
-	if successCount > 0 {
-		logger.CopyLogFileTo(*outputDir, config.archiveTimestamp)
-	}
+	// Logger is already created in the output directory, no need to copy
 
 	// Run post-download message filtering if enabled
 	if config.LogCollection.MessageFilter.Enabled && successCount > 0 {

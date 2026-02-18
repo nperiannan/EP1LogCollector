@@ -162,7 +162,7 @@ func (l *Logger) MoveLogFileTo(outputDir string) {
 
 // CopyLogFileTo copies the current log file to the specified output directory.
 // If archiveTimestamp is non-empty, the file is saved as logger_info_{timestamp}.txt.
-// Unlike MoveLogFileTo, this keeps the original file in place.
+// After copying, the original file in PWD is deleted to prevent clutter.
 func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 	if l.logFile == nil {
 		return
@@ -196,7 +196,15 @@ func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 	}
 	defer dst.Close()
 
-	io.Copy(dst, src)
+	if _, err := io.Copy(dst, src); err != nil {
+		fmt.Printf("Warning: Failed to copy log file: %v\n", err)
+		return
+	}
+
+	// Delete the original file from PWD after successful copy
+	if err := os.Remove(srcPath); err != nil {
+		fmt.Printf("Warning: Could not remove original logger_info.txt: %v\n", err)
+	}
 }
 
 // Log prints a message with the specified log level
@@ -5100,7 +5108,7 @@ func parseTimestamp(ts string) time.Time {
 
 // collectAppVersionsStandalone collects application version information and saves it locally
 // Returns the path to the created file and any error
-func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) (string, error) {
+func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config, outputDir string) (string, error) {
 	if !config.AppVersionCollection.Enabled {
 		logger.Info("App version collection is disabled in config")
 		return "", nil
@@ -5158,16 +5166,11 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config) (string
 	}
 	outputFileName = strings.ReplaceAll(outputFileName, "{timestamp}", timestampStr)
 
-	// Use the output directory from logs config or current directory
-	outputDir := config.Logs.OutputDir
+	// Use the provided output directory (already has template replacements applied)
+	// If empty, fall back to current directory
 	if outputDir == "" {
 		outputDir = "."
 	}
-
-	// Apply template replacement to outputDir
-	outputDir = strings.ReplaceAll(outputDir, "{timestamp}", timestampStr)
-	outputDir = strings.ReplaceAll(outputDir, "{username}", config.Username)
-	outputDir = strings.ReplaceAll(outputDir, "{environment}", config.Environment)
 
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -7622,7 +7625,7 @@ func main() {
 	// --version mode: collect only application version information
 	if selectedMode == "version" {
 		logger.Info("Running in version mode (app version collection only)...")
-		versionFilePath, err := collectAppVersionsStandalone(awsClient, config)
+		versionFilePath, err := collectAppVersionsStandalone(awsClient, config, *outputDir)
 		if err != nil {
 			logger.Error("Failed to collect app versions: %v", err)
 			return
@@ -7669,7 +7672,7 @@ func main() {
 		// If only app version collection is enabled (no logs, no general info)
 		if collectAppVersions && !collectLogs && !collectInfo {
 			logger.Info("Running in config mode - collecting app versions only...")
-			versionFilePath, err := collectAppVersionsStandalone(awsClient, config)
+			versionFilePath, err := collectAppVersionsStandalone(awsClient, config, *outputDir)
 			if err != nil {
 				logger.Error("Failed to collect app versions: %v", err)
 				return
@@ -7765,7 +7768,7 @@ func main() {
 	// Collect app versions if enabled and logs were collected
 	if collectAppVersions && collectLogs {
 		logger.Info("Collecting application version information...")
-		_, err = collectAppVersionsStandalone(awsClient, config)
+		_, err = collectAppVersionsStandalone(awsClient, config, *outputDir)
 		if err != nil {
 			logger.Warn("Failed to collect app versions: %v", err)
 			// Don't return - continue with log downloads

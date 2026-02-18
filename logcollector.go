@@ -2828,12 +2828,12 @@ func performFinalVerification(filePath string, expectedSize int64) error {
 func isCommandSafeForSystemInfo(command string) (bool, string) {
 	// Normalize command to lowercase for checking
 	cmdLower := strings.ToLower(strings.TrimSpace(command))
-	
+
 	// Remove sudo prefix for checking
 	cmdLower = strings.TrimPrefix(cmdLower, "sudo ")
 	cmdLower = strings.TrimPrefix(cmdLower, "sudo su - -c ")
 	cmdLower = strings.Trim(cmdLower, "'\"")
-	
+
 	// List of forbidden keywords that indicate config changes or destructive operations
 	forbiddenKeywords := []string{
 		"configure", "config", "set", "create", "delete", "remove", "rm",
@@ -2843,18 +2843,18 @@ func isCommandSafeForSystemInfo(command string) (bool, string) {
 		"exec", "execute", "run", "launch",
 		"scale", "rollout", "deploy",
 	}
-	
+
 	// Check for forbidden keywords
 	for _, keyword := range forbiddenKeywords {
 		// Check if keyword appears as a standalone word (not part of another word)
-		if strings.Contains(cmdLower, " "+keyword+" ") || 
-		   strings.HasPrefix(cmdLower, keyword+" ") || 
-		   strings.HasSuffix(cmdLower, " "+keyword) ||
-		   cmdLower == keyword {
+		if strings.Contains(cmdLower, " "+keyword+" ") ||
+			strings.HasPrefix(cmdLower, keyword+" ") ||
+			strings.HasSuffix(cmdLower, " "+keyword) ||
+			cmdLower == keyword {
 			return false, fmt.Sprintf("Command contains forbidden keyword '%s' - only read-only commands (show/get/describe/list) are allowed", keyword)
 		}
 	}
-	
+
 	// Additional check for common safe command patterns
 	safePatterns := []string{"kubectl get", "kubectl describe", "kubectl top", "kubectl logs", "show", "display", "list", "cat", "grep", "find", "ls", "ps", "netstat", "df", "du"}
 	hasSafePattern := false
@@ -2864,12 +2864,12 @@ func isCommandSafeForSystemInfo(command string) (bool, string) {
 			break
 		}
 	}
-	
+
 	// If no safe pattern found, warn but allow (for custom commands)
 	if !hasSafePattern {
 		logger.Debug("Command does not match common safe patterns but no forbidden keywords detected: %s", command)
 	}
-	
+
 	return true, ""
 }
 
@@ -2944,7 +2944,7 @@ func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 		command := cmd.Command
 		command = strings.ReplaceAll(command, "{environment}", actualNamespace)
 		command = strings.ReplaceAll(command, "{username}", username)
-		
+
 		// Validate command safety
 		isSafe, reason := isCommandSafeForSystemInfo(command)
 		if !isSafe {
@@ -5664,6 +5664,54 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config, outputD
 //   - credentials_other.go (Linux/macOS stubs - use env vars or config)
 // ================================================================
 
+// getJIRAApiToken retrieves the JIRA API token from multiple sources
+func getJIRAApiToken(jiraConfig *JiraConfig, logger *Logger) (string, error) {
+	// 1. Check environment variable first
+	if token := os.Getenv("JIRA_API_TOKEN"); token != "" {
+		logger.Debug("Using JIRA API token from environment variable")
+		return token, nil
+	}
+
+	// 2. Check config file
+	if jiraConfig.ApiToken != "" {
+		logger.Debug("Using JIRA API token from config file")
+		return jiraConfig.ApiToken, nil
+	}
+
+	// 3. Prompt user for token
+	fmt.Print("Enter JIRA API token: ")
+	fmt.Scanln(&jiraConfig.ApiToken)
+	if jiraConfig.ApiToken != "" {
+		return jiraConfig.ApiToken, nil
+	}
+
+	return "", fmt.Errorf("JIRA API token not provided")
+}
+
+// getBastionPassword retrieves bastion password from various sources
+func getBastionPassword(username, host, providedPassword string, logger *Logger) (string, bool, error) {
+	// If password is provided as argument, use it
+	if providedPassword != "" {
+		// Check if it's encrypted
+		if strings.HasPrefix(providedPassword, "encrypted:") {
+			decrypted, err := decryptPassword(providedPassword)
+			if err != nil {
+				return "", false, fmt.Errorf("failed to decrypt password: %v", err)
+			}
+			return decrypted, false, nil
+		}
+		return providedPassword, false, nil
+	}
+
+	// Prompt for password
+	password, err := promptPassword(fmt.Sprintf("Enter password for %s@%s: ", username, host))
+	if err != nil {
+		return "", false, err
+	}
+	
+	return password, true, nil
+}
+
 // attachFilesToJira uploads files to a JIRA issue using the JIRA REST API
 func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []string, logger *Logger) error {
 	// Validate basic configuration
@@ -5823,6 +5871,14 @@ func attachSingleFileToJira(jiraConfig JiraConfig, issueKey string, filePath str
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		logger.Debug("JIRA API Response for %s: %s", fileName, string(respBody))
 		return nil
+	}
+
+	// Special handling for 401 errors on large files - may indicate token expiration
+	if resp.StatusCode == 401 {
+		fileInfo, _ := os.Stat(filePath)
+		if fileInfo != nil && fileInfo.Size() > 50*1024*1024 { // > 50MB
+			return fmt.Errorf("JIRA API authentication failed (401) for large file (%d MB) - API token may have expired during upload. Try splitting into smaller files or refresh credentials", fileInfo.Size()/(1024*1024))
+		}
 	}
 
 	return fmt.Errorf("JIRA API request failed with status %d: %s", resp.StatusCode, string(respBody))
@@ -7497,11 +7553,9 @@ func processDatabaseCollection(config Config, baseOutputDir string, timestamp st
 			continue
 		}
 
-		// Check if alias command is available in AWS environment
-		if !isAliasAvailable(db.Alias, dbc.Aliases, logger) {
-			logger.Warn("  Alias '%s' not available in environment - skipping database %s", db.Alias, db.Name)
-			continue
-		}
+		// NOTE: Removed alias availability check - database commands are executed locally
+		// and require appropriate database clients (psql, mysql, etc.) to be installed.
+		// If command is not available, the query execution will fail with a clear error.
 
 		if err := executeDatabaseQueries(db, dbc, globalParams, dbOutputDir, timestamp, logger); err != nil {
 			logger.Error("Failed to execute queries for database %s: %v", db.Name, err)
@@ -9390,29 +9444,27 @@ func main() {
 			if len(attachmentFiles) > 0 {
 				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
-				} else {
-					// Clean up the compressed device log archive after successful JIRA upload
-					if deviceLogOutputDir != "" {
-						archiveName := filepath.Base(deviceLogOutputDir) + ".tar.gz"
-						archivePath := filepath.Join(filepath.Dir(deviceLogOutputDir), archiveName)
-						if _, statErr := os.Stat(archivePath); statErr == nil {
-							if err := os.Remove(archivePath); err != nil {
-								logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
-							} else {
-								logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
-							}
+				}
+				// Clean up compressed archives after JIRA upload attempt (success or failure)
+				if deviceLogOutputDir != "" {
+					archiveName := filepath.Base(deviceLogOutputDir) + ".tar.gz"
+					archivePath := filepath.Join(filepath.Dir(deviceLogOutputDir), archiveName)
+					if _, statErr := os.Stat(archivePath); statErr == nil {
+						if err := os.Remove(archivePath); err != nil {
+							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+						} else {
+							logger.Info("Deleted compressed archive after JIRA upload attempt: %s", archivePath)
 						}
 					}
-					// Clean up the compressed database results archive after successful JIRA upload
-					if databaseOutputDir != "" {
-						archiveName := filepath.Base(databaseOutputDir) + ".tar.gz"
-						archivePath := filepath.Join(filepath.Dir(databaseOutputDir), archiveName)
-						if _, statErr := os.Stat(archivePath); statErr == nil {
-							if err := os.Remove(archivePath); err != nil {
-								logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
-							} else {
-								logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
-							}
+				}
+				if databaseOutputDir != "" {
+					archiveName := filepath.Base(databaseOutputDir) + ".tar.gz"
+					archivePath := filepath.Join(filepath.Dir(databaseOutputDir), archiveName)
+					if _, statErr := os.Stat(archivePath); statErr == nil {
+						if err := os.Remove(archivePath); err != nil {
+							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+						} else {
+							logger.Info("Deleted compressed archive after JIRA upload attempt: %s", archivePath)
 						}
 					}
 				}

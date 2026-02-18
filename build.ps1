@@ -5,7 +5,7 @@
 # version, build number, and build date via Go's -ldflags.
 
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.2.0",
     [string]$Output = "logcollector.exe"
 )
 

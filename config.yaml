@@ -28,12 +28,12 @@ bastion:
 # AWS Server Configuration
 aws:
   host: "{environment}-console.qa.xcloudiq.com"
-  keyPath: ~/.ssh/id_ed25519_26Q1
+  keyPath: ~/.ssh/id_ed25519_26Q1              # Required: SSH public key for AWS server (e.g., ~/.ssh/id_rsa_aws)
 
 # Log File Configuration
 logs:
   pattern: /home/{username}/*.gz
-  outputDir: C:\Logs
+  outputDir: C:\Logs\{timestamp}                         # Output directory with timestamp (e.g., C:\Logs\20240218_143015)
 
 # General Options
 options:
@@ -61,7 +61,7 @@ logCollection:
   # Reference: https://extremenetworks.atlassian.net/wiki/spaces/NCM/pages/371756102/Temporal+Cheat+Sheet
   temporalWorkflowCollection:
     enabled: true                   # Enable/disable temporal workflow data collection
-    workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows)
+    workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows), example: "deploy-site-cp-name" or "deploy-profile-cp1" or "deploy-device-cp2"
     numberOfWorkflows: 3            # Number of recent workflows to collect (1-20, default 3)
     namespace: "configuration"      # Temporal namespace to query
   # Temporal schedule information collection
@@ -257,6 +257,85 @@ appVersionCollection:
       description: "NVO services namespace"
       podPrefixes: ["nvo-edge", "nvo-network"]
 
+# Database Query Collection Settings
+databaseCollection:
+  enabled: true                     # Enable/disable database query collection
+  outputDir: "Database"             # Subdirectory within main outputDir for database query results
+  
+  # Global parameters that can be used in SQL queries
+  parameters:
+    serial_number: ""               # Device serial number (e.g., "12345678")
+    owner_id: ""                    # Owner/tenant ID (e.g., "1096")
+  
+  # Connection and query timeouts
+  queryTimeout: 60                  # Query execution timeout in seconds
+  
+  # Database aliases from AWS environment
+  # Format: alias_name='psqlrds -U username -d database'
+  # The actual connection details are read from the AWS environment where psqlrds is configured
+  aliases:
+    psqlrds: "psql -h aurora-dl2.cluster-cjmu4y64cxc2.us-east-2.rds.amazonaws.com"
+    psqla3db: "psqlrds -U a3user -d a3"
+    psqlaccountdb: "psqlrds -U accountuser -d accountdb"
+    psqlassetsdb: "psqlrds -U assetsuser -d assetsdb"
+    psqlconfigdb_1: "psqlrds -U configuser_1 -d configdb_1"
+    psqldcsdb: "psqlrds -U dcsuser1 -d dcs_db"
+    psqlplatdb: "psqlrds -U postgres -d platform_common_db"
+    psqlportaldb: "psqlrds -U portaluser -d portaldb"
+    psqlproductinfodb: "psqlrds -U productinfouser -d productinfodb"
+    psqlredirectordb: "psqlrds -U redirectoruser -d redirectordb"
+    psqlscheduledb: "psqlrds -U scheduleuser -d scheduledb"
+    psqlsystemdb: "psqlrds -U systemuser -d systemdb"
+    psqltemporaldb: "psqlrds -U temporaluser temporaldb"
+  
+  # Database queries
+  databases:
+    # Assets Database
+    - name: "assetsdb"
+      alias: "psqlassetsdb"
+      enabled: true
+      queries:
+        - name: "get_device_by_serial"
+          sql: "SELECT asset_device_id, serial_number, owner_id, device_name, mac_address FROM devices WHERE serial_number = '{serial_number}'"
+          parameters: ["serial_number"]
+        - name: "get_device_history"
+          sql: "SELECT * FROM device_history WHERE asset_device_id = '{asset_device_id}' ORDER BY created_at DESC LIMIT 20"
+          dependsOn: "get_device_by_serial"
+          referenceColumn: "asset_device_id"
+    
+    # Config Database
+    - name: "configdb_1"
+      alias: "psqlconfigdb_1"
+      enabled: true
+      queries:
+        - name: "get_device_config"
+          sql: "SELECT config_id, device_id, serial_number, config_data FROM device_configs WHERE serial_number = '{serial_number}'"
+          parameters: ["serial_number"]
+        - name: "get_config_history"
+          sql: "SELECT * FROM config_history WHERE config_id = '{config_id}' ORDER BY updated_at DESC LIMIT 10"
+          dependsOn: "get_device_config"
+          referenceColumn: "config_id"
+    
+    # Platform Common Database
+    - name: "platform_common_db"
+      alias: "psqlplatdb"
+      enabled: true
+      queries:
+        - name: "get_tenant_info"
+          sql: "SELECT tenant_id, tenant_name, owner_id, status FROM tenants WHERE owner_id = '{owner_id}'"
+          parameters: ["owner_id"]
+        - name: "get_platform_events"
+          sql: "SELECT * FROM platform_events WHERE tenant_id = '{tenant_id}' ORDER BY event_time DESC LIMIT 50"
+          dependsOn: "get_tenant_info"
+          referenceColumn: "tenant_id"
+  
+  # Query Execution Notes:
+  # - Queries use the database alias to execute (e.g., psqlassetsdb -c "SELECT ...")
+  # - Parameters like {serial_number} and {owner_id} come from databaseCollection.parameters
+  # - Dependent queries use {column_name} from previous query results
+  # - If reference column has multiple rows, query executes once per row value
+  # - Each database's output is saved to a separate file in outputDir
+
 # JIRA Integration Settings
 jira:
   email: "{username}@extremenetworks.com" # Supports templates: {username}, {environment}
@@ -288,7 +367,7 @@ jira:
 
 # Network Device Log Collection Settings
 deviceLogCollection:
-  enabled: false                     # Master enable/disable for device log collection
+  enabled: true                      # Master enable/disable for device log collection
   outputDir: "Device"                # Subdirectory within main outputDir for device logs
   parallelDownloads: true            # Download from multiple devices concurrently
   globalTimeout: 600                 # Total timeout per device (seconds)

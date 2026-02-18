@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -643,6 +644,33 @@ type DeviceLogCollection struct {
 	Devices           []NetworkDevice   `yaml:"devices"`
 }
 
+// DatabaseQuery represents a single SQL query to execute
+type DatabaseQuery struct {
+	Name            string   `yaml:"name"`            // Query name
+	SQL             string   `yaml:"sql"`             // SQL query with parameter placeholders
+	Parameters      []string `yaml:"parameters"`      // Parameter names required for this query
+	DependsOn       string   `yaml:"dependsOn"`       // Name of query this depends on
+	ReferenceColumn string   `yaml:"referenceColumn"` // Column from dependent query to use as parameter
+}
+
+// DatabaseConfig represents configuration for a single database
+type DatabaseConfig struct {
+	Name    string          `yaml:"name"`    // Database name
+	Alias   string          `yaml:"alias"`   // psql alias to use
+	Enabled bool            `yaml:"enabled"` // Enable/disable this database
+	Queries []DatabaseQuery `yaml:"queries"` // List of queries to execute
+}
+
+// DatabaseCollection contains configuration for database query collection
+type DatabaseCollection struct {
+	Enabled      bool                       `yaml:"enabled"`      // Master enable/disable
+	OutputDir    string                     `yaml:"outputDir"`    // Output directory for query results
+	Parameters   map[string]string          `yaml:"parameters"`   // Global parameters (serial_number, owner_id)
+	QueryTimeout int                        `yaml:"queryTimeout"` // Query timeout in seconds
+	Aliases      map[string]string          `yaml:"aliases"`      // Database aliases map
+	Databases    []DatabaseConfig           `yaml:"databases"`    // List of databases with queries
+}
+
 // Configuration structure for the application
 type Config struct {
 	Username         string `yaml:"username"`    // Global username for all connections
@@ -745,6 +773,8 @@ type Config struct {
 	Jira JiraConfig `yaml:"jira"`
 	// Network device log collection
 	DeviceLogCollection DeviceLogCollection `yaml:"deviceLogCollection"`
+	// Database query collection
+	DatabaseCollection DatabaseCollection `yaml:"databaseCollection"`
 }
 
 // LoadConfig loads the configuration from a YAML file
@@ -5453,26 +5483,26 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 
 	// Upload files in parallel
 	logger.Info("Uploading %d file(s) to JIRA issue %s...", len(existingFiles), issueKey)
-	
+
 	type uploadResult struct {
 		fileName string
 		err      error
 	}
-	
+
 	resultChan := make(chan uploadResult, len(existingFiles))
 	var wg sync.WaitGroup
-	
+
 	// Launch parallel upload goroutines
 	for _, filePath := range existingFiles {
 		wg.Add(1)
 		go func(fPath string) {
 			defer wg.Done()
 			fileName := filepath.Base(fPath)
-			
+
 			logger.Info("Attaching file: %s", fileName)
-			
+
 			err := attachSingleFileToJira(jiraConfig, issueKey, fPath, apiToken, logger)
-			
+
 			if err != nil {
 				logger.Error("Failed to attach %s: %v", fileName, err)
 				resultChan <- uploadResult{fileName: fileName, err: err}
@@ -5482,15 +5512,15 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 			}
 		}(filePath)
 	}
-	
+
 	// Wait for all uploads to complete
 	wg.Wait()
 	close(resultChan)
-	
+
 	// Collect results
 	successCount := 0
 	failedFiles := []string{}
-	
+
 	for result := range resultChan {
 		if result.err == nil {
 			successCount++
@@ -5498,16 +5528,16 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 			failedFiles = append(failedFiles, result.fileName)
 		}
 	}
-	
+
 	// Print summary
 	if successCount > 0 {
 		logger.Info("Successfully attached %d file(s) to JIRA issue %s", successCount, issueKey)
 	}
-	
+
 	if len(failedFiles) > 0 {
 		return fmt.Errorf("failed to attach %d file(s): %v", len(failedFiles), failedFiles)
 	}
-	
+
 	return nil
 }
 
@@ -7149,6 +7179,389 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 	return timestampDir, nil
 }
 
+// ============================================================================
+// Database Query Collection Functions
+// ============================================================================
+
+// processDatabaseCollection executes database queries and saves results
+func processDatabaseCollection(config Config, baseOutputDir string, timestamp string, logger *Logger) (string, error) {
+	dbc := config.DatabaseCollection
+
+	if !dbc.Enabled {
+		logger.Debug("Database collection is disabled in config.yaml")
+		return "", nil
+	}
+
+	// Count enabled databases
+	enabledDBs := []DatabaseConfig{}
+	for _, db := range dbc.Databases {
+		if db.Enabled {
+			enabledDBs = append(enabledDBs, db)
+		}
+	}
+
+	if len(enabledDBs) == 0 {
+		logger.Warn("No enabled databases found in databaseCollection.databases")
+		return "", nil
+	}
+
+	// Check if required parameters are provided
+	if dbc.Parameters["serial_number"] == "" && dbc.Parameters["owner_id"] == "" {
+		logger.Warn("No parameters provided (serial_number, owner_id). Database queries may require parameters")
+	}
+
+	// Determine timestamp
+	if timestamp == "" {
+		timestamp = time.Now().Format("20060102_150405")
+	}
+
+	// Build output directory
+	var dbOutputDir string
+	if baseOutputDir != "" {
+		if dbc.OutputDir != "" {
+			dbOutputDir = filepath.Join(baseOutputDir, dbc.OutputDir)
+		} else {
+			dbOutputDir = filepath.Join(baseOutputDir, "Database")
+		}
+	} else {
+		if dbc.OutputDir != "" {
+			dbOutputDir = dbc.OutputDir
+		} else {
+			dbOutputDir = "Database"
+		}
+	}
+
+	logger.Info("========================================")
+	logger.Info("Database Query Collection")
+	logger.Info("Enabled databases: %d of %d", len(enabledDBs), len(dbc.Databases))
+	logger.Info("Output directory: %s", dbOutputDir)
+	if dbc.Parameters["serial_number"] != "" {
+		logger.Info("Serial Number: %s", dbc.Parameters["serial_number"])
+	}
+	if dbc.Parameters["owner_id"] != "" {
+		logger.Info("Owner ID: %s", dbc.Parameters["owner_id"])
+	}
+	logger.Info("========================================")
+
+	// Create output directory
+	if err := os.MkdirAll(dbOutputDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create database output directory: %v", err)
+	}
+
+	// Execute queries for each database
+	for _, db := range enabledDBs {
+		logger.Info("")
+		logger.Info("Processing database: %s (alias: %s)", db.Name, db.Alias)
+		
+		if err := executeDatabaseQueries(db, dbc, dbOutputDir, timestamp, logger); err != nil {
+			logger.Error("Failed to execute queries for database %s: %v", db.Name, err)
+		}
+	}
+
+	logger.Info("")
+	logger.Info("========================================")
+	logger.Info("Database query collection complete!")
+	logger.Info("Output directory: %s", dbOutputDir)
+	logger.Info("========================================")
+	
+	return dbOutputDir, nil
+}
+
+// executeDatabaseQueries executes all queries for a single database
+func executeDatabaseQueries(db DatabaseConfig, dbc DatabaseCollection, outputDir string, timestamp string, logger *Logger) error {
+	// Create database-specific output file
+	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s_queries_%s.txt", db.Name, timestamp))
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer f.Close()
+
+	// Write header
+	header := fmt.Sprintf("# Database Query Results: %s\n", db.Name)
+	header += fmt.Sprintf("# Timestamp: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	header += fmt.Sprintf("# Alias: %s\n", db.Alias)
+	if dbc.Parameters["serial_number"] != "" {
+		header += fmt.Sprintf("# Serial Number: %s\n", dbc.Parameters["serial_number"])
+	}
+	if dbc.Parameters["owner_id"] != "" {
+		header += fmt.Sprintf("# Owner ID: %s\n", dbc.Parameters["owner_id"])
+	}
+	header += strings.Repeat("=", 80) + "\n\n"
+	f.WriteString(header)
+
+	// Track query results for dependency resolution
+	queryResults := make(map[string][][]string) // queryName -> rows (each row is []string)
+
+	// Execute queries in order (respecting dependencies)
+	for _, query := range db.Queries {
+		logger.Info("  Executing query: %s", query.Name)
+		
+		// Resolve parameters
+		paramValues := make(map[string][]string)
+		
+		// Check if this query depends on a previous query
+		if query.DependsOn != "" {
+			if query.ReferenceColumn == "" {
+				logger.Error("    Query '%s' depends on '%s' but no referenceColumn specified", query.Name, query.DependsOn)
+				continue
+			}
+			
+			// Get results from dependent query
+			dependentResults, ok := queryResults[query.DependsOn]
+			if !ok {
+				logger.Error("    Query '%s' depends on '%s' which hasn't been executed yet", query.Name, query.DependsOn)
+				continue
+			}
+			
+			if len(dependentResults) == 0 {
+				logger.Warn("    Query '%s' depends on '%s' but it returned no results", query.Name, query.DependsOn)
+				continue
+			}
+			
+			// Extract reference column values from dependent query results
+			refValues := extractColumnValues(dependentResults, query.ReferenceColumn)
+			if len(refValues) == 0 {
+				logger.Warn("    Column '%s' not found in query '%s' results", query.ReferenceColumn, query.DependsOn)
+				continue
+			}
+			
+			paramValues[query.ReferenceColumn] = refValues
+			logger.Debug("    Found %d value(s) for parameter '%s' from query '%s'", len(refValues), query.ReferenceColumn, query.DependsOn)
+		}
+		
+		// Add global parameters
+		for _, paramName := range query.Parameters {
+			if paramValue, ok := dbc.Parameters[paramName]; ok && paramValue != "" {
+				paramValues[paramName] = []string{paramValue}
+			}
+		}
+		
+		// Execute query (possibly multiple times for multi-value parameters)
+		results, err := executeQueryWithParams(db.Alias, query, paramValues, dbc, logger)
+		if err != nil {
+			logger.Error("    Failed to execute query '%s': %v", query.Name, err)
+			f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
+			f.WriteString(fmt.Sprintf("Status: FAILED\n"))
+			f.WriteString(fmt.Sprintf("Error: %v\n\n", err))
+			continue
+		}
+		
+		// Store results for dependency resolution
+		queryResults[query.Name] = results
+		
+		// Write results to file
+		f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
+		f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
+		f.WriteString(fmt.Sprintf("Status: SUCCESS\n"))
+		f.WriteString(fmt.Sprintf("Rows returned: %d\n", len(results)))
+		f.WriteString(strings.Repeat("-", 80) + "\n")
+		
+		if len(results) > 0 {
+			// Write results in table format
+			for i, row := range results {
+				if i == 0 {
+					// Header row
+					f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
+					f.WriteString(strings.Repeat("-", 80) + "\n")
+				} else {
+					f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
+				}
+			}
+		} else {
+			f.WriteString("No results found.\n")
+		}
+		f.WriteString("\n\n")
+		
+		logger.Info("    Query completed: %d row(s) returned", len(results)-1) // -1 for header row
+	}
+
+	logger.Info("  Results saved to: %s", filepath.Base(outputFile))
+	return nil
+}
+
+// executeQueryWithParams executes a SQL query with parameter substitution
+func executeQueryWithParams(alias string, query DatabaseQuery, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+	// Find parameter with multiple values (dependency case)
+	var multiValueParam string
+	var multiValues []string
+	for param, values := range paramValues {
+		if len(values) > 1 {
+			multiValueParam = param
+			multiValues = values
+			break
+		}
+	}
+	
+	// If we have a multi-value parameter, execute query for each value
+	if multiValueParam != "" {
+		logger.Debug("      Executing query %d times for each value of '%s'", len(multiValues), multiValueParam)
+		var allResults [][]string
+		var headerAdded bool
+		
+		for _, value := range multiValues {
+			// Create parameter map with this single value
+			singleParams := make(map[string][]string)
+			for k, v := range paramValues {
+				if k == multiValueParam {
+					singleParams[k] = []string{value}
+				} else {
+					singleParams[k] = v
+				}
+			}
+			
+			results, err := executeSingleQuery(alias, query.SQL, singleParams, dbc, logger)
+			if err != nil {
+				logger.Warn("      Failed for %s=%s: %v", multiValueParam, value, err)
+				continue
+			}
+			
+			if len(results) > 0 {
+				if !headerAdded {
+					allResults = append(allResults, results[0]) // Add header
+					headerAdded = true
+				}
+				if len(results) > 1 {
+					allResults = append(allResults, results[1:]...) // Add data rows
+				}
+			}
+		}
+		
+		return allResults, nil
+	}
+	
+	// Single execution
+	return executeSingleQuery(alias, query.SQL, paramValues, dbc, logger)
+}
+
+// executeSingleQuery executes a single SQL query via psql alias
+func executeSingleQuery(alias string, sqlTemplate string, paramValues map[string][]string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+	// Substitute parameters in SQL
+	sql := sqlTemplate
+	for param, values := range paramValues {
+		if len(values) > 0 {
+			placeholder := fmt.Sprintf("{%s}", param)
+			sql = strings.ReplaceAll(sql, placeholder, values[0])
+		}
+	}
+	
+	// Check for unsubstituted parameters
+	if strings.Contains(sql, "{") && strings.Contains(sql, "}") {
+		return nil, fmt.Errorf("query contains unsubstituted parameters: %s", sql)
+	}
+	
+	// Build psql command using alias
+	aliasCmd, ok := dbc.Aliases[alias]
+	if !ok {
+		return nil, fmt.Errorf("alias '%s' not found in config", alias)
+	}
+	
+	// Expand nested aliases (e.g., psqlassetsdb uses psqlrds)
+	resolvedCmd := resolveAliases(aliasCmd, dbc.Aliases)
+	
+	// Build full command: resolved_alias -c "SQL" --csv
+	cmdParts := strings.Fields(resolvedCmd)
+	cmdParts = append(cmdParts, "-c", sql, "--csv")
+	
+	logger.Debug("      Executing: %s", strings.Join(cmdParts, " "))
+	
+	// Execute command with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(dbc.QueryTimeout)*time.Second)
+	defer cancel()
+	
+	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%v: %s", err, string(output))
+	}
+	
+	// Parse CSV output
+	results, err := parseCSV(string(output))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse query results: %v", err)
+	}
+	
+	return results, nil
+}
+
+// resolveAliases recursively resolves alias definitions
+func resolveAliases(command string, aliases map[string]string) string {
+	// Find the first word (potential alias)
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return command
+	}
+	
+	firstWord := parts[0]
+	if replacement, ok := aliases[firstWord]; ok {
+		// Replace the alias with its definition and keep the rest
+		resolved := replacement
+		if len(parts) > 1 {
+			resolved += " " + strings.Join(parts[1:], " ")
+		}
+		// Recursively resolve in case the replacement contains more aliases
+		return resolveAliases(resolved, aliases)
+	}
+	
+	return command
+}
+
+// parseCSV parses CSV output from psql
+func parseCSV(csvData string) ([][]string, error) {
+	var results [][]string
+	lines := strings.Split(csvData, "\n")
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		
+		// Simple CSV parsing (handles basic cases)
+		fields := strings.Split(line, ",")
+		for i, field := range fields {
+			fields[i] = strings.TrimSpace(field)
+		}
+		results = append(results, fields)
+	}
+	
+	return results, nil
+}
+
+// extractColumnValues extracts values from a specific column in query results
+func extractColumnValues(results [][]string, columnName string) []string {
+	if len(results) == 0 {
+		return nil
+	}
+	
+	// Find column index from header row
+	header := results[0]
+	columnIndex := -1
+	for i, col := range header {
+		if strings.EqualFold(col, columnName) {
+			columnIndex = i
+			break
+		}
+	}
+	
+	if columnIndex == -1 {
+		return nil
+	}
+	
+	// Extract values from data rows
+	var values []string
+	for i := 1; i < len(results); i++ {
+		if columnIndex < len(results[i]) {
+			value := strings.TrimSpace(results[i][columnIndex])
+			if value != "" {
+				values = append(values, value)
+			}
+		}
+	}
+	
+	return values
+}
+
 func main() {
 	// Define command-line flags
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
@@ -7174,11 +7587,12 @@ func main() {
 	useSFTP := flag.Bool("sftp", false, "Use parallel SFTP for downloads instead of native SCP")
 
 	// Operation mode flags (mutually exclusive - only one should be used)
-	modeAll := flag.Bool("all", false, "Collect logs + system info + app versions + device logs (if enabled in config)")
+	modeAll := flag.Bool("all", false, "Collect logs + system info + app versions + device logs + database queries (if enabled in config)")
 	modeLogs := flag.Bool("logs-only", false, "Collect only logs without system info or app versions")
 	modeSysInfo := flag.Bool("sys-info", false, "Collect only general system info (kubectl commands, system stats)")
 	modeVersion := flag.Bool("version", false, "Collect only application version information")
 	modeDeviceLogs := flag.Bool("device-logs", false, "Collect only network device logs and diagnostics")
+	modeDatabase := flag.Bool("database", false, "Collect only database query results")
 
 	// Log collection configuration flags
 	logFileName := flag.String("log-name", "", "Name for the log collection (without extension)")
@@ -7230,10 +7644,13 @@ func main() {
 	if *modeDeviceLogs {
 		modeCount++
 	}
+	if *modeDatabase {
+		modeCount++
+	}
 
 	if modeCount > 1 {
 		fmt.Fprintln(os.Stderr, "Error: Only one operation mode can be specified at a time")
-		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs")
+		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs, --database")
 		os.Exit(1)
 	}
 
@@ -7253,7 +7670,7 @@ func main() {
 	}
 
 	// Set defaults based on mode (or read from config if no mode specified)
-	var collectLogs, collectInfo, collectAppVersions, collectDeviceLogs bool
+	var collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase bool
 	var selectedMode string
 
 	if *modeAll {
@@ -7262,6 +7679,7 @@ func main() {
 		collectInfo = true
 		collectAppVersions = true
 		collectDeviceLogs = true // Will respect config.DeviceLogCollection.Enabled after loading
+		collectDatabase = true   // Will respect config.DatabaseCollection.Enabled after loading
 		selectedMode = "all"
 	} else if *modeLogs {
 		// --logs-only mode: collect only logs (K8s logs, excludes device logs)
@@ -7269,6 +7687,7 @@ func main() {
 		collectInfo = false
 		collectAppVersions = false
 		collectDeviceLogs = false
+		collectDatabase = false
 		selectedMode = "logs-only"
 	} else if *modeSysInfo {
 		// --sys-info mode: collect only general system info (kubectl commands)
@@ -7276,6 +7695,7 @@ func main() {
 		collectInfo = true
 		collectAppVersions = false
 		collectDeviceLogs = false
+		collectDatabase = false
 		selectedMode = "sys-info"
 	} else if *modeVersion {
 		// --version mode: collect only application version information
@@ -7283,6 +7703,7 @@ func main() {
 		collectInfo = false
 		collectAppVersions = true
 		collectDeviceLogs = false
+		collectDatabase = false
 		selectedMode = "version"
 	} else if *modeDeviceLogs {
 		// --device-logs mode: collect only network device logs
@@ -7290,7 +7711,16 @@ func main() {
 		collectInfo = false
 		collectAppVersions = false
 		collectDeviceLogs = true
+		collectDatabase = false
 		selectedMode = "device-logs"
+	} else if *modeDatabase {
+		// --database mode: collect only database query results
+		collectLogs = false
+		collectInfo = false
+		collectAppVersions = false
+		collectDeviceLogs = false
+		collectDatabase = true
+		selectedMode = "database"
 	} else if modeCount == 0 {
 		// No mode specified: use config.yaml settings (default behavior)
 		selectedMode = "config"
@@ -7312,9 +7742,10 @@ func main() {
 		collectDeviceLogs = config.DeviceLogCollection.Enabled
 	}
 
-	// In --all mode, respect DeviceLogCollection.Enabled from config
+	// In --all mode, respect feature-specific Enabled flags from config
 	if selectedMode == "all" {
 		collectDeviceLogs = config.DeviceLogCollection.Enabled
+		collectDatabase = config.DatabaseCollection.Enabled
 	}
 
 	// Initialize archiveTimestamp early so it's available for template replacement
@@ -7335,6 +7766,18 @@ func main() {
 				baseDir = "."
 			}
 			loggerOutputDir = filepath.Join(baseDir, deviceLogFolderName)
+		}
+	} else if selectedMode == "database" {
+		// For database mode: Database_<timestamp> subdirectory
+		databaseFolderName := fmt.Sprintf("Database_%s", config.archiveTimestamp)
+		if *outputDir != "" {
+			loggerOutputDir = filepath.Join(*outputDir, databaseFolderName)
+		} else {
+			baseDir := config.DatabaseCollection.OutputDir
+			if baseDir == "" {
+				baseDir = "."
+			}
+			loggerOutputDir = filepath.Join(baseDir, databaseFolderName)
 		}
 	} else {
 		// For other modes (--all, --logs, --info, etc.): use outputDir from config or flag
@@ -7592,6 +8035,60 @@ func main() {
 					attachmentFiles := []string{archivePath}
 					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 						logger.Error("Failed to attach device log files to JIRA issue %s: %v", *jiraIssueID, err)
+					} else {
+						// Clean up the compressed archive after successful JIRA upload
+						if err := os.Remove(archivePath); err != nil {
+							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+						} else {
+							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+						}
+					}
+				}
+			}
+		}
+		return
+	}
+
+	// --database mode: collect only database query results
+	// This mode does NOT require bastion/AWS — it runs psql commands locally
+	if selectedMode == "database" {
+		logger.Info("Running in database mode (database query collection only)...")
+
+		if !config.DatabaseCollection.Enabled {
+			logger.Warn("Database collection is disabled in config.yaml (databaseCollection.enabled: false)")
+			logger.Info("Please enable databaseCollection in config.yaml and configure your databases")
+			return
+		}
+
+		// Logger is already created in the correct directory,
+		// so we pass config.archiveTimestamp to reuse the same directory
+		dbOutDir, err := processDatabaseCollection(*config, *outputDir, config.archiveTimestamp, logger)
+		if err != nil {
+			logger.Error("Database collection failed: %v", err)
+		}
+		// No need to move/copy logger_info.txt - it's already in the right place!
+
+		// Attach database query files to JIRA if requested
+		if *jiraIssueID != "" && dbOutDir != "" {
+			logger.Info("")
+			if !config.Jira.AttachmentEnabled {
+				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+			} else if config.Jira.Email == "" {
+				logger.Warn("JIRA email not configured in config.yaml")
+				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
+			} else {
+				// Compress entire database results directory into a single archive for JIRA
+				archiveName := filepath.Base(dbOutDir) + ".tar.gz"
+				archivePath := filepath.Join(filepath.Dir(dbOutDir), archiveName)
+				logger.Info("Compressing database results for JIRA attachment: %s", archiveName)
+				if err := compressDirectoryToTarGz(dbOutDir, archivePath, logger); err != nil {
+					logger.Error("Failed to compress database results directory: %v", err)
+				} else {
+					logger.Info("Database results compressed: %s", archivePath)
+					attachmentFiles := []string{archivePath}
+					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						logger.Error("Failed to attach database files to JIRA issue %s: %v", *jiraIssueID, err)
 					} else {
 						// Clean up the compressed archive after successful JIRA upload
 						if err := os.Remove(archivePath); err != nil {
@@ -8094,6 +8591,20 @@ func main() {
 		}
 	}
 
+	// Collect database query results if enabled (in --all mode)
+	var databaseOutputDir string
+	if collectDatabase && config.DatabaseCollection.Enabled {
+		logger.Info("")
+		logger.Info("Starting database query collection...")
+		dbOutDir, dbErr := processDatabaseCollection(*config, *outputDir, config.archiveTimestamp, logger)
+		if dbErr != nil {
+			logger.Error("Database collection failed: %v", dbErr)
+		}
+		if dbOutDir != "" {
+			databaseOutputDir = dbOutDir
+		}
+	}
+
 	logger.Info("Download Summary:")
 	logger.Info("-----------------")
 	logger.Info("Total files: %d", totalFiles)
@@ -8225,19 +8736,49 @@ func main() {
 				}
 			}
 
+			// Add database query results as a single compressed archive
+			if databaseOutputDir != "" {
+				archiveName := filepath.Base(databaseOutputDir) + ".tar.gz"
+				archivePath := filepath.Join(filepath.Dir(databaseOutputDir), archiveName)
+				logger.Info("Compressing database results for JIRA attachment: %s", archiveName)
+				if err := compressDirectoryToTarGz(databaseOutputDir, archivePath, logger); err != nil {
+					logger.Warn("Failed to compress database results directory: %v", err)
+					// Fallback: attach individual files
+					dbFiles, _ := filepath.Glob(filepath.Join(databaseOutputDir, "*.txt"))
+					attachmentFiles = append(attachmentFiles, dbFiles...)
+				} else {
+					logger.Info("Database results compressed: %s", archivePath)
+					attachmentFiles = append(attachmentFiles, archivePath)
+				}
+			}
+
 			// Attempt to attach files to JIRA
 			if len(attachmentFiles) > 0 {
 				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
-				} else if deviceLogOutputDir != "" {
+				} else {
 					// Clean up the compressed device log archive after successful JIRA upload
-					archiveName := filepath.Base(deviceLogOutputDir) + ".tar.gz"
-					archivePath := filepath.Join(filepath.Dir(deviceLogOutputDir), archiveName)
-					if _, statErr := os.Stat(archivePath); statErr == nil {
-						if err := os.Remove(archivePath); err != nil {
-							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
-						} else {
-							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+					if deviceLogOutputDir != "" {
+						archiveName := filepath.Base(deviceLogOutputDir) + ".tar.gz"
+						archivePath := filepath.Join(filepath.Dir(deviceLogOutputDir), archiveName)
+						if _, statErr := os.Stat(archivePath); statErr == nil {
+							if err := os.Remove(archivePath); err != nil {
+								logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+							} else {
+								logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+							}
+						}
+					}
+					// Clean up the compressed database results archive after successful JIRA upload
+					if databaseOutputDir != "" {
+						archiveName := filepath.Base(databaseOutputDir) + ".tar.gz"
+						archivePath := filepath.Join(filepath.Dir(databaseOutputDir), archiveName)
+						if _, statErr := os.Stat(archivePath); statErr == nil {
+							if err := os.Remove(archivePath); err != nil {
+								logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+							} else {
+								logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+							}
 						}
 					}
 				}

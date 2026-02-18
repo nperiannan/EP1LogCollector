@@ -2,9 +2,9 @@
 
 A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
 
-## Latest Release: v1.2.0
+## Latest Release: v1.2.1
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.0)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.1)
 
 | Platform | Binary |
 |----------|--------|
@@ -13,7 +13,10 @@ A command-line tool to collect logs, system info, and application versions from 
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
 
-**What's New in v1.2.0:**
+**What's New in v1.2.1:**
+- **Pod file filtering** - New `matchPodName` option collects only current pod logs, excluding old pod logs in persistent directories
+
+**v1.2.0 Features:**
 - **Loki-style replica log merging** - Combines replica pod logs into single files
 - **Transaction ID correlation** - Groups related errors by correlation IDs across files
 - **Timestamp sorting** - Chronological ordering of merged logs
@@ -41,7 +44,7 @@ A command-line tool to collect logs, system info, and application versions from 
 ### 1. Get the Tool
 
 **Option A: Download Pre-built Binary (Recommended)**
-- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.0)
+- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.1)
 - Extract/rename to `logcollector.exe` (Windows) or `logcollector` (Linux/Mac)
 - Check version: `logcollector.exe -v` or `./logcollector -v`
 

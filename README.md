@@ -4,9 +4,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 
 ## Download
 
-**Latest Release: v1.2.0**
+**Latest Release: v1.2.1**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.0)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.1)
 
 | Platform | Binary |
 |----------|--------|
@@ -14,6 +14,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**v1.2.1 Changes:**
+- Pod file collection: `matchPodName` option to filter logs by current pod name (excludes old pod logs)
 
 **v1.2.0 Changes:**
 - Loki-style replica log merging (combines replica pod logs into single files)
@@ -31,7 +34,7 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 - Temporal workflow and schedule information
 - Application version tracking
 - System information (kubectl commands, pod status, nodes)
-- Direct pod file collection (wildcard support)
+- Direct pod file collection (wildcard support, pod-name filtering)
 
 **Network Devices:**
 - EXOS/VOSS switch diagnostics via SSH

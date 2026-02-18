@@ -7526,22 +7526,11 @@ func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputD
 
 // isAliasAvailable checks if an alias command is available on the AWS server
 func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]string, logger *Logger) bool {
-	// Get the alias command
-	aliasCmd, ok := aliases[alias]
+	// Verify alias exists in config
+	_, ok := aliases[alias]
 	if !ok {
 		return false
 	}
-
-	// Resolve nested aliases to get the base command
-	resolvedCmd := resolveAliases(aliasCmd, aliases)
-
-	// Extract the first command (the executable)
-	cmdParts := strings.Fields(resolvedCmd)
-	if len(cmdParts) == 0 {
-		return false
-	}
-
-	baseCmd := cmdParts[0]
 
 	// Check if alias exists on AWS server using 'type' command
 	session, err := awsClient.NewSession()
@@ -7551,17 +7540,18 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 	}
 	defer session.Close()
 
-	// Use 'type' command to check if the alias/command exists in the shell
-	checkCmd := fmt.Sprintf("type %s", baseCmd)
+	// Use 'type' command to check if the alias exists in the shell
+	// Check for the alias name directly (not the resolved command)
+	checkCmd := fmt.Sprintf("type %s", alias)
 	output, err := session.CombinedOutput(checkCmd)
 
 	if err != nil {
-		logger.Debug("  Alias '%s' (command: %s) not available on AWS server: %v", alias, baseCmd, err)
+		logger.Debug("  Alias '%s' not available on AWS server: %v", alias, err)
 		return false
 	}
 
-	// If 'type' command succeeded, the alias/command is available
-	logger.Debug("  Alias '%s' (command: %s) is available on AWS server: %s", alias, baseCmd, strings.TrimSpace(string(output)))
+	// If 'type' command succeeded, the alias is available
+	logger.Debug("  Alias '%s' is available on AWS server: %s", alias, strings.TrimSpace(string(output)))
 	return true
 }
 
@@ -7944,21 +7934,23 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 		return nil, fmt.Errorf("SQL validation failed: %v", err)
 	}
 
-	// Build psql command using alias
-	aliasCmd, ok := dbc.Aliases[alias]
+	// Verify alias exists in config
+	_, ok := dbc.Aliases[alias]
 	if !ok {
 		return nil, fmt.Errorf("alias '%s' not found in config", alias)
 	}
 
-	// Expand nested aliases (e.g., psqlassetsdb uses psqlrds)
-	resolvedCmd := resolveAliases(aliasCmd, dbc.Aliases)
+	// Use alias name directly (it's a bash alias on the AWS server)
+	// Don't resolve it - the AWS environment already has these aliases defined
+	// Build command: alias -c "SQL" --csv
+	// Escape SQL for shell (double-quoted string)
+	escapedSQL := sql
+	escapedSQL = strings.ReplaceAll(escapedSQL, `\`, `\\`)  // Escape backslashes first
+	escapedSQL = strings.ReplaceAll(escapedSQL, `"`, `\"`)  // Escape double quotes
+	escapedSQL = strings.ReplaceAll(escapedSQL, `$`, `\$`)  // Escape dollar signs (prevent variable expansion)
+	escapedSQL = strings.ReplaceAll(escapedSQL, "`", "\\`")  // Escape backticks (prevent command substitution)
 
-	// Build full command: resolved_alias -c "SQL" --csv
-	cmdParts := strings.Fields(resolvedCmd)
-	cmdParts = append(cmdParts, "-c", sql, "--csv")
-
-	// Build full command string for remote execution
-	fullCommand := strings.Join(cmdParts, " ")
+	fullCommand := fmt.Sprintf(`%s -c "%s" --csv`, alias, escapedSQL)
 	logger.Debug("      Executing on AWS server: %s", fullCommand)
 
 	// Execute command on AWS server via SSH

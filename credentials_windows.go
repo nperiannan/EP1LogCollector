@@ -113,7 +113,7 @@ func retrieveJIRATokenFromKeychain(email string, logger *Logger) (string, error)
 		return "", fmt.Errorf("failed to convert target name: %v", err)
 	}
 
-	var credPtr uintptr
+	var credPtr *CREDENTIAL
 	ret, _, err := credReadW.Call(
 		uintptr(unsafe.Pointer(targetNamePtr)),
 		CRED_TYPE_GENERIC,
@@ -129,15 +129,14 @@ func retrieveJIRATokenFromKeychain(email string, logger *Logger) (string, error)
 		return "", fmt.Errorf("failed to read credential: %v", err)
 	}
 
-	defer credFree.Call(credPtr)
+	defer credFree.Call(uintptr(unsafe.Pointer(credPtr)))
 
-	cred := (*CREDENTIAL)(unsafe.Pointer(credPtr))
+	cred := credPtr
 
-	// Extract token from credential blob
+	// Extract token from credential blob using unsafe.Slice
+	blob := unsafe.Slice((*byte)(unsafe.Pointer(cred.CredentialBlob)), cred.CredentialBlobSize)
 	tokenBytes := make([]byte, cred.CredentialBlobSize)
-	for i := uint32(0); i < cred.CredentialBlobSize; i++ {
-		tokenBytes[i] = *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(cred.CredentialBlob)) + uintptr(i)))
-	}
+	copy(tokenBytes, blob)
 
 	logger.Debug("JIRA token retrieved from Windows Credential Manager for %s", email)
 	return string(tokenBytes), nil
@@ -258,7 +257,7 @@ func retrieveBastionPasswordFromKeychain(username, bastionHost string, logger *L
 		return "", fmt.Errorf("failed to convert target name: %v", err)
 	}
 
-	var credPtr uintptr
+	var credPtr *CREDENTIAL
 	ret, _, err := credReadW.Call(
 		uintptr(unsafe.Pointer(targetNamePtr)),
 		CRED_TYPE_GENERIC,
@@ -274,15 +273,14 @@ func retrieveBastionPasswordFromKeychain(username, bastionHost string, logger *L
 		return "", fmt.Errorf("failed to read credent ial: %v", err)
 	}
 
-	defer credFree.Call(credPtr)
+	defer credFree.Call(uintptr(unsafe.Pointer(credPtr)))
 
-	cred := (*CREDENTIAL)(unsafe.Pointer(credPtr))
+	cred := credPtr
 
-	// Extract password from credential blob
+	// Extract password from credential blob using unsafe.Slice
+	blob := unsafe.Slice((*byte)(unsafe.Pointer(cred.CredentialBlob)), cred.CredentialBlobSize)
 	passwordBytes := make([]byte, cred.CredentialBlobSize)
-	for i := uint32(0); i < cred.CredentialBlobSize; i++ {
-		passwordBytes[i] = *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(cred.CredentialBlob)) + uintptr(i)))
-	}
+	copy(passwordBytes, blob)
 
 	logger.Debug("Bastion password retrieved from Windows Credential Manager for %s@%s", username, bastionHost)
 	return string(passwordBytes), nil

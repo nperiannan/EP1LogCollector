@@ -2,6 +2,8 @@
 
 A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
 
+**Documentation:** [README.md](README.md) | [Build Instructions](BUILD_INSTRUCTIONS.md)
+
 ## Latest Release: v1.3.3
 
 **Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/latest)

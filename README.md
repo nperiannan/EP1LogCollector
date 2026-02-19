@@ -31,6 +31,10 @@ LogCollector is a command-line tool that automates the collection of logs and di
 
 [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.3)
 
+**Documentation:**
+- [Quick Start Guide](QUICKSTART.md) - Get started quickly with minimal configuration
+- [Build Instructions](BUILD_INSTRUCTIONS.md) - Build from source for all platforms
+
 | Platform | Binary |
 |----------|--------|
 | Windows (x64) | `logcollector-windows-amd64.exe` |

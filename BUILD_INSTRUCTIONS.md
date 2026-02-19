@@ -1,5 +1,7 @@
 # Build Instructions for LogCollector
 
+**See also:** [README.md](README.md) | [Quick Start Guide](QUICKSTART.md)
+
 ## Quick Build
 
 ### Option 1: Use the build script (RECOMMENDED)

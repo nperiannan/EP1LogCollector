@@ -5259,22 +5259,43 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 			baseName := relPath
 			if filterConfig.CombineReplicas && replicaRegex != nil {
 				// Strip replica suffix to get base name
-				// e.g., "xiq/nvo-edge-7c59fdd6d6-7sqwc/app.log" -> "xiq/nvo-edge/app.log"
+				// Handles two cases:
+				// 1. Pod name in directory: "xiq/nvo-edge-7c59fdd6d6-7sqwc/app.log" -> "xiq/nvo-edge/app.log"
+				// 2. Pod name in filename: "nvo/nvo-network-7c895646cd-7lgcp-server.log" -> "nvo/nvo-network-server.log"
 				// Note: Kubernetes pods have TWO suffixes (ReplicaSet hash + Pod hash)
 				// We need to strip both to merge all replicas together
 				dir := filepath.Dir(relPath)
 				file := filepath.Base(relPath)
 				podDir := filepath.Base(dir)
+				
+				dirChanged := false
+				fileChanged := false
 
 				// Strip ALL replica suffixes from pod directory name (loop until no more matches)
 				// This handles cases like "nvo-edge-7c59fdd6d6-7sqwc" -> "nvo-edge"
+				origPodDir := podDir
 				for replicaRegex.MatchString(podDir) {
 					podDir = replicaRegex.ReplaceAllString(podDir, "")
 				}
-				
-				if podDir != filepath.Base(dir) {
-					// Suffix was stripped, update base name
-					dir = filepath.Join(filepath.Dir(dir), podDir)
+				if podDir != origPodDir {
+					dirChanged = true
+				}
+
+				// Strip ALL replica suffixes from filename (for pod file collections)
+				// This handles cases like "nvo-network-7c895646cd-7lgcp-server.log" -> "nvo-network-server.log"
+				origFile := file
+				for replicaRegex.MatchString(file) {
+					file = replicaRegex.ReplaceAllString(file, "")
+				}
+				if file != origFile {
+					fileChanged = true
+				}
+
+				// Rebuild path if either directory or filename changed
+				if dirChanged || fileChanged {
+					if dirChanged {
+						dir = filepath.Join(filepath.Dir(dir), podDir)
+					}
 					baseName = filepath.Join(dir, file)
 				}
 			}

@@ -33,15 +33,17 @@ A command-line tool to collect logs, system info, and application versions from 
 ### 1. Get the Tool
 
 **Option A: Download Pre-built Binary (Recommended)**
-- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.2.1)
+- Download from [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/latest)
 - Extract/rename to `logcollector.exe` (Windows) or `logcollector` (Linux/Mac)
 - Check version: `logcollector.exe -v` or `./logcollector -v`
 
 **Option B: Build from Source**
 ```bash
-go build -o logcollector.exe logcollector.go
-# Or use automated build script
-.\build.ps1
+# Build for current platform
+go build -o logcollector.exe
+
+# Or use automated build script for all platforms
+.\build-all.ps1
 ```
 
 ### 2. Configure `config.yaml`

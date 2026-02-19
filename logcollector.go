@@ -8379,17 +8379,25 @@ func main() {
 			loggerOutputDir = filepath.Join(baseDir, deviceLogFolderName)
 		}
 	} else if selectedMode == "database" {
-		// For database mode: Database_<timestamp> subdirectory
-		databaseFolderName := fmt.Sprintf("Database_%s", config.archiveTimestamp)
-		if *outputDir != "" {
-			loggerOutputDir = filepath.Join(*outputDir, databaseFolderName)
-		} else {
-			baseDir := config.DatabaseCollection.OutputDir
-			if baseDir == "" {
-				baseDir = "."
+		// For database mode: resolve outputDir from config (e.g., C:\Logs\{timestamp})
+		// then place database files inside the Database subdirectory
+		if *outputDir == "" {
+			if config.Logs.OutputDir != "" {
+				*outputDir = config.Logs.OutputDir
+			} else {
+				*outputDir = "."
 			}
-			loggerOutputDir = filepath.Join(baseDir, databaseFolderName)
 		}
+		// Apply template replacement to outputDir
+		*outputDir = strings.ReplaceAll(*outputDir, "{timestamp}", config.archiveTimestamp)
+		*outputDir = strings.ReplaceAll(*outputDir, "{username}", config.Username)
+		*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
+
+		dbSubDir := config.DatabaseCollection.OutputDir
+		if dbSubDir == "" {
+			dbSubDir = "Database"
+		}
+		loggerOutputDir = filepath.Join(*outputDir, dbSubDir)
 	} else {
 		// For other modes (--all, --logs, --info, etc.): use outputDir from config or flag
 		if *outputDir == "" {

@@ -326,7 +326,7 @@ databaseCollection:
       enabled: true
       queries:
         - name: "get_asset_devices_by_owner"
-          sql: "SELECT serial_number, created_at, initial_collection_done, asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'"
+          sql: "SELECT serial_number, created_at, initial_collection_done, id AS asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'"
           parameters: ["asset_device_id", "serial_number"]  # Extract multiple columns from results
         - name: "get_inferred_device_info"
           sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{asset_device_id}'"

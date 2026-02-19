@@ -1,0 +1,24 @@
+# Database Query Results: platform_common_db
+# Timestamp: 2026-02-19 05:22:29
+# Alias: psqlplatdb
+================================================================================
+
+## Query: get_asset_devices_by_owner
+SQL: SELECT serial_number, created_at, initial_collection_done, id AS asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'
+Status: SUCCESS
+Rows returned: 2
+--------------------------------------------------------------------------------
+serial_number | created_at | initial_collection_done | asset_device_id
+JA022321G-00008 | 2026-02-13 11:02:49.898245+00 | t | 99f6530f-1907-4b2b-b22e-86ee095c704d
+JA142040G-00471 | 2026-02-16 08:01:46.275018+00 | t | aca92fa9-b206-4b81-b455-13d4c4a1333d
+
+
+## Query: get_inferred_device_info
+SQL: SELECT * FROM inferred_device WHERE asset_device_id = '{asset_device_id}'
+Status: SUCCESS
+Rows returned: 1
+--------------------------------------------------------------------------------
+id | created_at | updated_at | deleted_at | customer_id | owner_id | area_id | asset_device_id | chassis_id | common_service_id | connection_status | connection_timestamp | description | device_type | fabric_device_state | firmware_version | functional_device_type | group_id | ip_address | is_stack | location | mac_address | managed | model_name | name | operating_system | scheduler_refresh_in_progress | scheduler_refresh_update_time | serial_number | stack_id | uptime | discovery_status_last_update_time | discovery_status_trace_id | extreme_common_types_discovery_status_enum | managed_by
+5ba964dd-823f-4a34-bd76-a98583073b12 | 2026-02-18 05:40:49.016375+00 | 2026-02-18 23:41:57.444951+00 |  | 0 | 1096 |  | 99f6530f-1907-4b2b-b22e-86ee095c704d | AE:ED:32:9D:E8:00 | 4707284265887 | 1 | 2026-02-18 23:41:46.868325+00 | Extreme Networks Switch Engine (Stack) version 33.5.1.6 by release-manager on Thu Oct 2 09:39:23 PM UTC 2025 | 1 | 2 | 33.5.1.6 | 2 | 5b7cf086-fce7-4b57-8e06-ad0405b40a5c | 10.127.35.116 | t | Chennai !stfloor 1stfloor | ae:ed:32:9d:e8:00 | t | 5420F-8W-16P-4XE | EXOS-Switch | 2 | f | 0001-01-01 00:00:00+00 | JA022321G-00008 | 4707284265896 | 5209200 | 2026-02-18 23:41:57.444496+00 | 93f6df40-d503-4036-bbe2-3286a6390ff9 | 5 | 
+
+

@@ -658,6 +658,13 @@ type DatabaseConfig struct {
 	Queries []DatabaseQuery `yaml:"queries"` // List of queries to execute
 }
 
+// QueryResultGroup represents results from a single parameter-value execution
+type QueryResultGroup struct {
+	ParamName  string     // Parameter name that was iterated (empty if single execution)
+	ParamValue string     // Parameter value used for this execution
+	Rows       [][]string // Result rows (first row is header)
+}
+
 // DatabaseCollection contains configuration for database query collection
 type DatabaseCollection struct {
 	Enabled      bool              `yaml:"enabled"`      // Master enable/disable
@@ -7595,7 +7602,7 @@ func executeDatabaseQueries(awsClient *ssh.Client, db DatabaseConfig, dbc Databa
 
 			// Execute query
 			logger.Info("  Executing query: %s", query.Name)
-			results, err := executeQueryWithGlobalParams(awsClient, db.Alias, query, globalParams, db.Name, dbc, logger)
+			resultGroups, err := executeQueryWithGlobalParams(awsClient, db.Alias, query, globalParams, db.Name, dbc, logger)
 
 			if err != nil {
 				logger.Error("    Failed: %v", err)
@@ -7609,8 +7616,23 @@ func executeDatabaseQueries(awsClient *ssh.Client, db DatabaseConfig, dbc Databa
 				continue
 			}
 
+			// Flatten groups into a single results slice for parameter extraction and backwards compat
+			var allResults [][]string
+			totalDataRows := 0
+			for _, grp := range resultGroups {
+				if len(grp.Rows) > 0 {
+					if len(allResults) == 0 {
+						allResults = append(allResults, grp.Rows[0]) // header from first group
+					}
+					if len(grp.Rows) > 1 {
+						allResults = append(allResults, grp.Rows[1:]...)
+						totalDataRows += len(grp.Rows) - 1
+					}
+				}
+			}
+
 			// Store results
-			queryResults[query.Name] = results
+			queryResults[query.Name] = allResults
 			completedQueries[query.Name] = true
 			progressMade = true
 
@@ -7618,30 +7640,44 @@ func executeDatabaseQueries(awsClient *ssh.Client, db DatabaseConfig, dbc Databa
 			f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
 			f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
 			f.WriteString(fmt.Sprintf("Status: SUCCESS\n"))
-			f.WriteString(fmt.Sprintf("Rows returned: %d\n", len(results)-1)) // -1 for header
+			f.WriteString(fmt.Sprintf("Total rows returned: %d\n", totalDataRows))
 			f.WriteString(strings.Repeat("-", 80) + "\n")
 
-			if len(results) > 0 {
-				// Write results in table format
-				for rowIdx, row := range results {
-					if rowIdx == 0 {
-						// Header row
-						f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
-					} else {
-						// Data row
+			if len(resultGroups) == 1 && resultGroups[0].ParamName == "" {
+				// Single execution (no multi-value parameter) - write flat
+				grp := resultGroups[0]
+				if len(grp.Rows) > 0 {
+					for _, row := range grp.Rows {
 						f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
 					}
+				} else {
+					f.WriteString("No results found.\n")
 				}
 			} else {
-				f.WriteString("No results found.\n")
+				// Multi-value execution - write grouped with labels
+				// Write header once
+				if len(allResults) > 0 {
+					f.WriteString(fmt.Sprintf("%s\n", strings.Join(allResults[0], " | ")))
+				}
+				for _, grp := range resultGroups {
+					f.WriteString(fmt.Sprintf("\n  --- %s = %s ---\n", grp.ParamName, grp.ParamValue))
+					if len(grp.Rows) > 1 {
+						for _, row := range grp.Rows[1:] {
+							f.WriteString(fmt.Sprintf("%s\n", strings.Join(row, " | ")))
+						}
+						f.WriteString(fmt.Sprintf("  (%d row(s))\n", len(grp.Rows)-1))
+					} else {
+						f.WriteString("  (no rows)\n")
+					}
+				}
 			}
 			f.WriteString("\n\n")
 
-			logger.Info("    Query completed: %d row(s) returned", len(results)-1)
+			logger.Info("    Query completed: %d row(s) returned", totalDataRows)
 
 			// Extract parameters from results if specified
-			if len(query.Parameters) > 0 && len(results) > 1 {
-				extractedValues := extractParametersFromResults(results, query.Parameters)
+			if len(query.Parameters) > 0 && len(allResults) > 1 {
+				extractedValues := extractParametersFromResults(allResults, query.Parameters)
 
 				// Add extracted parameters to global params with namespace
 				for paramName, values := range extractedValues {
@@ -7728,7 +7764,8 @@ func checkParameterAvailability(requiredParams []string, globalParams map[string
 }
 
 // executeQueryWithGlobalParams executes a query with parameter substitution from globalParams
-func executeQueryWithGlobalParams(awsClient *ssh.Client, alias string, query DatabaseQuery, globalParams map[string][]string, dbName string, dbc DatabaseCollection, logger *Logger) ([][]string, error) {
+// Returns results grouped by parameter value so the caller can label output clearly.
+func executeQueryWithGlobalParams(awsClient *ssh.Client, alias string, query DatabaseQuery, globalParams map[string][]string, dbName string, dbc DatabaseCollection, logger *Logger) ([]QueryResultGroup, error) {
 	// Extract required parameters from SQL
 	requiredParams := extractParametersFromSQL(query.SQL)
 
@@ -7771,8 +7808,7 @@ func executeQueryWithGlobalParams(awsClient *ssh.Client, alias string, query Dat
 	// If we have a multi-value parameter, execute query for each value
 	if multiValueParam != "" {
 		logger.Debug("      Executing query %d times (one per value of '%s')", len(multiValues), multiValueParam)
-		var allResults [][]string
-		var headerAdded bool
+		var groups []QueryResultGroup
 
 		for _, value := range multiValues {
 			// Create parameter map with this single value
@@ -7788,25 +7824,31 @@ func executeQueryWithGlobalParams(awsClient *ssh.Client, alias string, query Dat
 			results, err := executeSingleQuery(awsClient, alias, query.SQL, singleParams, dbc, logger)
 			if err != nil {
 				logger.Warn("      Failed for %s=%s: %v", multiValueParam, value, err)
+				// Still add an empty group so the output shows the failure
+				groups = append(groups, QueryResultGroup{
+					ParamName:  multiValueParam,
+					ParamValue: value,
+					Rows:       nil,
+				})
 				continue
 			}
 
-			if len(results) > 0 {
-				if !headerAdded {
-					allResults = append(allResults, results[0]) // Add header
-					headerAdded = true
-				}
-				if len(results) > 1 {
-					allResults = append(allResults, results[1:]...) // Add data rows
-				}
-			}
+			groups = append(groups, QueryResultGroup{
+				ParamName:  multiValueParam,
+				ParamValue: value,
+				Rows:       results,
+			})
 		}
 
-		return allResults, nil
+		return groups, nil
 	}
 
-	// Single execution
-	return executeSingleQuery(awsClient, alias, query.SQL, paramValues, dbc, logger)
+	// Single execution - return as a single group with no param label
+	results, err := executeSingleQuery(awsClient, alias, query.SQL, paramValues, dbc, logger)
+	if err != nil {
+		return nil, err
+	}
+	return []QueryResultGroup{{Rows: results}}, nil
 }
 
 // extractParametersFromResults extracts specified column values from query results
@@ -8393,11 +8435,7 @@ func main() {
 		*outputDir = strings.ReplaceAll(*outputDir, "{username}", config.Username)
 		*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
 
-		dbSubDir := config.DatabaseCollection.OutputDir
-		if dbSubDir == "" {
-			dbSubDir = "Database"
-		}
-		loggerOutputDir = filepath.Join(*outputDir, dbSubDir)
+		loggerOutputDir = *outputDir
 	} else {
 		// For other modes (--all, --logs, --info, etc.): use outputDir from config or flag
 		if *outputDir == "" {

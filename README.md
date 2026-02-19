@@ -4,9 +4,9 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 
 ## Download
 
-**Latest Release: v1.3.0**
+**Latest Release: v1.3.3**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.0)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.3)
 
 | Platform | Binary |
 |----------|--------|
@@ -14,6 +14,16 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**v1.3.3 Changes:**
+- **Database query collection** - Execute PostgreSQL queries via SSH tunnel (Bastion → AWS → psql)
+- **Config-based alias resolution** - Resolve psql aliases from config.yaml (no bash alias expansion needed)
+- **Cross-database parameter sharing** - Extract values from query results and use in subsequent queries
+- **Multi-value parameter support** - Comma-separated values execute queries N times automatically
+- **Grouped query output** - Multi-value results clearly labeled by parameter value
+- **Automatic dependency resolution** - Queries automatically ordered based on parameter availability
+- **Security** - Only SELECT queries allowed; data-modifying statements rejected
+- **Output directory fix** - Database files written to `C:\Logs\{timestamp}\Database\` per config
 
 **v1.3.0 Changes:**
 - **Multi-source credential retrieval** - Bastion passwords and JIRA tokens automatically stored in Windows Credential Manager
@@ -157,6 +167,9 @@ See [full config example](config.yaml) for all options.
 # Network device logs only
 .\logcollector.exe --device-logs
 
+# Database queries only
+.\logcollector.exe --database
+
 # System info only
 .\logcollector.exe --sys-info
 
@@ -171,9 +184,10 @@ See [full config example](config.yaml) for all options.
 
 | Mode | Description |
 |------|-------------|
-| `--all` | Logs + system info + app versions + devices (if enabled) |
+| `--all` | Logs + system info + app versions + devices + database (if enabled) |
 | `--logs-only` | Kubernetes pod logs only |
 | `--device-logs` | Network device diagnostics only |
+| `--database` | Database query collection only |
 | `--sys-info` | kubectl commands and cluster info |
 | `--version` | Application version collection |
 | (no flag) | Use config.yaml enabled/disabled settings |
@@ -339,6 +353,8 @@ C:/Logs/
 │   └── <namespace>/                # Pod logs
 │       └── <pod-name>/
 │           └── app.log
+├── Database/                       # Database query results
+│   └── platform_common_db_queries_20260217_143025.txt
 ├── Device_20260217_143025/
 │   ├── switch-01_diagnostics.txt
 │   └── switch-01_logs/

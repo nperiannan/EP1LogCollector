@@ -27,9 +27,9 @@ LogCollector is a command-line tool that automates the collection of logs and di
 
 ## Download
 
-**Latest Release: v1.3.4**
+**Latest Release: v1.3.5**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.4)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.5)
 
 **Documentation:**
 - [Quick Start Guide](QUICKSTART.md) - Get started quickly with minimal configuration
@@ -41,6 +41,13 @@ LogCollector is a command-line tool that automates the collection of logs and di
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**v1.3.5 Changes:**
+- **Bug Fix**: Fixed replica merging for pod file collections where pod name is in filename
+  - Issue: v1.3.4 only stripped replica suffixes from directory names
+  - Pod file collections have pod name in filename: `nvo-network-7c895646cd-7lgcp-server.log`
+  - Fix: Now strips replica suffixes from BOTH directory names AND filenames
+  - Result: All `nvo-network` replicas merge into single `nvo/nvo-network-server.log` file
 
 **v1.3.4 Changes:**
 - **Bug Fix**: Fixed replica log merging to properly combine all replica pods into single files

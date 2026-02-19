@@ -339,15 +339,9 @@ databaseCollection:
   parameters:
     owner_id: "1096"                 # Initial parameter - used by first query
   
-  # Alias resolution: bash aliases → full psql commands
-  aliases:
-    psqlplatdb: psqlrds              # psqlplatdb resolves to psqlrds
-    psqlrds: "psql -h aurora-db.cluster-xyz.us-east-2.rds.amazonaws.com -U dbuser -d platform_db --csv"
-  
   # Database configurations
   databases:
     - name: platform_common_db       # Database name (used in output filename)
-      alias: psqlplatdb              # Which alias to use (resolves to full psql command)
       
       queries:
         # Query 1: Get device IDs for owner
@@ -378,7 +372,6 @@ C:/Logs/20260219_143025/
 ```
 
 **Features:**
-- **Alias resolution**: Bash aliases from config resolved to full psql commands
 - **Cross-database parameters**: Query results from one query feed into the next as parameters
 - **Grouped output**: Multi-value parameters show labeled sections per value with row counts
 - **SSH tunneling**: Queries executed via bastion → AWS → RDS

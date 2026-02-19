@@ -27,9 +27,9 @@ LogCollector is a command-line tool that automates the collection of logs and di
 
 ## Download
 
-**Latest Release: v1.3.3**
+**Latest Release: v1.3.4**
 
-[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.3)
+[GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.4)
 
 **Documentation:**
 - [Quick Start Guide](QUICKSTART.md) - Get started quickly with minimal configuration
@@ -41,6 +41,13 @@ LogCollector is a command-line tool that automates the collection of logs and di
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
+
+**v1.3.4 Changes:**
+- **Bug Fix**: Fixed replica log merging to properly combine all replica pods into single files
+  - Issue: Kubernetes pods have TWO suffixes (ReplicaSet hash + Pod hash), previous code only removed one
+  - Example: `nvo-edge-7c59fdd6d6-7sqwc` has both `-7c59fdd6d6` and `-7sqwc` suffixes
+  - Fix: Now removes ALL suffixes, ensuring true Loki-style merging (one file per service)
+- **Documentation**: Added cross-references between README, QUICKSTART, and BUILD_INSTRUCTIONS
 
 **v1.3.3 Changes:**
 - **Database query collection** - Execute PostgreSQL queries via SSH tunnel (Bastion → AWS → psql)

@@ -328,25 +328,40 @@ C:/Logs/20260219_143025/
 
 ## Quick Start: Database Queries
 
-Execute PostgreSQL queries via SSH tunneling and collect results.
+Execute PostgreSQL queries via SSH tunneling and collect results with cross-database parameter passing.
 
 **1. Configure database queries in config.yaml:**
 ```yaml
 databaseCollection:
-  enabled: true
+  enabled: true                      # Enable database query collection
+  
+  # Global parameters used across all queries
+  parameters:
+    owner_id: "1096"                 # Initial parameter - used by first query
+  
+  # Alias resolution: bash aliases → full psql commands
   aliases:
-    psqlplatdb: psqlrds
-    psqlrds: "psql -h aurora-db.us-east-2.rds.amazonaws.com -U dbuser -d platform_db --csv"
+    psqlplatdb: psqlrds              # psqlplatdb resolves to psqlrds
+    psqlrds: "psql -h aurora-db.cluster-xyz.us-east-2.rds.amazonaws.com -U dbuser -d platform_db --csv"
+  
+  # Database configurations
   databases:
-    - name: platform_common_db
-      alias: psqlplatdb
+    - name: platform_common_db       # Database name (used in output filename)
+      alias: psqlplatdb              # Which alias to use (resolves to full psql command)
+      
       queries:
+        # Query 1: Get device IDs for owner
         - name: get_owner_devices
           sql: "SELECT id AS asset_device_id, name FROM devices WHERE owner_id = :owner_id;"
+          # :owner_id comes from parameters above (value: "1096")
+          # Returns: asset_device_id column values are extracted for next query
+        
+        # Query 2: Get details for each device from Query 1
         - name: device_details
           sql: "SELECT * FROM device_info WHERE asset_device_id = :asset_device_id;"
-  parameters:
-    owner_id: "1096"
+          # :asset_device_id comes from previous query's "asset_device_id" column
+          # If Query 1 returns multiple rows, this query runs once per asset_device_id value
+          # Output shows grouped results per asset_device_id value
 ```
 
 **2. Run collection:**
@@ -364,9 +379,22 @@ C:/Logs/20260219_143025/
 
 **Features:**
 - **Alias resolution**: Bash aliases from config resolved to full psql commands
-- **Cross-database parameters**: Query results from one query feed into the next
-- **Grouped output**: Multi-value parameters show labeled sections per value
+- **Cross-database parameters**: Query results from one query feed into the next as parameters
+- **Grouped output**: Multi-value parameters show labeled sections per value with row counts
 - **SSH tunneling**: Queries executed via bastion → AWS → RDS
+
+**How parameter passing works:**
+1. Query 1 uses `:owner_id` from `parameters` section (value: "1096")
+2. Query 1 returns column `asset_device_id` with multiple values (e.g., "abc-123", "def-456")
+3. Query 2 runs once per `asset_device_id` value extracted from Query 1
+4. Output shows grouped results:
+   ```
+   --- asset_device_id = abc-123 ---
+   (5 rows returned)
+   
+   --- asset_device_id = def-456 ---
+   (3 rows returned)
+   ```
 
 ## Config.yaml Reference
 

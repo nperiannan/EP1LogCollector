@@ -341,22 +341,20 @@ databaseCollection:
   
   # Database configurations
   databases:
-    - name: "platform_common_db"     # Database name (used in output filename)
-      alias: "psqlplatdb"            # Which alias to use for psql connection
-      enabled: true                  # Enable this database
+    - name: platform_common_db       # Database name (used in output filename)
       
       queries:
-        # Query 1: Get asset devices for owner
-        - name: "get_asset_devices_by_owner"
-          sql: "SELECT serial_number, created_at, initial_collection_done, id AS asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'"
-          parameters: ["asset_device_id", "serial_number"]  # Extract multiple columns from results
-          # '{owner_id}' comes from parameters above (value: "1096")
-          # Returns: asset_device_id and serial_number values extracted for next queries
+        # Query 1: Get device IDs for owner
+        - name: get_owner_devices
+          sql: "SELECT id AS asset_device_id, name FROM devices WHERE owner_id = {owner_id};"
+          parameters: ["asset_device_id", "serial_number"]  # Extract columns for next queries
+          # :owner_id comes from parameters above (value: "1096")
+          # Returns: asset_device_id column values are extracted for next query
         
-        # Query 2: Get inferred device info for each device from Query 1
-        - name: "get_inferred_device_info"
-          sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{asset_device_id}'"
-          # '{asset_device_id}' comes from previous query's extracted "asset_device_id" column
+        # Query 2: Get details for each device from Query 1
+        - name: device_details
+          sql: "SELECT * FROM device_info WHERE asset_device_id = {asset_device_id};"
+          # :asset_device_id comes from previous query's "asset_device_id" column
           # If Query 1 returns multiple rows, this query runs once per asset_device_id value
           # Output shows grouped results per asset_device_id value
 ```
@@ -380,10 +378,10 @@ C:/Logs/20260219_143025/
 - **SSH tunneling**: Queries executed via bastion → AWS → RDS
 
 **How parameter passing works:**
-1. Query 1 uses `'{owner_id}'` from `parameters` section (value: "1096")
+1. Query 1 uses `{owner_id}` from `parameters` section (value: "1096")
 2. Query 1 extracts columns via `parameters: ["asset_device_id", "serial_number"]`
 3. Query 1 returns `asset_device_id` with multiple values (e.g., "abc-123", "def-456")
-4. Query 2 runs once per `asset_device_id` value extracted from Query 1
+4. Query 2 uses `{asset_device_id}` which runs once per value extracted from Query 1
 5. Output shows grouped results:
    ```
    --- asset_device_id = abc-123 ---

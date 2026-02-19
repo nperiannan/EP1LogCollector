@@ -1,6 +1,29 @@
 # LogCollector
 
-Command-line tool for collecting logs and diagnostics from Kubernetes clusters and network devices via SSH bastion host.
+## What It Does
+
+LogCollector is a command-line tool that automates the collection of logs and diagnostics from Kubernetes clusters and network devices through our SSH bastion host. Instead of manually SSH-ing into systems, navigating directories, and copying files, this tool handles everything with a single command. This utility can significantly streamline our log collection and reduces the overhead.
+
+## Key Features
+
+- **Kubernetes log collection** - Gathers pod logs across namespaces with time-based filtering (e.g., last 15 minutes), includes system info and application versions
+- **Temporal workflow support** - Simplifies complex workflow log collection by automatically gathering workflow histories, schedules, and correlated logs across services
+- **Database query collection** - Execute PostgreSQL queries via SSH tunneling (Bastion → AWS → RDS) with cross-database parameter passing and automatic dependency resolution
+- **Network device diagnostics** - Executes CLI commands on EXOS/VOSS switches and downloads logs via SFTP and SCP
+- **Replica handling** - Automatically merges logs from replica pods and filters out old pod logs from persistent directories
+- **Fast transfers** - Uses native SCP or SFTP with automatic bastion→AWS→local routing
+- **Built-in analysis** - Pattern-based error detection with severity classification (Implementation is still in progress to identify the root cause)
+- **JIRA integration** - Upload collected logs directly to JIRA tickets with `logcollector.exe --all --jira XCP-12345`
+
+## Benefits for Daily Work
+
+- **Reduces log collection time** from 15-20 minutes to 2-5 minutes
+- **Eliminates manual SSH session juggling** and file transfers
+- **Provides organized output** with analytics reports for faster root cause analysis
+- **Highly configurable** - When new services are added to the cluster, simply add an entry to config.yaml - no code changes required
+- **Extensible design** - Supports any cloud-based application (ExtremeCloud IQ, wireless, etc.) through configuration
+- **Standardizes log collection** across the team
+- **Works across all platforms** (Windows, Linux, macOS)
 
 ## Download
 
@@ -46,7 +69,7 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 - Enhanced analytics report with transaction/request correlation section
 - Security: encrypted passwords excluded from logger_info.txt
 
-## What It Does
+## Technical Capabilities
 
 **Kubernetes:**
 - Collect pod logs from multiple namespaces
@@ -55,6 +78,15 @@ Command-line tool for collecting logs and diagnostics from Kubernetes clusters a
 - Application version tracking
 - System information (kubectl commands, pod status, nodes)
 - Direct pod file collection (wildcard support, pod-name filtering)
+
+**Database:**
+- PostgreSQL query execution via SSH tunneling (Bastion → AWS → RDS)
+- Bash alias resolution from config.yaml
+- Cross-database parameter passing (query results feed into next queries)
+- Multi-value parameter support (CSV values execute queries N times)
+- Automatic dependency resolution (queries ordered by parameter availability)
+- Grouped output with row counts per parameter value
+- Security: SELECT-only queries (data-modifying statements rejected)
 
 **Network Devices:**
 - EXOS/VOSS switch diagnostics via SSH

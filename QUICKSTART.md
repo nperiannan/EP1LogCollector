@@ -2,9 +2,9 @@
 
 A command-line tool to collect logs, system info, and application versions from Kubernetes clusters and network devices via SSH bastion host.
 
-## Latest Release: v1.3.0
+## Latest Release: v1.3.3
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v1.3.0)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/latest)
 
 | Platform | Binary |
 |----------|--------|
@@ -12,27 +12,6 @@ A command-line tool to collect logs, system info, and application versions from 
 | Linux (x64) | `logcollector-linux-amd64` |
 | macOS (Intel) | `logcollector-darwin-amd64` |
 | macOS (Apple Silicon) | `logcollector-darwin-arm64` |
-
-**What's New in v1.3.0:**
-- **Multi-source credential retrieval** - Bastion passwords and JIRA tokens stored securely in Windows Credential Manager
-- **One-time password entry** - Enter once, retrieved automatically on subsequent runs
-- **CI/CD support** - Environment variables (BASTION_PASSWORD, JIRA_API_TOKEN) for automation
-- **Template support** - JIRA email supports `{username}` and `{environment}` placeholders 
-- **Enhanced security** - Windows DPAPI encryption, accessible only by your user account
-
-**What's New in v1.2.2:**
-- **Automatic SFTP fallback** - When SCP fails (DNS resolution, network issues), automatically falls back to parallel SFTP for reliable downloads
-
-**v1.2.1 Features:**
-- **Pod file filtering** - New `matchPodName` option collects only current pod logs, excluding old pod logs in persistent directories
-
-**v1.2.0 Features:**
-- **Loki-style replica log merging** - Combines replica pod logs into single files
-- **Transaction ID correlation** - Groups related errors by correlation IDs across files
-- **Timestamp sorting** - Chronological ordering of merged logs
-- **Semantic error grouping** - Categorizes errors by type (Database, Permission, Network, Resource)
-- **Enhanced analytics** - Transaction/request correlation section in reports
-- **Security improvement** - Encrypted passwords excluded from logger_info.txt
 
 ## Prerequisites
 
@@ -225,16 +204,6 @@ jira:
 - `{username}` → Your username from config
 - `{environment}` → Environment name from config
 
-### Security Benefits
-
-✅ **Windows DPAPI encryption** - Credentials encrypted by Windows Data Protection API  
-✅ **User-scoped** - Only accessible by your Windows user account  
-✅ **Login-protected** - Cannot be accessed when computer is locked  
-✅ **One-time setup** - Enter credentials once, used automatically thereafter  
-✅ **Backward compatible** - Old config files still work  
-✅ **Priority system** - Use env vars for CI/CD, Credential Manager for desktop  
-✅ **IT-manageable** - Can be deployed via Group Policy  
-
 ## How to Use
 
 ### Basic Commands
@@ -281,6 +250,12 @@ jira:
 ```
 → Network device diagnostics and log files (EXOS/VOSS switches)
 
+**Collect Database Query Results:**
+```bash
+.\logcollector.exe --database
+```
+→ Execute PostgreSQL queries via SSH tunneling, collect results with cross-database parameter passing
+
 **Use Config File Settings:**
 ```bash
 .\logcollector.exe
@@ -311,6 +286,85 @@ jira:
 .\logcollector.exe --all --jira XCP-17614           # Attach to JIRA issue
 .\logcollector.exe --logs-only --jira XCP-12345     # Logs only, attach to JIRA
 ```
+
+## Quick Start: Device Logs
+
+Collect diagnostics and logs from network devices (EXOS/VOSS switches).
+
+**1. Configure devices in config.yaml:**
+```yaml
+deviceLogCollection:
+  enabled: true
+  devices:
+    - name: switch-1
+      host: 192.168.10.1
+      username: admin
+      password: "switch_password"
+      type: exos
+      commands:
+        - "show version"
+        - "show configuration"
+        - "show log messages"
+```
+
+**2. Run collection:**
+```bash
+.\logcollector.exe --device-logs
+```
+
+**3. Output location:**
+```
+C:/Logs/20260219_143025/
+├── logger_info.txt
+└── DeviceLogs/
+    └── switch-1_diagnostics_20260219_143025.txt
+```
+
+**Supported device types:**
+- `exos` - Extreme Networks EXOS switches
+- `voss` - Extreme Networks VOSS (Fabric) switches
+
+## Quick Start: Database Queries
+
+Execute PostgreSQL queries via SSH tunneling and collect results.
+
+**1. Configure database queries in config.yaml:**
+```yaml
+databaseCollection:
+  enabled: true
+  aliases:
+    psqlplatdb: psqlrds
+    psqlrds: "psql -h aurora-db.us-east-2.rds.amazonaws.com -U dbuser -d platform_db --csv"
+  databases:
+    - name: platform_common_db
+      alias: psqlplatdb
+      queries:
+        - name: get_owner_devices
+          sql: "SELECT id AS asset_device_id, name FROM devices WHERE owner_id = :owner_id;"
+        - name: device_details
+          sql: "SELECT * FROM device_info WHERE asset_device_id = :asset_device_id;"
+  parameters:
+    owner_id: "1096"
+```
+
+**2. Run collection:**
+```bash
+.\logcollector.exe --database
+```
+
+**3. Output location:**
+```
+C:/Logs/20260219_143025/
+├── logger_info.txt
+└── Database/
+    └── platform_common_db_queries_20260219_143025.txt
+```
+
+**Features:**
+- **Alias resolution**: Bash aliases from config resolved to full psql commands
+- **Cross-database parameters**: Query results from one query feed into the next
+- **Grouped output**: Multi-value parameters show labeled sections per value
+- **SSH tunneling**: Queries executed via bastion → AWS → RDS
 
 ## Config.yaml Reference
 
@@ -371,6 +425,18 @@ jira:
 - Configurable namespace, pod prefix, and file paths
 - Multiple collection configurations
 
+**Device Log Collection** (`deviceLogCollection.enabled`):
+- Collect diagnostics from network devices
+- Supports EXOS and VOSS switches
+- Configurable commands per device
+- Direct SSH connection to devices
+
+**Database Collection** (`databaseCollection.enabled`):
+- Execute PostgreSQL queries via SSH tunneling
+- Bash alias resolution from config
+- Cross-database parameter passing
+- Grouped output for multi-value parameters
+
 **JIRA Integration** (`jira.attachmentEnabled`):
 - Automatically attach downloaded files to JIRA issues
 - Command-line flag: `--jira XCP-12345`
@@ -402,9 +468,9 @@ appVersionCollection:
 
 After running `--all`, you'll get:
 ```
-C:/Logs/
+C:/Logs/20260217_143025/
 ├── app_log_20260217_143025.tar.gz          # Kubernetes pod logs
-├── logger_info_20260217_143025.txt         # Session log (all terminal output)
+├── logger_info.txt                         # Session log (all terminal output)
 ├── dev_app_versions_20260217_143025.txt    # Application versions
 ├── log_analytics_report_20260217_143025.txt  # Analytics report (if enabled)
 ├── filtered_logs_20260217_143025/          # Filtered logs (if enabled)
@@ -412,6 +478,11 @@ C:/Logs/
 │   │   └── app.log
 │   └── pod2/
 │       └── service.log
+├── Database/                               # Database query results (if enabled)
+│   └── platform_common_db_queries_20260217_143025.txt
+└── DeviceLogs/                             # Network device logs (if enabled)
+    ├── switch-1_diagnostics_20260217_143025.txt
+    └── switch-2_diagnostics_20260217_143025.txt
 
 Inside the archive (app_log_*.tar.gz):
 ├── General/                                # System info (inside archive)

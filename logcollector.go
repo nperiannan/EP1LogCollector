@@ -7608,10 +7608,7 @@ func executeDatabaseQueries(awsClient *ssh.Client, db DatabaseConfig, dbc Databa
 				logger.Error("    Failed: %v", err)
 				f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
 				f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
-				f.WriteString(fmt.Sprintf("Status: FAILED\n"))
-				f.WriteString(fmt.Sprintf("Error: %v\n\n", err))
-
-				// Remove from queue (don't retry failed queries)
+				f.WriteString("Status: FAILED\n")
 				remainingQueries = append(remainingQueries[:i], remainingQueries[i+1:]...)
 				continue
 			}
@@ -7639,7 +7636,7 @@ func executeDatabaseQueries(awsClient *ssh.Client, db DatabaseConfig, dbc Databa
 			// Write results to file
 			f.WriteString(fmt.Sprintf("## Query: %s\n", query.Name))
 			f.WriteString(fmt.Sprintf("SQL: %s\n", query.SQL))
-			f.WriteString(fmt.Sprintf("Status: SUCCESS\n"))
+			f.WriteString("Status: SUCCESS\n")
 			f.WriteString(fmt.Sprintf("Total rows returned: %d\n", totalDataRows))
 			f.WriteString(strings.Repeat("-", 80) + "\n")
 

@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.0.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.0.1"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -298,8 +298,17 @@ func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	message := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] [%s] %s\n", timestamp, level.String(), message)
-	fmt.Print(line)
-	// Also write to log file
+
+	// Terminal output: truncate to 118 visible characters + "..." (121 total)
+	const maxTerminalWidth = 118
+	lineNoNewline := strings.TrimRight(line, "\n")
+	if len(lineNoNewline) > maxTerminalWidth {
+		fmt.Println(lineNoNewline[:maxTerminalWidth] + "...")
+	} else {
+		fmt.Print(line)
+	}
+
+	// Log file: always write full untruncated line
 	if l.logFile != nil {
 		l.logFile.WriteString(line)
 	}
@@ -1359,6 +1368,9 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	// Start timing the log collection process
 	logCollectionStartTime := time.Now()
 	logger.Info("Starting Kubernetes log collection...")
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  LOG COLLECTION - Kubernetes pod logs")
+	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Debug("Received tempDir parameter: '%s'", tempDir)
 
 	// Parse time-based collection parameters
@@ -3274,6 +3286,10 @@ func collectSystemInfo(awsClient *ssh.Client, systemInfoConfig struct {
 		return nil
 	}
 
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  SYSTEM INFO - Collecting cluster information")
+	logger.Info("%s", strings.Repeat("=", 70))
+
 	// Validate and set timeout (default: 180, min: 60, max: 300)
 	timeoutSeconds := systemInfoConfig.CommandTimeout
 	if timeoutSeconds < 60 {
@@ -3518,6 +3534,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		return nil
 	}
 
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  TEMPORAL WORKFLOWS - Collecting workflow execution data")
+	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("Starting Temporal workflow information collection...")
 
 	// Set defaults
@@ -3903,6 +3922,9 @@ func collectTemporalScheduleInfo(awsClient *ssh.Client, temporalConfig struct {
 		return nil
 	}
 
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  TEMPORAL SCHEDULES - Collecting schedule information")
+	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("Starting Temporal schedule information collection...")
 
 	// Set defaults
@@ -4084,6 +4106,9 @@ func extractScheduleIDs(listOutput string, maxCount int) []string {
 
 // collectPodFiles collects specific files from pods based on configuration
 func collectPodFiles(awsClient *ssh.Client, collections []PodFileCollection, tempDir, finalLogFileName string) error {
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  POD FILE COLLECTION - Collecting files from inside pods")
+	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("Collecting pod files from %d configuration(s)...", len(collections))
 
 	for i, collection := range collections {
@@ -4629,9 +4654,9 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 		return nil
 	}
 
-	logger.Info("%s", "="+strings.Repeat("=", 69))
+	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("  LOG ANALYTICS - Analyzing downloaded archive for errors & issues")
-	logger.Info("%s", "="+strings.Repeat("=", 69))
+	logger.Info("%s", strings.Repeat("=", 70))
 
 	// Set defaults
 	if logAnalysisConfig.OutputFile == "" {
@@ -5768,9 +5793,9 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 		return nil
 	}
 
-	logger.Info("%s", "="+strings.Repeat("=", 69))
+	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("  MESSAGE FILTER - Filtering downloaded logs")
-	logger.Info("%s", "="+strings.Repeat("=", 69))
+	logger.Info("%s", strings.Repeat("=", 70))
 
 	if hasKeyValueFilters {
 		for _, kv := range filterConfig.KeyValueFilters {
@@ -6164,6 +6189,9 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config, outputD
 	}
 
 	logger.Debug("Starting standalone application version collection...")
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  APP VERSION - Collecting application version information")
+	logger.Info("%s", strings.Repeat("=", 70))
 
 	// First, let's check what namespaces are available
 	logger.Debug("Checking available namespaces...")
@@ -6422,15 +6450,15 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config, outputD
 
 	// Print to log if requested
 	if config.AppVersionCollection.PrintToLog {
-		logger.Debug("Application Version Information:")
-		logger.Debug("%s", strings.Repeat("=", 80))
+		logger.Info("Application Version Information:")
+		logger.Info("%s", strings.Repeat("=", 80))
 		lines := strings.Split(content, "\n")
 		for _, line := range lines {
 			if line != "" {
-				logger.Debug("%s", line)
+				logger.Info("%s", line)
 			}
 		}
-		logger.Debug("%s", strings.Repeat("=", 80))
+		logger.Info("%s", strings.Repeat("=", 80))
 	}
 
 	logger.Info("Standalone app version collection completed: %d/%d pods processed successfully", successCount, totalPods)
@@ -8099,6 +8127,10 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 		return "", nil
 	}
 
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  DEVICE LOG COLLECTION - Network device diagnostics")
+	logger.Info("%s", strings.Repeat("=", 70))
+
 	// Determine timestamp
 	if timestamp == "" {
 		timestamp = time.Now().Format("20060102_150405")
@@ -8204,6 +8236,10 @@ func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputD
 		logger.Warn("No enabled databases found in databaseCollection.databases")
 		return "", nil
 	}
+
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  DATABASE COLLECTION - PostgreSQL query results")
+	logger.Info("%s", strings.Repeat("=", 70))
 
 	// Determine timestamp
 	if timestamp == "" {
@@ -9967,6 +10003,9 @@ func main() {
 			}
 			// Download selected log files
 			totalFiles = len(selectedLogFiles)
+			logger.Info("%s", strings.Repeat("=", 70))
+			logger.Info("  FILE DOWNLOAD - Downloading %d file(s) to local machine", totalFiles)
+			logger.Info("%s", strings.Repeat("=", 70))
 			logger.Info("Starting download of %d file(s) to %s", totalFiles, *outputDir)
 			fmt.Println(strings.Repeat("-", 50))
 
@@ -10190,6 +10229,9 @@ func main() {
 	// Attach files to JIRA issue if requested
 	if *jiraIssueID != "" && successCount > 0 {
 		logger.Info("")
+		logger.Info("%s", strings.Repeat("=", 70))
+		logger.Info("  JIRA ATTACHMENT - Uploading files to %s", *jiraIssueID)
+		logger.Info("%s", strings.Repeat("=", 70))
 
 		// Check if JIRA attachment is enabled in config
 		if !config.Jira.AttachmentEnabled {
@@ -10211,16 +10253,38 @@ func main() {
 				}
 			}
 
-			// Add logger_info file
+			// Add logger_info file (check both with and without timestamp)
 			loggerInfoPath := filepath.Join(*outputDir, fmt.Sprintf("logger_info_%s.txt", config.archiveTimestamp))
 			if _, err := os.Stat(loggerInfoPath); err == nil {
 				attachmentFiles = append(attachmentFiles, loggerInfoPath)
+			} else {
+				// Fallback: check for logger_info.txt without timestamp
+				loggerInfoPathNoTs := filepath.Join(*outputDir, "logger_info.txt")
+				if _, err := os.Stat(loggerInfoPathNoTs); err == nil {
+					attachmentFiles = append(attachmentFiles, loggerInfoPathNoTs)
+				}
 			}
 
-			// Add app versions file
-			appVersionsPattern := fmt.Sprintf("*_app_versions_%s.txt", config.archiveTimestamp)
-			matches, _ := filepath.Glob(filepath.Join(*outputDir, appVersionsPattern))
-			attachmentFiles = append(attachmentFiles, matches...)
+			// Add app versions file - use the actual configured filename
+			appVersionFileName := config.AppVersionCollection.OutputFileName
+			if appVersionFileName != "" {
+				// Apply template replacements to match the actual file name
+				appVersionFileName = strings.ReplaceAll(appVersionFileName, "{environment}", config.Environment)
+				appVersionFileName = strings.ReplaceAll(appVersionFileName, "{username}", config.Username)
+				if config.archiveTimestamp != "" {
+					appVersionFileName = strings.ReplaceAll(appVersionFileName, "{timestamp}", config.archiveTimestamp)
+				} else {
+					appVersionFileName = strings.ReplaceAll(appVersionFileName, "{timestamp}", time.Now().Format("20060102_150405"))
+				}
+				appVersionFilePath := filepath.Join(*outputDir, appVersionFileName)
+				if _, err := os.Stat(appVersionFilePath); err == nil {
+					attachmentFiles = append(attachmentFiles, appVersionFilePath)
+				} else {
+					// Fallback: glob for any version info files
+					matches, _ := filepath.Glob(filepath.Join(*outputDir, "*ersion*nfo*.txt"))
+					attachmentFiles = append(attachmentFiles, matches...)
+				}
+			}
 
 			// Add analytics report file
 			analyticsReportPath := filepath.Join(*outputDir, fmt.Sprintf("log_analytics_report_%s.txt", config.archiveTimestamp))

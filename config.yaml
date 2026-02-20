@@ -8,8 +8,8 @@
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  ESSENTIALS - Change these values                                       │
 # └─────────────────────────────────────────────────────────────────────────┘
-username:                                   # Enter your corp username (e.g. "nperiannan")
-environment: dl2r1                          # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.)
+username: nperiannan                        # Enter your corp username (e.g. "nperiannan") ( Mandatory )
+environment: dl2r1                          # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.) ( Mandatory )
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  SSH CONNECTION                                                         │
@@ -74,7 +74,7 @@ logCollection:
   
   # ┌─── Message Filtering - Extract Specific Logs ────────────────────┐
   messageFilter:
-    enabled: false
+    enabled: true
     filterDuringDownload: false             # Apply grep filters during kubectl logs (faster but less sophisticated)
     keyValueFilters:
       - key: "ownerID"
@@ -89,7 +89,7 @@ logCollection:
   
   # ┌─── Log Analysis - Automatic Error Detection ─────────────────────────┐
   logAnalysis:
-    enabled: false
+    enabled: true
     outputFile: "log_analysis_summary.txt"
     errorPatterns:
       - "error"
@@ -189,7 +189,7 @@ logCollection:
   #       are controlled by defaultEP1Logs setting (above)
   # Add only ADDITIONAL collections below (beyond built-in defaults)
   podFileCollection:
-    enabled: false                      # Enable/disable pod file collection             
+    enabled: true                       # Enable/disable pod file collection             
     collections:                        # List of pod file collection configurations
       - namespace: "common"             # Kubernetes namespace
         podPrefix: "cs-configuration"   # Pod name prefix to match
@@ -203,7 +203,7 @@ logCollection:
 # └─────────────────────────────────────────────────────────────────────────┘
 # Note: Always runs when enabled (independent of defaultEP1Logs setting)
 systemInfo:
-  enabled: false
+  enabled: true
   outputDir: "System_Info"
   commandTimeout: 180                     # Timeout per command in seconds (60-300, default: 180)
   commands:
@@ -250,7 +250,7 @@ appVersionCollection:
 # │  DATABASE QUERIES - Troubleshooting data collection                     │
 # └─────────────────────────────────────────────────────────────────────────┘
 databaseCollection:
-  enabled: false
+  enabled: true
   outputDir: "Database"
   queryTimeout: 60
   
@@ -293,7 +293,7 @@ databaseCollection:
 # │  NETWORK DEVICE LOG COLLECTION - Collect logs from switches (NOS)       │
 # └─────────────────────────────────────────────────────────────────────────┘
 deviceLogCollection:
-  enabled: false
+  enabled: true
   outputDir: "Device"
   parallelDownloads: true                   # Download from multiple devices concurrently
   globalTimeout: 600                        # Total timeout per device (seconds)

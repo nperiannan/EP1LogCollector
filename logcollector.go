@@ -37,10 +37,73 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "1.0.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.0.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
+
+// Temporal Cheat Sheet - Default bash aliases for debugging Temporal workflows
+// These can be supplemented with custom aliases from config.yaml
+const temporalCheatSheet = `# ============================================================================
+# Temporal Cheat Sheet
+# ============================================================================
+# These are bash aliases for debugging Temporal workflows when exec'd into
+# a Temporal admin pod. Copy and paste these commands into your bash session.
+# 
+# Usage:
+#   1. kubectl exec -it <temporal-admin-pod> -n common -- bash
+#   2. Copy/paste the aliases below
+#   3. Use them: tc-list, tc-input <workflow-id>, tc-output <workflow-id>, etc.
+# ============================================================================
+
+# List all workflows in configuration namespace
+alias tc-list='temporal workflow list --namespace configuration'
+
+# Show workflow input (decoded from base64 and pretty-printed JSON)
+alias tc-input='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"; }; f'
+
+# Show workflow output (decoded from base64 and pretty-printed JSON)
+alias tc-output='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"; }; f'
+
+# Show both input and output for a workflow
+alias tc-both='f(){ echo "=== INPUT ===" && tc-input "$1" && echo -e "\n=== OUTPUT ===" && tc-output "$1"; }; f'
+
+# List all activities for a workflow with event IDs and types
+alias tc-activities='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""; }; f'
+
+# Show activity failure details for a specific activity by name
+alias tc-activity-failure='f(){
+  SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+    jq -r --arg activityName "$2" \
+      ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
+  if [ -n "$SCHED_ID" ]; then
+    temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+    jq -r --arg sid "$SCHED_ID" \
+      ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | \
+    jq . 2>/dev/null || echo "No failure data found for activity $2";
+  else
+    echo "Activity $2 not found";
+  fi
+}; f'
+
+# Show activity input by activity name
+alias tc-activity-input-by-name='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"$2\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity $2"; }; f'
+
+# Show activity output by activity name
+alias tc-activity-output='f(){
+  SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+    jq -r --arg activityName "$2" \
+      ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
+  if [ -n "$SCHED_ID" ]; then
+    temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
+    jq -r --arg sid "$SCHED_ID" \
+      ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | \
+    base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity $2";
+  else
+    echo "Activity $2 not found";
+  fi
+}; f'
+`
 
 // LogLevel represents different logging levels
 type LogLevel int
@@ -550,8 +613,62 @@ var defaultLogSources = []PodLogSource{
 	{Namespace: "common", PodPrefix: "hacr", LogPath: "/opt/hacr/logs", OutputName: "hac.log"},
 }
 
-// GeneralInfoCommand represents a command to collect general system information
-type GeneralInfoCommand struct {
+// Default pod file collections (controlled by defaultEP1Logs setting)
+var defaultPodFileCollections = []PodFileCollection{
+	// Common namespace - CS Configuration service
+	{
+		Namespace:    "common",
+		PodPrefix:    "cs-configuration",
+		LogPath:      "/var/log/configuration/",
+		FilePatterns: []string{"*.log"},
+		MatchPodName: true,
+	},
+	// NVO namespace - Orchestration Wired service
+	{
+		Namespace:    "nvo",
+		PodPrefix:    "nvo-orchestration-wired",
+		LogPath:      "/data/log/nvo-orchestration-wired/",
+		FilePatterns: []string{"*.log"},
+		MatchPodName: true,
+	},
+	// NVO namespace - Orchestration Wireless service
+	{
+		Namespace:    "nvo",
+		PodPrefix:    "nvo-orchestration-wireless",
+		LogPath:      "/data/log/nvo-orchestration-wireless/",
+		FilePatterns: []string{"*.log"},
+		MatchPodName: true,
+	},
+}
+
+// Default EXOS device diagnostic commands
+func getDefaultExosCommands() []DeviceCommand {
+	return []DeviceCommand{
+		{Name: "version", Command: "show version", Description: "Software version and hardware info"},
+		{Name: "switch", Command: "show switch", Description: "Switch status and uptime"},
+		{Name: "inlets", Command: "show inlets", Description: "Inlets status"},
+		{Name: "iqagent", Command: "show iqagent", Description: "IQ Agent status"},
+		{Name: "telemetry", Command: "show telemetry", Description: "Telemetry configuration"},
+		{Name: "vlan", Command: "show vlan", Description: "VLAN configuration"},
+		{Name: "running_config", Command: "show configuration", Description: "Running configuration"},
+		{Name: "openapi_logs", Command: "show openapi-server logs", Description: "OpenAPI server logs"},
+	}
+}
+
+// Default VOSS device diagnostic commands
+func getDefaultVossCommands() []DeviceCommand {
+	return []DeviceCommand{
+		{Name: "software", Command: "show software", Description: "Software version information"},
+		{Name: "sys_info", Command: "show sys-info", Description: "System information and uptime"},
+		{Name: "vlan", Command: "show vlan basic", Description: "VLAN configuration"},
+		{Name: "iqagent", Command: "show application iqagent", Description: "IQ Agent status"},
+		{Name: "inlets", Command: "show application inlets", Description: "Inlets status"},
+		{Name: "running_config", Command: "show running-config", Description: "Running configuration"},
+	}
+}
+
+// SystemInfoCommand represents a command to collect general system information
+type SystemInfoCommand struct {
 	Name        string `yaml:"name"`
 	Command     string `yaml:"command"`
 	Description string `yaml:"description"`
@@ -587,16 +704,14 @@ type DeviceCLISettings struct {
 
 // ExosDefaultConfig contains default settings for EXOS devices
 type ExosDefaultConfig struct {
-	PagingDisableCommand string          `yaml:"pagingDisableCommand"`
-	DiagnosticCommands   []DeviceCommand `yaml:"diagnosticCommands"`
+	// All EXOS defaults are now hardcoded in the functions
+	// No config needed - kept for backward compatibility
 }
 
 // VossDefaultConfig contains default settings for VOSS devices
 type VossDefaultConfig struct {
-	EnableCommand        string          `yaml:"enableCommand"`
-	ConfigCommand        string          `yaml:"configCommand"`
-	PagingDisableCommand string          `yaml:"pagingDisableCommand"`
-	DiagnosticCommands   []DeviceCommand `yaml:"diagnosticCommands"`
+	// All VOSS defaults are now hardcoded in the functions
+	// No config needed - kept for backward compatibility
 }
 
 // DeviceDiagnosticConfig controls diagnostic command collection for a device
@@ -703,6 +818,7 @@ type Config struct {
 	// New section for log collection
 	LogCollection struct {
 		Enabled             bool           `yaml:"enabled"`
+		DefaultEP1Logs      bool           `yaml:"defaultEP1Logs"` // Enable/disable default EP1 log collection (kubectl logs + temporal) (default: true)
 		LogFileName         string         `yaml:"logFileName"`
 		CustomSources       []PodLogSource `yaml:"customSources"`
 		TempDir             string         `yaml:"tempDir"`
@@ -715,10 +831,11 @@ type Config struct {
 			Duration string `yaml:"duration"` // Duration like "15m", "1h", "30m"
 		} `yaml:"timeBasedCollection"`
 		TemporalWorkflowCollection struct {
-			Enabled           bool   `yaml:"enabled"`           // Enable temporal workflow data collection
-			WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`  // Filter by workflow ID prefix
-			NumberOfWorkflows int    `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
-			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
+			Enabled           bool     `yaml:"enabled"`           // Enable temporal workflow data collection
+			WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`  // Filter by workflow ID prefix
+			NumberOfWorkflows int      `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
+			Namespace         string   `yaml:"namespace"`         // Temporal namespace (default: configuration)
+			CustomAliases     []string `yaml:"customAliases"`     // Optional custom bash aliases to append to cheat sheet
 		} `yaml:"temporalWorkflowCollection"`
 		TemporalScheduleCollection struct {
 			Enabled           bool   `yaml:"enabled"`           // Enable temporal schedule data collection
@@ -744,8 +861,9 @@ type Config struct {
 			} `yaml:"errorGroups"` // Semantic error grouping
 		} `yaml:"logAnalysis"`
 		MessageFilter struct {
-			Enabled         bool `yaml:"enabled"` // Enable/disable post-download message filtering
-			KeyValueFilters []struct {
+			Enabled              bool `yaml:"enabled"`              // Enable/disable post-download message filtering
+			FilterDuringDownload bool `yaml:"filterDuringDownload"` // Apply simple grep filters during kubectl logs download (faster, less bandwidth)
+			KeyValueFilters      []struct {
 				Key   string `yaml:"key"`   // Key to look for in log lines (e.g., ownerID, serial)
 				Value string `yaml:"value"` // Value to match (lines with key but different value are excluded)
 			} `yaml:"keyValueFilters"` // Keep lines where key is absent OR key has specified value
@@ -760,12 +878,13 @@ type Config struct {
 			Collections []PodFileCollection `yaml:"collections"` // List of pod file collection configurations
 		} `yaml:"podFileCollection"`
 	} `yaml:"logCollection"`
-	// General system information collection
-	GeneralInfo struct {
-		Enabled   bool                 `yaml:"enabled"`
-		OutputDir string               `yaml:"outputDir"`
-		Commands  []GeneralInfoCommand `yaml:"commands"`
-	} `yaml:"generalInfo"`
+	// System information collection
+	SystemInfo struct {
+		Enabled        bool                `yaml:"enabled"`
+		OutputDir      string              `yaml:"outputDir"`
+		CommandTimeout int                 `yaml:"commandTimeout"` // Timeout per command in seconds (60-300)
+		Commands       []SystemInfoCommand `yaml:"commands"`
+	} `yaml:"systemInfo"`
 	// Application version collection
 	AppVersionCollection struct {
 		Enabled        bool                  `yaml:"enabled"`
@@ -809,7 +928,7 @@ func LoadConfig(configPath string) (*Config, error) {
 }
 
 // printCollectionSummary displays what will be collected before starting connections
-func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, listOnly bool, config *Config, logger *Logger) {
+func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, listOnly bool, config *Config, logger *Logger) bool {
 	logger.Info("")
 	logger.Info("========================================")
 	logger.Info("PRE-FLIGHT COLLECTION SUMMARY")
@@ -825,39 +944,63 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 		logger.Info("Mode: LIST ONLY (no files will be downloaded)")
 		logger.Info("")
 		logger.Info("========================================")
-		return
+		return true // List mode always has work to do
 	}
 
 	collectionCount := 0
+	hasActualWork := false // Track if there's actual work to do
 
 	// Kubernetes Logs
 	if collectLogs {
 		collectionCount++
 		logger.Info("[%d] Kubernetes Log Collection: ENABLED", collectionCount)
+
+		// Check if there's actually anything to collect
+		hasKubectlLogs := (config.LogCollection.DefaultEP1Logs || len(config.LogCollection.CustomSources) > 0)
+		if hasKubectlLogs {
+			hasActualWork = true
+		}
 		if config.LogCollection.TimeBasedCollection.Enabled && config.LogCollection.TimeBasedCollection.Duration != "" {
 			logger.Info("    - Time-based collection: Last %s", config.LogCollection.TimeBasedCollection.Duration)
 		} else {
 			logger.Info("    - Time-based collection: Full logs")
 		}
 		if config.LogCollection.MessageFilter.Enabled {
-			logger.Info("    - Message filtering: ENABLED")
+			filterMode := "post-download"
+			if config.LogCollection.MessageFilter.FilterDuringDownload {
+				filterMode = "during-download"
+			}
+			logger.Info("    - Message filtering: ENABLED (%s)", filterMode)
 			if config.LogCollection.MessageFilter.CombineReplicas {
 				logger.Info("    - Replica log merging: ENABLED")
 			}
 		}
-		if config.LogCollection.TemporalWorkflowCollection.Enabled {
+		// Temporal collections are controlled by defaultEP1Logs setting
+		if config.LogCollection.DefaultEP1Logs && config.LogCollection.TemporalWorkflowCollection.Enabled {
 			logger.Info("    - Temporal workflows: %d workflows (prefix: %s)",
 				config.LogCollection.TemporalWorkflowCollection.NumberOfWorkflows,
 				config.LogCollection.TemporalWorkflowCollection.WorkflowIdPrefix)
 		}
-		if config.LogCollection.TemporalScheduleCollection.Enabled {
+		if config.LogCollection.DefaultEP1Logs && config.LogCollection.TemporalScheduleCollection.Enabled {
 			logger.Info("    - Temporal schedules: %d schedules",
 				config.LogCollection.TemporalScheduleCollection.NumberOfSchedules)
 		}
-		if config.LogCollection.PodFileCollection.Enabled && len(config.LogCollection.PodFileCollection.Collections) > 0 {
-			logger.Info("    - Pod file collection: %d pod(s) configured", len(config.LogCollection.PodFileCollection.Collections))
-			for _, podCol := range config.LogCollection.PodFileCollection.Collections {
-				logger.Info("      * %s/%s: %d pattern(s)", podCol.Namespace, podCol.PodPrefix, len(podCol.FilePatterns))
+		// Pod file collection - show defaults when defaultEP1Logs=true
+		if config.LogCollection.PodFileCollection.Enabled {
+			totalCollections := 0
+			if config.LogCollection.DefaultEP1Logs {
+				totalCollections += len(defaultPodFileCollections)
+			}
+			totalCollections += len(config.LogCollection.PodFileCollection.Collections)
+
+			if totalCollections > 0 {
+				logger.Info("    - Pod file collection: %d collection(s)", totalCollections)
+				if config.LogCollection.DefaultEP1Logs && len(defaultPodFileCollections) > 0 {
+					logger.Info("      * Built-in: cs-configuration, nvo-orchestration-wired, nvo-orchestration-wireless")
+				}
+				for _, podCol := range config.LogCollection.PodFileCollection.Collections {
+					logger.Info("      * Custom: %s/%s (%d pattern(s))", podCol.Namespace, podCol.PodPrefix, len(podCol.FilePatterns))
+				}
 			}
 		}
 		if config.LogCollection.LogAnalysis.Enabled {
@@ -870,9 +1013,10 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 	if collectInfo {
 		collectionCount++
 		logger.Info("[%d] System Information Collection: ENABLED", collectionCount)
-		if len(config.GeneralInfo.Commands) > 0 {
-			logger.Info("    - Commands configured: %d", len(config.GeneralInfo.Commands))
-			for _, cmd := range config.GeneralInfo.Commands {
+		if len(config.SystemInfo.Commands) > 0 {
+			hasActualWork = true
+			logger.Info("    - Commands configured: %d", len(config.SystemInfo.Commands))
+			for _, cmd := range config.SystemInfo.Commands {
 				logger.Info("      * %s", cmd.Name)
 			}
 		} else {
@@ -886,6 +1030,7 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 		collectionCount++
 		logger.Info("[%d] Application Version Collection: ENABLED", collectionCount)
 		if len(config.AppVersionCollection.Namespaces) > 0 {
+			hasActualWork = true
 			logger.Info("    - Namespaces to check: %d", len(config.AppVersionCollection.Namespaces))
 			for _, ns := range config.AppVersionCollection.Namespaces {
 				logger.Info("      * %s: %d pod prefix(es)", ns.Namespace, len(ns.PodPrefixes))
@@ -904,6 +1049,7 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 			for _, dev := range config.DeviceLogCollection.Devices {
 				if dev.Enabled {
 					enabledDevices++
+					hasActualWork = true
 				}
 			}
 			logger.Info("[%d] Network Device Log Collection: ENABLED", collectionCount)
@@ -930,6 +1076,7 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 			for _, db := range config.DatabaseCollection.Databases {
 				if db.Enabled {
 					enabledDBs++
+					hasActualWork = true
 				}
 			}
 			logger.Info("[%d] Database Query Collection: ENABLED", collectionCount)
@@ -965,10 +1112,58 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 		logger.Info("")
 	}
 
+	if !hasActualWork {
+		logger.Info("========================================")
+		logger.Warn("WARNING: No actual work to do!")
+		logger.Info("")
+		logger.Info("Collections are enabled but have no configured items:")
+		if collectLogs && !config.LogCollection.DefaultEP1Logs && len(config.LogCollection.CustomSources) == 0 {
+			logger.Info("  - Kubernetes logs: defaultEP1Logs=false and no custom sources")
+		}
+		if collectInfo && len(config.SystemInfo.Commands) == 0 {
+			logger.Info("  - System info: no commands configured")
+		}
+		if collectAppVersions && len(config.AppVersionCollection.Namespaces) == 0 {
+			logger.Info("  - App versions: no namespaces configured")
+		}
+		if collectDeviceLogs && (!config.DeviceLogCollection.Enabled || !hasEnabledDevices(config.DeviceLogCollection.Devices)) {
+			logger.Info("  - Device logs: no enabled devices")
+		}
+		if collectDatabase && (!config.DatabaseCollection.Enabled || !hasEnabledDatabases(config.DatabaseCollection.Databases)) {
+			logger.Info("  - Database: no enabled databases")
+		}
+		logger.Info("")
+		logger.Info("Please enable at least one feature with actual configuration.")
+		logger.Info("========================================")
+		logger.Info("")
+		return false
+	}
+
 	logger.Info("========================================")
 	logger.Info("Starting connection process...")
 	logger.Info("========================================")
 	logger.Info("")
+	return true
+}
+
+// Helper function to check if there are any enabled devices
+func hasEnabledDevices(devices []NetworkDevice) bool {
+	for _, dev := range devices {
+		if dev.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper function to check if there are any enabled databases
+func hasEnabledDatabases(databases []DatabaseConfig) bool {
+	for _, db := range databases {
+		if db.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 func sshConnectBastion(username, password, host string, port int) (*ssh.Client, error) {
@@ -1134,15 +1329,25 @@ func sshConnectAWSViaBastionWithLogging(bastionClient *ssh.Client, awsHost, keyP
 }
 
 // collectKubernetesLogs executes the log collection process remotely on AWS
-func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir string, customSources []PodLogSource, useTimestamp bool, timestampFormat, environment, username string, collectInfo bool, generalInfoConfig struct {
-	Enabled   bool                 `yaml:"enabled"`
-	OutputDir string               `yaml:"outputDir"`
-	Commands  []GeneralInfoCommand `yaml:"commands"`
-}, timeBasedEnabled bool, timeDurationStr string, maxSSHSessions int, autoDeleteTempDir bool, temporalConfig struct {
-	Enabled           bool   `yaml:"enabled"`
-	WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`
-	NumberOfWorkflows int    `yaml:"numberOfWorkflows"`
-	Namespace         string `yaml:"namespace"`
+func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir string, customSources []PodLogSource, useTimestamp bool, timestampFormat, environment, username string, collectInfo bool, systemInfoConfig struct {
+	Enabled        bool                `yaml:"enabled"`
+	OutputDir      string              `yaml:"outputDir"`
+	CommandTimeout int                 `yaml:"commandTimeout"`
+	Commands       []SystemInfoCommand `yaml:"commands"`
+}, timeBasedEnabled bool, timeDurationStr string, maxSSHSessions int, autoDeleteTempDir bool, defaultEP1Logs bool, messageFilterConfig struct {
+	Enabled              bool `yaml:"enabled"`
+	FilterDuringDownload bool `yaml:"filterDuringDownload"`
+	KeyValueFilters      []struct {
+		Key   string `yaml:"key"`
+		Value string `yaml:"value"`
+	} `yaml:"keyValueFilters"`
+	SpecificStrings []string `yaml:"specificStrings"`
+}, temporalConfig struct {
+	Enabled           bool     `yaml:"enabled"`
+	WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`
+	NumberOfWorkflows int      `yaml:"numberOfWorkflows"`
+	Namespace         string   `yaml:"namespace"`
+	CustomAliases     []string `yaml:"customAliases"`
 }, temporalScheduleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
 	NumberOfSchedules int    `yaml:"numberOfSchedules"`
@@ -1205,10 +1410,19 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 		logger.Info("Generated timestamped filename: %s", finalLogFileName)
 	}
 
-	// Use default sources if no custom sources provided
-	sources := defaultLogSources
+	// Use default sources based on defaultEP1Logs setting
+	var sources []PodLogSource
 	if len(customSources) > 0 {
+		// Custom sources always take precedence
 		sources = customSources
+	} else if defaultEP1Logs {
+		// Use built-in default sources only when defaultEP1Logs is enabled
+		sources = defaultLogSources
+		logger.Debug("Using default EP1 log sources (defaultEP1Logs=true)")
+	} else {
+		// No sources when defaultEP1Logs is disabled and no custom sources
+		sources = []PodLogSource{}
+		logger.Info("Default EP1 log collection is disabled (defaultEP1Logs=false), skipping built-in kubectl logs collection")
 	}
 
 	// Detect XIQ namespace: check if 'xiq' namespace exists, otherwise use environment name
@@ -1373,7 +1587,7 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 				src.Namespace, src.PodPrefix, idx+1, totalSources)
 
 			// Create independent SSH session for this collection
-			err := collectLogsFromSourceParallel(awsClient, src, logDir, timeBasedEnabled, sinceTime, maxSSHSessions)
+			err := collectLogsFromSourceParallel(awsClient, src, logDir, timeBasedEnabled, sinceTime, maxSSHSessions, defaultEP1Logs, messageFilterConfig)
 			resultChan <- logResult{source: src, index: idx, err: err}
 		}(source, i)
 	}
@@ -1415,43 +1629,66 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 		}
 	}
 
-	// Collect general system information before archiving (if enabled)
-	if collectInfo && generalInfoConfig.Enabled {
-		logger.Info("Starting general system information collection...")
-		err = collectGeneralInfo(awsClient, generalInfoConfig, environment, username, tempDir, finalLogFileName)
+	// Collect system information before archiving (if enabled)
+	if collectInfo && systemInfoConfig.Enabled {
+		logger.Info("Starting system information collection...")
+		err = collectSystemInfo(awsClient, systemInfoConfig, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("General info collection failed: %v", err)
 			// Don't return here - continue with archive creation
 		}
 	}
 
-	// Collect Temporal workflow information before archiving (if enabled)
-	if temporalConfig.Enabled {
+	// Collect Temporal workflow information before archiving (if enabled and defaultEP1Logs is true)
+	if defaultEP1Logs && temporalConfig.Enabled {
 		logger.Info("Starting Temporal workflow information collection...")
 		err = collectTemporalWorkflowInfo(awsClient, temporalConfig, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("Temporal workflow collection failed: %v", err)
 			// Don't return here - continue with archive creation
 		}
+	} else if !defaultEP1Logs && temporalConfig.Enabled {
+		logger.Info("Temporal workflow collection skipped (defaultEP1Logs=false)")
 	}
 
-	// Collect Temporal schedule information before archiving (if enabled)
-	if temporalScheduleConfig.Enabled {
+	// Collect Temporal schedule information before archiving (if enabled and defaultEP1Logs is true)
+	if defaultEP1Logs && temporalScheduleConfig.Enabled {
 		logger.Info("Starting Temporal schedule information collection...")
 		err = collectTemporalScheduleInfo(awsClient, temporalScheduleConfig, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("Temporal schedule collection failed: %v", err)
 			// Don't return here - continue with archive creation
 		}
+	} else if !defaultEP1Logs && temporalScheduleConfig.Enabled {
+		logger.Info("Temporal schedule collection skipped (defaultEP1Logs=false)")
 	}
 
 	// Collect pod files before archiving (if enabled)
-	if podFileCollectionConfig.Enabled && len(podFileCollectionConfig.Collections) > 0 {
-		logger.Info("Starting pod file collection...")
-		err = collectPodFiles(awsClient, podFileCollectionConfig.Collections, tempDir, finalLogFileName)
-		if err != nil {
-			logger.Warn("Pod file collection failed: %v", err)
-			// Don't return here - continue with archive creation
+	if podFileCollectionConfig.Enabled {
+		// Build collection list: start with defaults when defaultEP1Logs is enabled
+		var collectionsToProcess []PodFileCollection
+
+		if defaultEP1Logs {
+			// Add default collections (cs-configuration, nvo-orchestration-wired, nvo-orchestration-wireless)
+			collectionsToProcess = append(collectionsToProcess, defaultPodFileCollections...)
+			logger.Debug("Added %d default pod file collections (defaultEP1Logs=true)", len(defaultPodFileCollections))
+		}
+
+		// Add any additional collections from config
+		if len(podFileCollectionConfig.Collections) > 0 {
+			collectionsToProcess = append(collectionsToProcess, podFileCollectionConfig.Collections...)
+			logger.Debug("Added %d custom pod file collections from config", len(podFileCollectionConfig.Collections))
+		}
+
+		if len(collectionsToProcess) > 0 {
+			logger.Info("Starting pod file collection (total: %d collections)...", len(collectionsToProcess))
+			err = collectPodFiles(awsClient, collectionsToProcess, tempDir, finalLogFileName)
+			if err != nil {
+				logger.Warn("Pod file collection failed: %v", err)
+				// Don't return here - continue with archive creation
+			}
+		} else {
+			logger.Debug("Pod file collection enabled but no collections configured")
 		}
 	}
 
@@ -1480,6 +1717,62 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 			fileSize = strings.TrimSpace(string(output))
 		}
 	}
+
+	// Get archive size in bytes for validation
+	var fileSizeBytes int64
+	byteSizeSession, byteSizeErr := awsClient.NewSession()
+	if byteSizeErr == nil {
+		defer byteSizeSession.Close()
+		sizeBytesCmd := fmt.Sprintf("stat -c %%s %s/%s.tar.gz 2>/dev/null || stat -f %%z %s/%s.tar.gz 2>/dev/null", tempDir, finalLogFileName, tempDir, finalLogFileName)
+		if bytesOutput, bytesExecErr := byteSizeSession.Output(sizeBytesCmd); bytesExecErr == nil {
+			if parsedSize, parseErr := strconv.ParseInt(strings.TrimSpace(string(bytesOutput)), 10, 64); parseErr == nil {
+				fileSizeBytes = parsedSize
+			}
+		}
+	}
+
+	// Validate archive size - if too small, likely no data was collected
+	if fileSizeBytes > 0 && fileSizeBytes < 1024 { // Less than 1KB (just tar overhead)
+		logger.Warn("Archive size is very small (%s / %d bytes) - no data was collected", fileSize, fileSizeBytes)
+		logger.Info("")
+		logger.Info("Cleaning up empty archive and temporary directory...")
+
+		// Delete the empty archive
+		delArchiveSession, _ := awsClient.NewSession()
+		if delArchiveSession != nil {
+			defer delArchiveSession.Close()
+			delArchiveCmd := fmt.Sprintf("rm -f %s/%s.tar.gz", tempDir, finalLogFileName)
+			executeCommandAsRoot(delArchiveSession, delArchiveCmd)
+		}
+
+		// Delete temp directory
+		delTempSession, _ := awsClient.NewSession()
+		if delTempSession != nil {
+			defer delTempSession.Close()
+			delTempCmd := fmt.Sprintf("rm -rf %s/%s", tempDir, finalLogFileName)
+			executeCommandAsRoot(delTempSession, delTempCmd)
+		}
+
+		logger.Info("")
+		logger.Info("========================================")
+		logger.Error("No data collected - possible reasons:")
+		logger.Info("  1. No matching pods found for the specified namespaces/prefixes")
+		logger.Info("  2. Pods exist but have no log files")
+		logger.Info("  3. Time-based collection window has no logs")
+		logger.Info("  4. Message filtering excluded all log entries")
+		logger.Info("")
+		logger.Info("Please check your configuration and try again.")
+		logger.Info("========================================")
+		return "", fmt.Errorf("no data collected - archive size too small (%d bytes)", fileSizeBytes)
+	}
+
+	if fileSize != "" {
+		logger.Info("Archive created successfully: %s", fileSize)
+	} else {
+		logger.Info("Archive created successfully")
+	}
+
+	logger.Info("Moving archive to /home/%s/", userID)
 
 	logger.Info("Moving archive to /home/%s/", userID)
 	// Move archive to user directory using a fresh session
@@ -1577,7 +1870,15 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 }
 
 // collectLogsFromSourceParallel collects logs from a specific pod source using an independent SSH session
-func collectLogsFromSourceParallel(awsClient *ssh.Client, source PodLogSource, logDir string, timeBasedEnabled bool, sinceTime string, maxSSHSessions int) error {
+func collectLogsFromSourceParallel(awsClient *ssh.Client, source PodLogSource, logDir string, timeBasedEnabled bool, sinceTime string, maxSSHSessions int, defaultEP1Logs bool, messageFilterConfig struct {
+	Enabled              bool `yaml:"enabled"`
+	FilterDuringDownload bool `yaml:"filterDuringDownload"`
+	KeyValueFilters      []struct {
+		Key   string `yaml:"key"`
+		Value string `yaml:"value"`
+	} `yaml:"keyValueFilters"`
+	SpecificStrings []string `yaml:"specificStrings"`
+}) error {
 	// kubectl command to get pod names - try multiple approaches for robustness
 	// NOTE: Each command needs its own SSH session to avoid "Stdout already set" errors
 
@@ -1780,15 +2081,83 @@ func collectLogsFromSourceParallel(awsClient *ssh.Client, source PodLogSource, l
 	// Handle time-based vs file-based collection
 	if timeBasedEnabled && sinceTime != "" {
 		logger.Info("Using time-based collection for %s namespace (since %s)", source.Namespace, sinceTime)
-		return collectTimeBasedLogs(awsClient, source, logDir, podNames, sinceTime, maxSSHSessions)
+		return collectTimeBasedLogs(awsClient, source, logDir, podNames, sinceTime, maxSSHSessions, defaultEP1Logs, messageFilterConfig)
 	} else {
 		logger.Debug("Using file-based collection for %s namespace", source.Namespace)
 		return collectFileBased(awsClient, source, logDir, podNames, maxSSHSessions)
 	}
 }
 
+// buildGrepFilter constructs a grep command chain from the message filter configuration
+func buildGrepFilter(config struct {
+	Enabled              bool `yaml:"enabled"`
+	FilterDuringDownload bool `yaml:"filterDuringDownload"`
+	KeyValueFilters      []struct {
+		Key   string `yaml:"key"`
+		Value string `yaml:"value"`
+	} `yaml:"keyValueFilters"`
+	SpecificStrings []string `yaml:"specificStrings"`
+}) string {
+	if !config.FilterDuringDownload {
+		return ""
+	}
+
+	var grepParts []string
+
+	// Build grep patterns for key-value filters
+	// For JSON logs, we look for "key":"value" or key.*value patterns
+	for _, filter := range config.KeyValueFilters {
+		if filter.Key == "" {
+			continue
+		}
+		if filter.Value != "" {
+			// Escape special characters in key and value for grep
+			key := strings.ReplaceAll(filter.Key, `"`, `\"`)
+			value := strings.ReplaceAll(filter.Value, `"`, `\"`)
+			// Match "key":"value" pattern (JSON) or key.*value (flexible)
+			grepParts = append(grepParts, fmt.Sprintf(`grep -E '"%s".*"%s"|%s.*%s'`, key, value, key, value))
+		} else {
+			// Just match lines containing the key
+			key := strings.ReplaceAll(filter.Key, `"`, `\"`)
+			grepParts = append(grepParts, fmt.Sprintf(`grep '%s'`, key))
+		}
+	}
+
+	// Build grep patterns for specific strings
+	if len(config.SpecificStrings) > 0 {
+		var patterns []string
+		for _, str := range config.SpecificStrings {
+			if str != "" {
+				// Escape special regex characters for literal matching
+				escaped := strings.ReplaceAll(str, `\`, `\\`)
+				escaped = strings.ReplaceAll(escaped, `'`, `'\''`)
+				patterns = append(patterns, escaped)
+			}
+		}
+		if len(patterns) > 0 {
+			// Combine all patterns with OR (|) for efficiency
+			grepParts = append(grepParts, fmt.Sprintf(`grep -E '%s'`, strings.Join(patterns, "|")))
+		}
+	}
+
+	// Chain all grep commands with pipes
+	if len(grepParts) > 0 {
+		return " | " + strings.Join(grepParts, " | ")
+	}
+
+	return ""
+}
+
 // collectTimeBasedLogs collects logs using kubectl logs with --since parameter
-func collectTimeBasedLogs(awsClient *ssh.Client, source PodLogSource, logDir string, podNames []string, sinceTime string, maxSSHSessions int) error {
+func collectTimeBasedLogs(awsClient *ssh.Client, source PodLogSource, logDir string, podNames []string, sinceTime string, maxSSHSessions int, defaultEP1Logs bool, messageFilterConfig struct {
+	Enabled              bool `yaml:"enabled"`
+	FilterDuringDownload bool `yaml:"filterDuringDownload"`
+	KeyValueFilters      []struct {
+		Key   string `yaml:"key"`
+		Value string `yaml:"value"`
+	} `yaml:"keyValueFilters"`
+	SpecificStrings []string `yaml:"specificStrings"`
+}) error {
 	// Create directories for logs
 	namespaceDir := fmt.Sprintf("%s/%s", logDir, source.Namespace)
 
@@ -1813,6 +2182,12 @@ func collectTimeBasedLogs(awsClient *ssh.Client, source PodLogSource, logDir str
 		if err := executeCommandAsRoot(session2, createDirsCmd); err != nil {
 			logger.Warn("Failed to create some directories: %v", err)
 		}
+	}
+
+	// Check if pod logs download is disabled
+	if !defaultEP1Logs {
+		logger.Info("Default EP1 log collection is disabled (defaultEP1Logs=false), skipping built-in kubectl logs collection")
+		return nil
 	}
 
 	// Collect logs from each pod using kubectl logs --since-time (CONFIGURABLE SSH management)
@@ -1869,6 +2244,14 @@ func collectTimeBasedLogs(awsClient *ssh.Client, source PodLogSource, logDir str
 
 			// Use kubectl logs with --since parameter
 			logsCmd := fmt.Sprintf("timeout 180 kubectl logs -n %s %s --since-time=%s", source.Namespace, pod, sinceTime)
+
+			// Apply grep filtering during download if enabled
+			grepFilter := buildGrepFilter(messageFilterConfig)
+			if grepFilter != "" {
+				logsCmd += grepFilter
+				logger.Debug("Applying during-download filter: kubectl logs with grep filters")
+			}
+
 			logger.Debug("Executing kubectl logs: %s", logsCmd)
 
 			// Execute and redirect output to file
@@ -2879,22 +3262,38 @@ func isCommandSafeForSystemInfo(command string) (bool, string) {
 	return true, ""
 }
 
-// collectGeneralInfo executes general system information commands and saves outputs to files on the remote server
-func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
-	Enabled   bool                 `yaml:"enabled"`
-	OutputDir string               `yaml:"outputDir"`
-	Commands  []GeneralInfoCommand `yaml:"commands"`
+// collectSystemInfo executes system information commands and saves outputs to files on the remote server
+func collectSystemInfo(awsClient *ssh.Client, systemInfoConfig struct {
+	Enabled        bool                `yaml:"enabled"`
+	OutputDir      string              `yaml:"outputDir"`
+	CommandTimeout int                 `yaml:"commandTimeout"`
+	Commands       []SystemInfoCommand `yaml:"commands"`
 }, environment, username, tempDir, finalLogFileName string) error {
-	if !generalInfoConfig.Enabled || len(generalInfoConfig.Commands) == 0 {
-		logger.Debug("General info collection is disabled or no commands configured")
+	if !systemInfoConfig.Enabled || len(systemInfoConfig.Commands) == 0 {
+		logger.Debug("System info collection is disabled or no commands configured")
 		return nil
 	}
 
-	logger.Info("Starting general system information collection...")
+	// Validate and set timeout (default: 180, min: 60, max: 300)
+	timeoutSeconds := systemInfoConfig.CommandTimeout
+	if timeoutSeconds < 60 {
+		logger.Warn("Command timeout %d seconds is too low, using minimum: 60 seconds", timeoutSeconds)
+		timeoutSeconds = 60
+	} else if timeoutSeconds > 300 {
+		logger.Warn("Command timeout %d seconds is too high, using maximum: 300 seconds", timeoutSeconds)
+		timeoutSeconds = 300
+	} else if timeoutSeconds == 0 {
+		timeoutSeconds = 180 // default
+		logger.Debug("Using default command timeout: 180 seconds")
+	} else {
+		logger.Debug("Using configured command timeout: %d seconds", timeoutSeconds)
+	}
+
+	logger.Info("Starting general system information collection (timeout: %d seconds per command)...", timeoutSeconds)
 
 	// Create the general info directory on the remote server inside the log collection directory
 	logDir := fmt.Sprintf("%s/%s", tempDir, finalLogFileName)
-	generalOutputDir := fmt.Sprintf("%s/%s", logDir, generalInfoConfig.OutputDir)
+	generalOutputDir := fmt.Sprintf("%s/%s", logDir, systemInfoConfig.OutputDir)
 
 	logger.Debug("TempDir: %s", tempDir)
 	logger.Debug("FinalLogFileName: %s", finalLogFileName)
@@ -2941,9 +3340,9 @@ func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 	timestamp := time.Now().Format("20060102_150405")
 
 	successCount := 0
-	totalCommands := len(generalInfoConfig.Commands)
+	totalCommands := len(systemInfoConfig.Commands)
 
-	for i, cmd := range generalInfoConfig.Commands {
+	for i, cmd := range systemInfoConfig.Commands {
 		logger.Info("Executing command %d/%d: %s", i+1, totalCommands, cmd.Name)
 
 		// Apply template replacement to the command
@@ -2966,10 +3365,40 @@ func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 			continue
 		}
 
-		// Execute the command as root
+		// Execute the command as root with configurable timeout
 		logger.Debug("Executing: %s", command)
-		output, err := cmdSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", command))
-		cmdSession.Close()
+
+		type cmdResult struct {
+			output []byte
+			err    error
+		}
+		resultChan := make(chan cmdResult, 1)
+
+		// Run command in goroutine
+		go func() {
+			output, err := cmdSession.CombinedOutput(fmt.Sprintf("sudo su - -c '%s'", command))
+			resultChan <- cmdResult{output: output, err: err}
+		}()
+
+		// Wait for command or timeout
+		var output []byte
+		select {
+		case result := <-resultChan:
+			output = result.output
+			err = result.err
+			cmdSession.Close()
+		case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+			logger.Warn("Command '%s' timed out after %d seconds - interrupting", cmd.Name, timeoutSeconds)
+			// Close the session to terminate the command
+			cmdSession.Close()
+			err = fmt.Errorf("command timed out after %d seconds", timeoutSeconds)
+			output = []byte(fmt.Sprintf("Command timed out after %d seconds", timeoutSeconds))
+			// Try to drain the result channel to avoid goroutine leak
+			select {
+			case <-resultChan:
+			default:
+			}
+		}
 
 		if err != nil {
 			logger.Warn("Command '%s' failed: %v", cmd.Name, err)
@@ -3078,10 +3507,11 @@ func collectGeneralInfo(awsClient *ssh.Client, generalInfoConfig struct {
 
 // collectTemporalWorkflowInfo collects Temporal workflow debugging information from the admin pod
 func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
-	Enabled           bool   `yaml:"enabled"`
-	WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`
-	NumberOfWorkflows int    `yaml:"numberOfWorkflows"`
-	Namespace         string `yaml:"namespace"`
+	Enabled           bool     `yaml:"enabled"`
+	WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`
+	NumberOfWorkflows int      `yaml:"numberOfWorkflows"`
+	Namespace         string   `yaml:"namespace"`
+	CustomAliases     []string `yaml:"customAliases"`
 }, environment, username, tempDir, finalLogFileName string) error {
 	if !temporalConfig.Enabled {
 		logger.Debug("Temporal workflow collection is disabled")
@@ -3170,21 +3600,6 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 			}(),
 			strings.Repeat("-", 60),
 			string(listOutput)))
-
-	// Also save JSON listing as workflow_list.json (useful for programmatic analysis)
-	jsonListSession, jsonErr := awsClient.NewSession()
-	if jsonErr == nil {
-		jsonListCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s --output json 2>/dev/null",
-			adminPod, temporalNamespace)
-		jsonListOutput, jsonExecErr := jsonListSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", jsonListCmd))
-		jsonListSession.Close()
-		if jsonExecErr == nil {
-			writeFileToRemote(awsClient, fmt.Sprintf("%s/workflow_list.json", temporalOutputDir), string(jsonListOutput))
-			logger.Debug("Saved JSON workflow listing to workflow_list.json")
-		} else {
-			logger.Debug("JSON workflow listing failed (non-critical): %v", jsonExecErr)
-		}
-	}
 
 	// Step 3: Extract workflow IDs from the tabular listing
 	listOutputStr := string(listOutput)
@@ -3307,6 +3722,25 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 
 	logger.Info("Temporal workflow collection completed: %d workflow(s) collected", len(workflowIDs))
 	logger.Info("Temporal data saved to remote directory: %s", temporalOutputDir)
+
+	// Write Temporal cheat sheet with custom aliases appended
+	logger.Info("Writing Temporal cheat sheet to output...")
+	cheatSheetContent := temporalCheatSheet
+
+	// Append custom aliases if provided
+	if len(temporalConfig.CustomAliases) > 0 {
+		cheatSheetContent += "\n# ============================================================================\n"
+		cheatSheetContent += "# CUSTOM ALIASES (from config.yaml)\n"
+		cheatSheetContent += "# ============================================================================\n\n"
+		for _, alias := range temporalConfig.CustomAliases {
+			cheatSheetContent += alias + "\n"
+		}
+	}
+
+	cheatSheetFile := fmt.Sprintf("%s/temporal_cheatsheet.sh", temporalOutputDir)
+	writeFileToRemote(awsClient, cheatSheetFile, cheatSheetContent)
+	logger.Info("Temporal cheat sheet saved to: %s", cheatSheetFile)
+
 	return nil
 }
 
@@ -3953,6 +4387,223 @@ type FileAnalysisSummary struct {
 	PatternCounts map[string]int // count per pattern
 }
 
+// categorizeAnalyzedFiles logs statistics about the types of files being analyzed
+func categorizeAnalyzedFiles(logFiles []string, extractDir string) {
+	var podLogs, podFiles, systemInfo, temporalFiles, filteredLogs, dbQueryFiles, otherFiles []string
+
+	for _, path := range logFiles {
+		relPath, _ := filepath.Rel(extractDir, path)
+		relPathLower := strings.ToLower(relPath)
+
+		// Categorize based on path patterns
+		switch {
+		case strings.Contains(relPathLower, "/temporal/"):
+			temporalFiles = append(temporalFiles, relPath)
+		case strings.Contains(relPathLower, "/database/"):
+			dbQueryFiles = append(dbQueryFiles, relPath)
+		case strings.Contains(relPathLower, "/general_info/") || strings.Contains(relPathLower, "/systeminfo/"):
+			systemInfo = append(systemInfo, relPath)
+		case strings.Contains(relPathLower, "/filter/"):
+			filteredLogs = append(filteredLogs, relPath)
+		case strings.Contains(relPathLower, "/pods/") || strings.Contains(relPathLower, "-server.log") || strings.Contains(relPathLower, "-server_err.log"):
+			podFiles = append(podFiles, relPath)
+		case strings.HasSuffix(relPathLower, ".log") && (strings.Contains(relPathLower, "/xiq/") || strings.Contains(relPathLower, "/common/") || strings.Contains(relPathLower, "/nvo/") || strings.Contains(relPathLower, "/configuration/")):
+			podLogs = append(podLogs, relPath)
+		default:
+			otherFiles = append(otherFiles, relPath)
+		}
+	}
+
+	logger.Info("Analyzing %d file(s) across multiple categories:", len(logFiles))
+	if len(podLogs) > 0 {
+		logger.Info("  → Pod Logs (kubectl logs): %d files", len(podLogs))
+	}
+	if len(podFiles) > 0 {
+		logger.Info("  → Pod Files (kubectl cp): %d files", len(podFiles))
+	}
+	if len(systemInfo) > 0 {
+		logger.Info("  → System Info: %d files", len(systemInfo))
+	}
+	if len(temporalFiles) > 0 {
+		logger.Info("  → Temporal Workflow Data: %d files", len(temporalFiles))
+	}
+	if len(dbQueryFiles) > 0 {
+		logger.Info("  → Database Query Results: %d files", len(dbQueryFiles))
+	}
+	if len(filteredLogs) > 0 {
+		logger.Info("  → Filtered Logs: %d files", len(filteredLogs))
+	}
+	if len(otherFiles) > 0 {
+		logger.Info("  → Other Files: %d files", len(otherFiles))
+	}
+}
+
+// PodStatusIssue represents a problematic pod status
+type PodStatusIssue struct {
+	PodName   string
+	Namespace string
+	Status    string
+	Restarts  string
+	Age       string
+	IssueType string // "CrashLoopBackOff", "Evicted", "NotReady", "Error", "Pending", "ImagePullBackOff", etc.
+	Severity  string // "CRITICAL", "HIGH", "MEDIUM"
+}
+
+// isAgeLessThanDays checks if a Kubernetes age string (e.g., "12d", "3h", "45m", "1d2h") is less than the specified number of days
+func isAgeLessThanDays(age string, days int) bool {
+	if age == "" {
+		return false
+	}
+
+	// Parse age format: can be "12d", "3h", "45m", "1d2h", etc.
+	totalHours := 0.0
+
+	// Extract numbers and units
+	var currentNum strings.Builder
+	for i := 0; i < len(age); i++ {
+		ch := age[i]
+		if ch >= '0' && ch <= '9' {
+			currentNum.WriteByte(ch)
+		} else if ch == 'd' || ch == 'h' || ch == 'm' || ch == 's' {
+			if currentNum.Len() > 0 {
+				num := 0
+				fmt.Sscanf(currentNum.String(), "%d", &num)
+				currentNum.Reset()
+
+				switch ch {
+				case 'd':
+					totalHours += float64(num * 24)
+				case 'h':
+					totalHours += float64(num)
+				case 'm':
+					totalHours += float64(num) / 60.0
+				case 's':
+					totalHours += float64(num) / 3600.0
+				}
+			}
+		}
+	}
+
+	thresholdHours := float64(days * 24)
+	return totalHours < thresholdHours
+}
+
+// analyzePodStatus parses kubectl get pods output and identifies problematic pods
+func analyzePodStatus(logFiles []string, extractDir string) []PodStatusIssue {
+	var issues []PodStatusIssue
+
+	// Find files that might contain pod status
+	for _, path := range logFiles {
+		relPath, _ := filepath.Rel(extractDir, path)
+		relPathLower := strings.ToLower(relPath)
+
+		// Look for files with names like "kubectl_get_pods*.txt" or similar
+		if !strings.Contains(relPathLower, "pod") || (!strings.Contains(relPathLower, "kubectl") && !strings.Contains(relPathLower, "general_info")) {
+			continue
+		}
+
+		// Read the file
+		content, err := ioutil.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		// Process lines to find pod statuses
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "NAME") || strings.HasPrefix(line, "#") {
+				continue // Skip header and comment lines
+			}
+
+			// Parse pod status line (format: NAME READY STATUS RESTARTS AGE)
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				continue
+			}
+
+			podName := fields[0]
+			ready := fields[1]
+			status := fields[2]
+			restarts := fields[3]
+			age := fields[4]
+			namespace := "unknown"
+
+			// Try to extract namespace from column if -A flag was used
+			if len(fields) >= 6 && !strings.Contains(fields[1], "/") {
+				namespace = fields[0]
+				podName = fields[1]
+				ready = fields[2]
+				status = fields[3]
+				restarts = fields[4]
+				age = fields[5]
+			}
+
+			// Identify problem pods
+			var issueType string
+			var severity string
+
+			statusLower := strings.ToLower(status)
+			switch {
+			case strings.Contains(statusLower, "crashloopbackoff"):
+				issueType = "CrashLoopBackOff"
+				severity = "CRITICAL"
+			case strings.Contains(statusLower, "evicted"):
+				issueType = "Evicted"
+				severity = "CRITICAL"
+			case strings.Contains(statusLower, "error"):
+				issueType = "Error"
+				severity = "CRITICAL"
+			case strings.Contains(statusLower, "imagepullbackoff") || strings.Contains(statusLower, "errimagepull"):
+				issueType = "ImagePullBackOff"
+				severity = "HIGH"
+			case strings.Contains(statusLower, "pending") && age != "" && !strings.Contains(age, "s") && !strings.Contains(age, "m"): // Pending for a long time
+				issueType = "Pending (Long Duration)"
+				severity = "HIGH"
+			case strings.Contains(statusLower, "terminating") && age != "" && !strings.Contains(age, "s") && !strings.Contains(age, "m"):
+				issueType = "Terminating (Stuck)"
+				severity = "MEDIUM"
+			case strings.Contains(statusLower, "oomkilled"):
+				issueType = "OOMKilled"
+				severity = "CRITICAL"
+			case (!strings.Contains(ready, "/") || strings.HasPrefix(ready, "0/")) && !strings.Contains(statusLower, "completed"):
+				// Only flag NotReady if: restarts > 0 OR age < 1 day
+				restartCount := 0
+				fmt.Sscanf(restarts, "%d", &restartCount)
+				isYoung := isAgeLessThanDays(age, 1)
+				if restartCount > 0 || isYoung {
+					issueType = "NotReady"
+					severity = "HIGH"
+				}
+			case status == "Running" && restarts != "0" && restarts != "":
+				// Parse restart count
+				restartCount := 0
+				fmt.Sscanf(restarts, "%d", &restartCount)
+				if restartCount >= 5 {
+					issueType = "Excessive Restarts"
+					severity = "MEDIUM"
+				}
+			default:
+				continue // Not a problem pod
+			}
+
+			if issueType != "" {
+				issues = append(issues, PodStatusIssue{
+					PodName:   podName,
+					Namespace: namespace,
+					Status:    status,
+					Restarts:  restarts,
+					Age:       age,
+					IssueType: issueType,
+					Severity:  severity,
+				})
+			}
+		}
+	}
+
+	return issues
+}
+
 // analyzeDownloadedLogs extracts a downloaded .tar.gz archive and analyzes all log files
 // for error patterns, correlates issues across files, and generates a comprehensive report
 func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig struct {
@@ -4100,7 +4751,9 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 		logger.Warn("No log/text files found in the archive to analyze")
 		return nil
 	}
-	logger.Info("Found %d file(s) to analyze", len(logFiles))
+
+	// Log the different file categories being analyzed
+	categorizeAnalyzedFiles(logFiles, extractDir)
 
 	// Step 3: Analyze each file for error patterns
 	var allSummaries []FileAnalysisSummary
@@ -4130,6 +4783,15 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 	}
 
 	logger.Info("Analysis complete: %d total matches across %d file(s)", totalMatchesFound, len(allSummaries))
+
+	// Step 3b: Analyze pod status issues
+	logger.Info("Analyzing Kubernetes pod status for issues...")
+	podStatusIssues := analyzePodStatus(logFiles, extractDir)
+	if len(podStatusIssues) > 0 {
+		logger.Warn("Found %d problematic pod(s) with status issues", len(podStatusIssues))
+	} else {
+		logger.Info("No pod status issues detected")
+	}
 
 	// Step 4: Correlate errors across files
 	correlatedIssues := correlateErrors(allSummaries, globalPatternCounts, patternFileMap)
@@ -4163,7 +4825,7 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 	}
 	reportPath := filepath.Join(outputDir, reportFileName)
 	err = generateAnalyticsReport(reportPath, allSummaries, correlatedIssues,
-		globalPatternCounts, logAnalysisConfig, totalMatchesFound, archivePath, correlationIDIssues)
+		globalPatternCounts, logAnalysisConfig, totalMatchesFound, archivePath, correlationIDIssues, podStatusIssues)
 	if err != nil {
 		return fmt.Errorf("failed to generate analytics report: %v", err)
 	}
@@ -4647,7 +5309,7 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 			Patterns []string `yaml:"patterns"`
 			Severity string   `yaml:"severity"`
 		} `yaml:"errorGroups"`
-	}, totalMatches int, archivePath string, correlationIDIssues []CorrelationIDIssue) error {
+	}, totalMatches int, archivePath string, correlationIDIssues []CorrelationIDIssue, podStatusIssues []PodStatusIssue) error {
 
 	file, err := os.Create(reportPath)
 	if err != nil {
@@ -4672,8 +5334,73 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 	fmt.Fprintf(w, "  Max Matches:   %d per file\n", config.MaxMatches)
 	fmt.Fprintf(w, "  Files Analyzed: %d with matches out of total scanned\n", len(summaries))
 	fmt.Fprintf(w, "  Total Matches: %d\n", totalMatches)
+	if len(podStatusIssues) > 0 {
+		fmt.Fprintf(w, "  Pod Status Issues: %d problematic pods detected\n", len(podStatusIssues))
+	}
 	fmt.Fprintln(w, strings.Repeat("=", 80))
 	fmt.Fprintln(w)
+
+	// ---- SECTION 0: POD STATUS ISSUES (if any) ----
+	if len(podStatusIssues) > 0 {
+		fmt.Fprintln(w, strings.Repeat("*", 80))
+		fmt.Fprintln(w, "  SECTION 0: KUBERNETES POD STATUS ISSUES")
+		fmt.Fprintln(w, strings.Repeat("*", 80))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "  The following pods have problematic statuses that require attention:")
+		fmt.Fprintln(w)
+
+		// Group by severity
+		criticalPods := []PodStatusIssue{}
+		highPods := []PodStatusIssue{}
+		mediumPods := []PodStatusIssue{}
+
+		for _, issue := range podStatusIssues {
+			switch issue.Severity {
+			case "CRITICAL":
+				criticalPods = append(criticalPods, issue)
+			case "HIGH":
+				highPods = append(highPods, issue)
+			case "MEDIUM":
+				mediumPods = append(mediumPods, issue)
+			}
+		}
+
+		if len(criticalPods) > 0 {
+			fmt.Fprintln(w, "  CRITICAL ISSUES:", len(criticalPods), "pod(s)")
+			fmt.Fprintln(w, "  "+strings.Repeat("-", 76))
+			for _, issue := range criticalPods {
+				fmt.Fprintf(w, "    • Pod: %s (Namespace: %s)\n", issue.PodName, issue.Namespace)
+				fmt.Fprintf(w, "      Issue: %s | Status: %s | Restarts: %s | Age: %s\n",
+					issue.IssueType, issue.Status, issue.Restarts, issue.Age)
+			}
+			fmt.Fprintln(w)
+		}
+
+		if len(highPods) > 0 {
+			fmt.Fprintln(w, "  HIGH PRIORITY ISSUES:", len(highPods), "pod(s)")
+			fmt.Fprintln(w, "  "+strings.Repeat("-", 76))
+			for _, issue := range highPods {
+				fmt.Fprintf(w, "    • Pod: %s (Namespace: %s)\n", issue.PodName, issue.Namespace)
+				fmt.Fprintf(w, "      Issue: %s | Status: %s | Restarts: %s | Age: %s\n",
+					issue.IssueType, issue.Status, issue.Restarts, issue.Age)
+			}
+			fmt.Fprintln(w)
+		}
+
+		if len(mediumPods) > 0 {
+			fmt.Fprintln(w, "  MEDIUM PRIORITY ISSUES:", len(mediumPods), "pod(s)")
+			fmt.Fprintln(w, "  "+strings.Repeat("-", 76))
+			for _, issue := range mediumPods {
+				fmt.Fprintf(w, "    • Pod: %s (Namespace: %s)\n", issue.PodName, issue.Namespace)
+				fmt.Fprintf(w, "      Issue: %s | Status: %s | Restarts: %s | Age: %s\n",
+					issue.IssueType, issue.Status, issue.Restarts, issue.Age)
+			}
+			fmt.Fprintln(w)
+		}
+
+		fmt.Fprintln(w, "  "+strings.Repeat("=", 76))
+		fmt.Fprintln(w)
+	}
 
 	// ---- SECTION 1: EXECUTIVE SUMMARY ----
 	fmt.Fprintln(w, strings.Repeat("*", 80))
@@ -5017,8 +5744,9 @@ func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []C
 //   - combineReplicas: If enabled, merges logs from replica pods into single files (e.g., nvo-edge-abc + nvo-edge-xyz → nvo-edge.log)
 //   - sortByTimestamp: If enabled, sorts combined logs chronologically by timestamp
 func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
-	Enabled         bool `yaml:"enabled"`
-	KeyValueFilters []struct {
+	Enabled              bool `yaml:"enabled"`
+	FilterDuringDownload bool `yaml:"filterDuringDownload"`
+	KeyValueFilters      []struct {
 		Key   string `yaml:"key"`
 		Value string `yaml:"value"`
 	} `yaml:"keyValueFilters"`
@@ -5087,13 +5815,34 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 	// Create filter output directory: outputDir/filtered_logs_{timestamp}/
 	filterBaseDir := filepath.Join(outputDir, filterDirName)
 
-	// Discover all files
+	// Discover all files (ONLY kubectl logs and pod file collection logs, NOT system info/database/version files)
 	var logFiles []string
 	err = filepath.Walk(extractDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil || info.IsDir() {
 			return nil
 		}
-		// Only filter text/log files
+
+		// Skip system directories (System_Info, Database, App_Version_Info, etc.)
+		// Message filtering should ONLY apply to kubectl logs and pod file collection
+		relPath, _ := filepath.Rel(extractDir, path)
+		pathLower := strings.ToLower(relPath)
+
+		// Skip if path contains system directories
+		skipDirs := []string{"system_info", "database", "app_version_info", "version_info"}
+		shouldSkip := false
+		for _, skipDir := range skipDirs {
+			if strings.Contains(pathLower, skipDir) {
+				shouldSkip = true
+				break
+			}
+		}
+
+		if shouldSkip {
+			logger.Debug("Skipping system file from message filtering: %s", relPath)
+			return nil
+		}
+
+		// Only filter text/log files (kubectl logs and pod file collection)
 		ext := strings.ToLower(filepath.Ext(path))
 		switch ext {
 		case ".log", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".out", ".err", "":
@@ -5267,7 +6016,7 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 				dir := filepath.Dir(relPath)
 				file := filepath.Base(relPath)
 				podDir := filepath.Base(dir)
-				
+
 				dirChanged := false
 				fileChanged := false
 
@@ -6374,7 +7123,8 @@ func collectExosDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	// Determine which commands to run
 	var commands []DeviceCommand
 	if device.Diagnostics.UseDefaults {
-		commands = append(commands, dlc.ExosDefaults.DiagnosticCommands...)
+		// Use hardcoded default EXOS commands
+		commands = append(commands, getDefaultExosCommands()...)
 	}
 	if len(device.Diagnostics.AdditionalCommands) > 0 {
 		commands = append(commands, device.Diagnostics.AdditionalCommands...)
@@ -6753,39 +7503,28 @@ func connectToVossDevice(device NetworkDevice, logger *Logger) (*DeviceSession, 
 }
 
 // initVossSession enters enable mode and config mode, then disables paging.
-// VOSS requires: en → conf terminal → terminal more disable
+// VOSS requires: enable → configure terminal → terminal more disable
+// All commands are hardcoded as they are standard VOSS commands
 func (ds *DeviceSession) initVossSession(dlc DeviceLogCollection) error {
 	logger := ds.Logger
 
-	// Step 1: Enter enable mode
-	enableCmd := dlc.VossDefaults.EnableCommand
-	if enableCmd == "" {
-		enableCmd = "en"
-	}
+	// Step 1: Enter enable mode (hardcoded VOSS command)
 	logger.Info("Entering enable mode on '%s'...", ds.Device.Name)
-	if _, err := ds.sendCommand(enableCmd, 10*time.Second); err != nil {
+	if _, err := ds.sendCommand("enable", 10*time.Second); err != nil {
 		return fmt.Errorf("failed to enter enable mode on %s: %v", ds.Device.Name, err)
 	}
 	logger.Info("Enable mode active on '%s'", ds.Device.Name)
 
-	// Step 2: Enter config mode
-	configCmd := dlc.VossDefaults.ConfigCommand
-	if configCmd == "" {
-		configCmd = "configure terminal"
-	}
+	// Step 2: Enter config mode (hardcoded VOSS command)
 	logger.Info("Entering config mode on '%s'...", ds.Device.Name)
-	if _, err := ds.sendCommand(configCmd, 10*time.Second); err != nil {
+	if _, err := ds.sendCommand("configure terminal", 10*time.Second); err != nil {
 		return fmt.Errorf("failed to enter config mode on %s: %v", ds.Device.Name, err)
 	}
 	logger.Info("Config mode active on '%s'", ds.Device.Name)
 
-	// Step 3: Disable CLI paging
-	pagingCmd := dlc.VossDefaults.PagingDisableCommand
-	if pagingCmd == "" {
-		pagingCmd = "terminal more disable"
-	}
+	// Step 3: Disable CLI paging (hardcoded VOSS command)
 	logger.Info("Disabling CLI paging on '%s'...", ds.Device.Name)
-	if _, err := ds.sendCommand(pagingCmd, 10*time.Second); err != nil {
+	if _, err := ds.sendCommand("terminal more disable", 10*time.Second); err != nil {
 		return fmt.Errorf("failed to disable paging on %s: %v", ds.Device.Name, err)
 	}
 	logger.Info("CLI paging disabled on '%s'", ds.Device.Name)
@@ -6801,7 +7540,8 @@ func collectVossDiagnostics(ds *DeviceSession, device NetworkDevice, dlc DeviceL
 	// Determine which commands to run
 	var commands []DeviceCommand
 	if device.Diagnostics.UseDefaults {
-		commands = append(commands, dlc.VossDefaults.DiagnosticCommands...)
+		// Use hardcoded default VOSS commands
+		commands = append(commands, getDefaultVossCommands()...)
 	}
 	if len(device.Diagnostics.AdditionalCommands) > 0 {
 		commands = append(commands, device.Diagnostics.AdditionalCommands...)
@@ -7254,8 +7994,8 @@ func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollect
 			return fmt.Errorf("failed to create output directory %s: %v", deviceOutputDir, err)
 		}
 
-		// Disable paging
-		if err := ds.disableExosPaging(dlc.ExosDefaults.PagingDisableCommand); err != nil {
+		// Disable paging (hardcoded EXOS command)
+		if err := ds.disableExosPaging("disable clipaging"); err != nil {
 			return fmt.Errorf("failed to disable paging on %s: %v", device.Name, err)
 		}
 
@@ -7533,15 +8273,13 @@ func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputD
 		logger.Info("")
 		logger.Info("Processing database: %s (alias: %s)", db.Name, db.Alias)
 
-		// Check if alias is available in config
-		if _, ok := dbc.Aliases[db.Alias]; !ok {
-			logger.Warn("  Alias '%s' not found in config - skipping database %s", db.Alias, db.Name)
-			continue
-		}
-
-		// Check if alias is available on AWS server before attempting queries
+		// Check if alias is available (behavior depends on whether aliases are defined in config)
 		if !isAliasAvailable(awsClient, db.Alias, dbc.Aliases, logger) {
-			logger.Warn("Alias '%s' not available on AWS server - skipping database %s", db.Alias, db.Name)
+			if len(dbc.Aliases) > 0 {
+				logger.Warn("  Alias '%s' not available - skipping database %s", db.Alias, db.Name)
+			} else {
+				logger.Warn("  Bash alias '%s' not available on AWS server - skipping database %s", db.Alias, db.Name)
+			}
 			continue
 		}
 
@@ -7561,26 +8299,54 @@ func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputD
 
 // isAliasAvailable checks if an alias command is available on the AWS server
 func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]string, logger *Logger) bool {
-	// Verify alias exists in config and can be resolved to a full psql command
-	_, ok := aliases[alias]
-	if !ok {
-		logger.Debug("  Alias '%s' not found in config", alias)
+	if len(aliases) > 0 {
+		// Config mode: Verify alias exists in config and can be resolved to a full psql command
+		_, ok := aliases[alias]
+		if !ok {
+			logger.Debug("  Alias '%s' not found in config", alias)
+			return false
+		}
+
+		// Resolve the alias chain to get the full psql command
+		// e.g., psqlplatdb -> psqlrds -U postgres -d platform_common_db -> psql -h aurora-... -U postgres -d platform_common_db
+		resolved := resolveAliases(alias, aliases)
+		logger.Debug("  Alias '%s' resolves to: %s", alias, resolved)
+
+		// Verify the resolved command starts with 'psql' (fully resolved)
+		if !strings.HasPrefix(resolved, "psql ") && resolved != "psql" {
+			logger.Debug("  Alias '%s' could not be fully resolved (got: %s)", alias, resolved)
+			return false
+		}
+
+		logger.Debug("  Alias '%s' is available (resolved from config)", alias)
+		return true
+	} else {
+		// Bash alias mode: Test if the alias exists on the AWS server
+		logger.Debug("  Testing bash alias '%s' on AWS server...", alias)
+
+		// Test if alias exists by running as root (where aliases are defined)
+		// Source root's bash profile, then check if alias is defined
+		testCmd := fmt.Sprintf(`sudo bash -c 'source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; alias %s >/dev/null 2>&1 && echo "ALIAS_OK" || echo "ALIAS_NOT_FOUND"'`, alias)
+
+		session, err := awsClient.NewSession()
+		if err != nil {
+			logger.Debug("  Failed to create SSH session for alias test: %v", err)
+			return false
+		}
+		defer session.Close()
+
+		output, err := session.CombinedOutput(testCmd)
+		outputStr := strings.TrimSpace(string(output))
+
+		// Check the result (ignore err since command may succeed but bash might print warnings)
+		if strings.Contains(outputStr, "ALIAS_OK") {
+			logger.Debug("  Bash alias '%s' is available on AWS server", alias)
+			return true
+		}
+
+		logger.Debug("  Bash alias '%s' not found on AWS server (output: %s)", alias, outputStr)
 		return false
 	}
-
-	// Resolve the alias chain to get the full psql command
-	// e.g., psqlplatdb -> psqlrds -U postgres -d platform_common_db -> psql -h aurora-... -U postgres -d platform_common_db
-	resolved := resolveAliases(alias, aliases)
-	logger.Debug("  Alias '%s' resolves to: %s", alias, resolved)
-
-	// Verify the resolved command starts with 'psql' (fully resolved)
-	if !strings.HasPrefix(resolved, "psql ") && resolved != "psql" {
-		logger.Debug("  Alias '%s' could not be fully resolved (got: %s)", alias, resolved)
-		return false
-	}
-
-	logger.Debug("  Alias '%s' is available (resolved from config)", alias)
-	return true
 }
 
 // executeDatabaseQueries executes all queries for a single database with automatic parameter resolution
@@ -7994,28 +8760,56 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 		return nil, fmt.Errorf("SQL validation failed: %v", err)
 	}
 
-	// Verify alias exists in config
-	_, ok := dbc.Aliases[alias]
-	if !ok {
-		return nil, fmt.Errorf("alias '%s' not found in config", alias)
+	// Determine whether to use config-defined aliases or bash aliases from AWS server
+	// If aliases are defined in config.yaml, resolve them (legacy/custom behavior)
+	// If aliases are NOT defined, use bash aliases directly from AWS server (portable across environments)
+	var psqlCommand string
+	var fullCommand string
+
+	if len(dbc.Aliases) > 0 {
+		// Config-defined aliases mode: Resolve alias chain from config
+		_, ok := dbc.Aliases[alias]
+		if !ok {
+			return nil, fmt.Errorf("alias '%s' not found in config", alias)
+		}
+
+		// Resolve the alias chain from config to get the full psql command
+		// e.g., psqlplatdb -> psqlrds -U postgres -d platform_common_db
+		//                  -> psql -h aurora-dl2.cluster-... -U postgres -d platform_common_db
+		resolvedCmd := resolveAliases(alias, dbc.Aliases)
+		logger.Debug("      [Config Mode] Alias '%s' resolved to: %s", alias, resolvedCmd)
+
+		// Escape single quotes in SQL for shell (inside single-quoted wrapper)
+		escapedSQL := strings.ReplaceAll(sql, `'`, `'\''`)
+
+		// Build the psql command with resolved connection string
+		psqlCommand = fmt.Sprintf(`%s -c "%s" --csv`, resolvedCmd, escapedSQL)
+
+		// Wrap in sudo su - -c to run as root (psql binary is in root's PATH)
+		fullCommand = fmt.Sprintf(`sudo su - -c '%s'`, psqlCommand)
+	} else {
+		// Bash alias mode: Use bash aliases from AWS server (portable, environment-agnostic)
+		logger.Debug("      [Bash Alias Mode] Using bash alias '%s' from AWS server", alias)
+
+		// For bash alias mode, we use a heredoc approach to avoid all quoting issues.
+		// The SQL may contain single quotes (for string values like UUIDs), double quotes,
+		// and other special characters that are hard to escape through multiple shell layers.
+		//
+		// Strategy: Use base64 encoding to safely pass the SQL through shell layers,
+		// then decode and execute on the server.
+		encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
+
+		psqlCommand = fmt.Sprintf(`%s -c "<query>" --csv`, alias)
+
+		// Decode the SQL on the server side, avoiding all quoting issues
+		// 1. Source bash profile to load aliases
+		// 2. Enable alias expansion
+		// 3. Decode the base64-encoded SQL
+		// 4. Execute via eval (needed for alias expansion)
+		fullCommand = fmt.Sprintf(
+			`sudo bash -c 'shopt -s expand_aliases; source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
+			encodedSQL, alias)
 	}
-
-	// Resolve the alias chain from config to get the full psql command
-	// e.g., psqlplatdb -> psqlrds -U postgres -d platform_common_db
-	//                  -> psql -h aurora-dl2.cluster-... -U postgres -d platform_common_db
-	// This avoids all bash alias expansion issues in non-interactive SSH sessions
-	resolvedCmd := resolveAliases(alias, dbc.Aliases)
-	logger.Debug("      Alias '%s' resolved to: %s", alias, resolvedCmd)
-
-	// Escape single quotes in SQL for shell (inside single-quoted wrapper)
-	escapedSQL := strings.ReplaceAll(sql, `'`, `'\''`)
-
-	// Build the full psql command with the resolved connection string
-	// e.g., psql -h aurora-... -U postgres -d platform_common_db -c "SELECT ..." --csv
-	psqlCommand := fmt.Sprintf(`%s -c "%s" --csv`, resolvedCmd, escapedSQL)
-
-	// Wrap in sudo su - -c to run as root (psql binary is in root's PATH)
-	fullCommand := fmt.Sprintf(`sudo su - -c '%s'`, psqlCommand)
 
 	logger.Debug("      Executing on AWS server (as root): %s", psqlCommand)
 
@@ -8415,9 +9209,10 @@ func main() {
 	// If using config mode, read settings from config.yaml
 	if selectedMode == "config" {
 		collectLogs = config.LogCollection.Enabled
-		collectInfo = config.GeneralInfo.Enabled
+		collectInfo = config.SystemInfo.Enabled
 		collectAppVersions = config.AppVersionCollection.Enabled
 		collectDeviceLogs = config.DeviceLogCollection.Enabled
+		collectDatabase = config.DatabaseCollection.Enabled
 	}
 
 	// In --all mode, respect feature-specific Enabled flags from config
@@ -8754,7 +9549,7 @@ func main() {
 		fmt.Println("No operations requested.")
 		fmt.Println("In config mode, enable operations in config.yaml:")
 		fmt.Println("  logCollection.enabled: true")
-		fmt.Println("  generalInfo.enabled: true")
+		fmt.Println("  systemInfo.enabled: true")
 		fmt.Println("  appVersionCollection.enabled: true")
 		fmt.Println("")
 		fmt.Println("Or use operation mode flags:")
@@ -8767,196 +9562,121 @@ func main() {
 	}
 
 	// Print pre-flight summary of what will be collected
-	printCollectionSummary(selectedMode, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, *listOnly, config, logger)
+	hasWork := printCollectionSummary(selectedMode, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, *listOnly, config, logger)
+	if !hasWork {
+		// No actual work to do - exit without connecting
+		return
+	}
 
-	// Connect to bastion
-	logger.Info("Connecting to bastion host %s", *bastionHost)
-	bastionClient, err := sshConnectBastion(*username, *password, *bastionHost, *bastionPort)
-	if err != nil {
-		// Check if it's an authentication error
-		if strings.Contains(err.Error(), "unable to authenticate") || strings.Contains(err.Error(), "permission denied") {
-			logger.Error("Authentication failed: %v", err)
-			logger.Warn("Please enter password again")
+	// Determine if bastion/AWS connection is needed
+	// Device log collection connects directly to switches — no bastion/AWS required
+	needsAWSConnection := collectLogs || collectInfo || collectAppVersions || collectDatabase || *listOnly
 
-			newPass, promptErr := promptPassword("Enter bastion password: ")
-			if promptErr != nil {
-				logger.Error("Failed to read password: %v", promptErr)
-				return
-			}
+	var bastionClient *ssh.Client
+	var awsClient *ssh.Client
 
-			*password = newPass
-			passwordNeedsSaving = true
+	if needsAWSConnection {
+		// Connect to bastion
+		logger.Info("Connecting to bastion host %s", *bastionHost)
+		bastionClient, err = sshConnectBastion(*username, *password, *bastionHost, *bastionPort)
+		if err != nil {
+			// Check if it's an authentication error
+			if strings.Contains(err.Error(), "unable to authenticate") || strings.Contains(err.Error(), "permission denied") {
+				logger.Error("Authentication failed: %v", err)
+				logger.Warn("Please enter password again")
 
-			// Retry connection with new password
-			logger.Info("Retrying connection to bastion host %s", *bastionHost)
-			bastionClient, err = sshConnectBastion(*username, *password, *bastionHost, *bastionPort)
-			if err != nil {
+				newPass, promptErr := promptPassword("Enter bastion password: ")
+				if promptErr != nil {
+					logger.Error("Failed to read password: %v", promptErr)
+					return
+				}
+
+				*password = newPass
+				passwordNeedsSaving = true
+
+				// Retry connection with new password
+				logger.Info("Retrying connection to bastion host %s", *bastionHost)
+				bastionClient, err = sshConnectBastion(*username, *password, *bastionHost, *bastionPort)
+				if err != nil {
+					logger.Error("Failed to connect to bastion: %v", err)
+					return
+				}
+			} else {
 				logger.Error("Failed to connect to bastion: %v", err)
 				return
 			}
-		} else {
-			logger.Error("Failed to connect to bastion: %v", err)
-			return
 		}
-	}
-	defer bastionClient.Close()
-	logger.Info("Successfully connected to bastion")
+		defer bastionClient.Close()
+		logger.Info("Successfully connected to bastion")
 
-	// Save encrypted password if needed
-	if passwordNeedsSaving && *password != "" {
-		if err := saveConfigWithEncryptedPassword(*configFile, config, *password); err != nil {
-			logger.Warn("Failed to save encrypted password: %v", err)
-		} else {
-			// Display encrypted password for user to copy if needed (terminal only, not in logger_info)
-			encryptedPass, encErr := encryptPassword(*password)
-			if encErr == nil {
-				logger.Info("Password encrypted and saved to config.yaml")
-				// Display encrypted password in terminal only (not in logger_info.txt for security)
-				fmt.Println("[INFO] Encrypted Password (copy the below \"ENC:...\" if needed):")
-				fmt.Printf("[INFO] \"%s\"\n", encryptedPass)
-			}
-		}
-	}
-
-	// Connect to AWS host
-	logger.Info("Connecting to AWS server %s via bastion...", *awsHost)
-	awsClient, err := sshConnectAWSViaBastion(bastionClient, *awsHost, *keyPath, *awsUsername)
-	if err != nil {
-		logger.Error("Failed to connect to AWS server: %v", err)
-		return
-	}
-	defer awsClient.Close()
-	logger.Info("Successfully connected to AWS server: %s", *awsHost)
-
-	// When CLI flags explicitly request system info collection, override config.yaml's enabled flag
-	if collectInfo {
-		config.GeneralInfo.Enabled = true
-	}
-
-	// Handle standalone operation modes
-
-	// --sys-info mode: collect only general system information
-	if selectedMode == "sys-info" {
-		logger.Info("Running in sys-info mode (general system info only)...")
-
-		// Create a simple temp directory for sys-info collection
-		tempDir := "sys_info_temp"
-		infoFileName := fmt.Sprintf("sys_info_%s", time.Now().Format("20060102_150405"))
-
-		err = collectGeneralInfo(awsClient, config.GeneralInfo, config.Environment, config.Username, tempDir, infoFileName)
-		if err != nil {
-			logger.Error("Failed to collect general system information: %v", err)
-			return
-		}
-		logger.Info("General system information collection completed successfully!")
-		logger.Info("Files are located in: %s/%s/%s/", tempDir, infoFileName, config.GeneralInfo.OutputDir)
-		return
-	}
-
-	// --version mode: collect only application version information
-	if selectedMode == "version" {
-		logger.Info("Running in version mode (app version collection only)...")
-		versionFilePath, err := collectAppVersionsStandalone(awsClient, config, *outputDir)
-		if err != nil {
-			logger.Error("Failed to collect app versions: %v", err)
-			return
-		}
-		logger.Info("App version collection completed successfully!")
-
-		// Attach to JIRA if requested
-		if *jiraIssueID != "" && versionFilePath != "" {
-			logger.Info("")
-			if !config.Jira.AttachmentEnabled {
-				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-			} else if config.Jira.Email == "" {
-				logger.Warn("JIRA email not configured in config.yaml")
-				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
-				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
+		// Save encrypted password if needed
+		if passwordNeedsSaving && *password != "" {
+			if err := saveConfigWithEncryptedPassword(*configFile, config, *password); err != nil {
+				logger.Warn("Failed to save encrypted password: %v", err)
 			} else {
-				attachmentFiles := []string{versionFilePath}
-				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
-					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+				// Display encrypted password for user to copy if needed (terminal only, not in logger_info)
+				encryptedPass, encErr := encryptPassword(*password)
+				if encErr == nil {
+					logger.Info("Password encrypted and saved to config.yaml")
+					// Display encrypted password in terminal only (not in logger_info.txt for security)
+					fmt.Println("[INFO] Encrypted Password (copy the below \"ENC:...\" if needed):")
+					fmt.Printf("[INFO] \"%s\"\n", encryptedPass)
 				}
 			}
 		}
-		return
-	}
 
-	// --database mode: collect only database query results
-	// This mode requires AWS connection to execute database commands remotely
-	if selectedMode == "database" {
-		logger.Info("Running in database mode (database query collection only)...")
-
-		if !config.DatabaseCollection.Enabled {
-			logger.Warn("Database collection is disabled in config.yaml (databaseCollection.enabled: false)")
-			logger.Info("Please enable databaseCollection in config.yaml and configure your databases")
-			return
-		}
-
-		// Execute database queries on AWS server via SSH
-		dbOutDir, err := processDatabaseCollection(awsClient, *config, *outputDir, config.archiveTimestamp, logger)
+		// Connect to AWS host
+		logger.Info("Connecting to AWS server %s via bastion...", *awsHost)
+		awsClient, err = sshConnectAWSViaBastion(bastionClient, *awsHost, *keyPath, *awsUsername)
 		if err != nil {
-			logger.Error("Database collection failed: %v", err)
+			logger.Error("Failed to connect to AWS server: %v", err)
 			return
 		}
-		logger.Info("Database query collection completed successfully!")
+		defer awsClient.Close()
+		logger.Info("Successfully connected to AWS server: %s", *awsHost)
+	} // end needsAWSConnection
 
-		// Attach database query files to JIRA if requested
-		if *jiraIssueID != "" && dbOutDir != "" {
-			logger.Info("")
-			if !config.Jira.AttachmentEnabled {
-				logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
-			} else if config.Jira.Email == "" {
-				logger.Warn("JIRA email not configured in config.yaml")
-				logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
-				logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
-			} else {
-				// Compress entire database results directory into a single archive for JIRA
-				archiveName := filepath.Base(dbOutDir) + ".tar.gz"
-				archivePath := filepath.Join(filepath.Dir(dbOutDir), archiveName)
-				logger.Info("Compressing database results for JIRA attachment: %s", archiveName)
-				if err := compressDirectoryToTarGz(dbOutDir, archivePath, logger); err != nil {
-					logger.Error("Failed to compress database results directory: %v", err)
-				} else {
-					logger.Info("Database results compressed: %s", archivePath)
-					attachmentFiles := []string{archivePath}
-					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
-						logger.Error("Failed to attach database files to JIRA issue %s: %v", *jiraIssueID, err)
-					} else {
-						// Clean up the compressed archive after JIRA upload attempt
-						if err := os.Remove(archivePath); err != nil {
-							logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
-						} else {
-							logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
-						}
-					}
-				}
-			}
+	// Pre-declare variables used in download summary (zero values when AWS is skipped)
+	var finalArchiveName string
+	successCount := 0
+	failCount := 0
+	retrySuccessCount := 0
+	totalFiles := 0
+	var downloadedFiles []string
+	var downloadSpeeds []string
+	var selectedLogFiles []string
+
+	// All code below this point that uses awsClient is wrapped in needsAWSConnection
+	if needsAWSConnection {
+
+		// When CLI flags explicitly request system info collection, override config.yaml's enabled flag
+		if collectInfo {
+			config.SystemInfo.Enabled = true
 		}
-		return
-	}
 
-	// In config mode, handle standalone operations based on what's enabled
-	if selectedMode == "config" {
-		// If only general info is enabled (no logs, no app versions)
-		if collectInfo && !collectLogs && !collectAppVersions {
-			logger.Info("Running in config mode - collecting general system info only...")
+		// Handle standalone operation modes
+
+		// --sys-info mode: collect only general system information
+		if selectedMode == "sys-info" {
+			logger.Info("Running in sys-info mode (general system info only)...")
+
+			// Create a simple temp directory for sys-info collection
 			tempDir := "sys_info_temp"
 			infoFileName := fmt.Sprintf("sys_info_%s", time.Now().Format("20060102_150405"))
 
-			err = collectGeneralInfo(awsClient, config.GeneralInfo, config.Environment, config.Username, tempDir, infoFileName)
+			err = collectSystemInfo(awsClient, config.SystemInfo, config.Environment, config.Username, tempDir, infoFileName)
 			if err != nil {
-				logger.Error("Failed to collect general system information: %v", err)
+				logger.Error("Failed to collect system information: %v", err)
 				return
 			}
-			logger.Info("General system information collection completed successfully!")
-			logger.Info("Files are located in: %s/%s/%s/", tempDir, infoFileName, config.GeneralInfo.OutputDir)
+			logger.Info("System information collection completed successfully!")
+			logger.Info("Files are located in: %s/%s/%s/", tempDir, infoFileName, config.SystemInfo.OutputDir)
 			return
 		}
 
-		// If only app version collection is enabled (no logs, no general info)
-		if collectAppVersions && !collectLogs && !collectInfo {
-			logger.Info("Running in config mode - collecting app versions only...")
+		// --version mode: collect only application version information
+		if selectedMode == "version" {
+			logger.Info("Running in version mode (app version collection only)...")
 			versionFilePath, err := collectAppVersionsStandalone(awsClient, config, *outputDir)
 			if err != nil {
 				logger.Error("Failed to collect app versions: %v", err)
@@ -8982,285 +9702,392 @@ func main() {
 			}
 			return
 		}
-	}
 
-	// Perform log collection if requested
-	var finalArchiveName string
-	if collectLogs {
-		if selectedMode == "all" {
-			logger.Info("Running in all mode (logs + system info + app versions)...")
-		} else if selectedMode == "logs-only" {
-			logger.Info("Running in logs-only mode...")
-		} else if selectedMode == "config" {
-			logger.Info("Running in config mode (using config.yaml settings)...")
-		}
-		logger.Info("Starting log collection process...")
+		// --database mode: collect only database query results
+		// This mode requires AWS connection to execute database commands remotely
+		if selectedMode == "database" {
+			logger.Info("Running in database mode (database query collection only)...")
 
-		// Determine time-based collection settings
-		timeBasedEnabled := false
-		timeDurationStr := ""
-
-		// Check command-line flag first
-		if *timeDuration != "" {
-			// Special handling for explicit disable values
-			if *timeDuration == "0" || *timeDuration == "disabled" || *timeDuration == "false" {
-				timeBasedEnabled = false
-				timeDurationStr = ""
-				logger.Info("Time-based collection explicitly disabled via command line")
-			} else {
-				timeBasedEnabled = true
-				timeDurationStr = *timeDuration
-				logger.Info("Time-based collection enabled via command line: %s", timeDurationStr)
+			if !config.DatabaseCollection.Enabled {
+				logger.Warn("Database collection is disabled in config.yaml (databaseCollection.enabled: false)")
+				logger.Info("Please enable databaseCollection in config.yaml and configure your databases")
+				return
 			}
-		} else if config.LogCollection.TimeBasedCollection.Enabled {
-			// Use config settings if no command-line flag
-			timeBasedEnabled = true
-			timeDurationStr = config.LogCollection.TimeBasedCollection.Duration
-			logger.Info("Time-based collection enabled via config: %s", timeDurationStr)
-		}
 
-		// Start timing the entire log collection and archive creation process
-		overallStartTime := time.Now()
+			// Execute database queries on AWS server via SSH
+			dbOutDir, err := processDatabaseCollection(awsClient, *config, *outputDir, config.archiveTimestamp, logger)
+			if err != nil {
+				logger.Error("Database collection failed: %v", err)
+				return
+			}
+			logger.Info("Database query collection completed successfully!")
 
-		finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.GeneralInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection, config.LogCollection.PodFileCollection)
-		if err != nil {
-			logger.Error("Failed to collect logs: %v", err)
+			// Attach database query files to JIRA if requested
+			if *jiraIssueID != "" && dbOutDir != "" {
+				logger.Info("")
+				if !config.Jira.AttachmentEnabled {
+					logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+				} else if config.Jira.Email == "" {
+					logger.Warn("JIRA email not configured in config.yaml")
+					logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+					logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
+				} else {
+					// Compress entire database results directory into a single archive for JIRA
+					archiveName := filepath.Base(dbOutDir) + ".tar.gz"
+					archivePath := filepath.Join(filepath.Dir(dbOutDir), archiveName)
+					logger.Info("Compressing database results for JIRA attachment: %s", archiveName)
+					if err := compressDirectoryToTarGz(dbOutDir, archivePath, logger); err != nil {
+						logger.Error("Failed to compress database results directory: %v", err)
+					} else {
+						logger.Info("Database results compressed: %s", archivePath)
+						attachmentFiles := []string{archivePath}
+						if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+							logger.Error("Failed to attach database files to JIRA issue %s: %v", *jiraIssueID, err)
+						} else {
+							// Clean up the compressed archive after JIRA upload attempt
+							if err := os.Remove(archivePath); err != nil {
+								logger.Warn("Failed to delete compressed archive %s: %v", archivePath, err)
+							} else {
+								logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
+							}
+						}
+					}
+				}
+			}
 			return
 		}
 
-		// Display overall timing
-		overallDuration := time.Since(overallStartTime)
-		logger.Info("Overall log collection and archiving completed in: %s", overallDuration.Round(time.Millisecond))
+		// In config mode, handle standalone operations based on what's enabled
+		if selectedMode == "config" {
+			// If only general info is enabled (no logs, no app versions)
+			if collectInfo && !collectLogs && !collectAppVersions {
+				logger.Info("Running in config mode - collecting general system info only...")
+				tempDir := "sys_info_temp"
+				infoFileName := fmt.Sprintf("sys_info_%s", time.Now().Format("20060102_150405"))
 
-		// Extract timestamp from archive name (e.g., app_log_20260217_095735 -> 20260217_095735)
-		// and store it in config for consistent naming across all output files
-		tsRe := regexp.MustCompile(`(\d{8}_\d{6})`)
-		if tsMatch := tsRe.FindString(finalArchiveName); tsMatch != "" {
-			config.archiveTimestamp = tsMatch
-			logger.Debug("Extracted archive timestamp: %s", tsMatch)
-		}
-
-		// Update the log pattern to look for the newly created archive
-		archivePattern := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
-		*logPattern = archivePattern
-		logger.Info("Updated log pattern to: %s", *logPattern)
-
-		// Give the system a moment to complete file operations
-		logger.Info("Waiting for file system operations to complete...")
-		time.Sleep(2 * time.Second)
-	}
-
-	// Collect app versions if enabled and logs were collected
-	if collectAppVersions && collectLogs {
-		logger.Info("Collecting application version information...")
-		_, err = collectAppVersionsStandalone(awsClient, config, *outputDir)
-		if err != nil {
-			logger.Warn("Failed to collect app versions: %v", err)
-			// Don't return - continue with log downloads
-		} else {
-			logger.Info("App version collection completed successfully!")
-		}
-	}
-
-	// List log files on AWS server
-	logger.Info("Fetching log files...")
-	session, err := awsClient.NewSession()
-	if err != nil {
-		logger.Error("Failed to create session: %v", err)
-		return
-	}
-	defer session.Close()
-
-	var logFiles []string
-	output, err := session.Output("ls " + *logPattern + " 2>/dev/null || echo ''")
-	if err != nil {
-		logger.Debug("No existing log files found matching pattern %s: %v", *logPattern, err)
-		// Don't return here - continue to allow log collection or other operations
-		logFiles = []string{}
-		fmt.Println("No existing log files found. Logs will be collected from Kubernetes.")
-	} else {
-		logFiles = strings.Split(strings.TrimSpace(string(output)), "\n")
-		if len(logFiles) == 0 || (len(logFiles) == 1 && logFiles[0] == "") {
-			logFiles = []string{} // Reset to empty if no valid files
-			fmt.Println("No log files found matching pattern:", *logPattern)
-			fmt.Println("Logs will be collected from Kubernetes.")
-		} else {
-			fmt.Println("Available log files:")
-			fmt.Println("--------------------")
-			for i, file := range logFiles {
-				fmt.Printf("%d. %s\n", i+1, file)
-			}
-		}
-	}
-
-	if *listOnly {
-		return
-	}
-
-	// Select log files to download
-	var selectedLogFiles []string
-	if *interactive {
-		fmt.Println("Enter log file numbers to download (comma-separated, or 'all' for all files):")
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "all" {
-			selectedLogFiles = logFiles
-		} else {
-			selections := strings.Split(input, ",")
-			for _, s := range selections {
-				s = strings.TrimSpace(s)
-				idx, err := strconv.Atoi(s)
-				if err != nil || idx < 1 || idx > len(logFiles) {
-					logger.Warn("Invalid selection: %s", s)
-					continue
+				err = collectSystemInfo(awsClient, config.SystemInfo, config.Environment, config.Username, tempDir, infoFileName)
+				if err != nil {
+					logger.Error("Failed to collect system information: %v", err)
+					return
 				}
-				selectedLogFiles = append(selectedLogFiles, logFiles[idx-1])
+				logger.Info("System information collection completed successfully!")
+				logger.Info("Files are located in: %s/%s/%s/", tempDir, infoFileName, config.SystemInfo.OutputDir)
+				return
+			}
+
+			// If only app version collection is enabled (no logs, no general info)
+			if collectAppVersions && !collectLogs && !collectInfo {
+				logger.Info("Running in config mode - collecting app versions only...")
+				versionFilePath, err := collectAppVersionsStandalone(awsClient, config, *outputDir)
+				if err != nil {
+					logger.Error("Failed to collect app versions: %v", err)
+					return
+				}
+				logger.Info("App version collection completed successfully!")
+
+				// Attach to JIRA if requested
+				if *jiraIssueID != "" && versionFilePath != "" {
+					logger.Info("")
+					if !config.Jira.AttachmentEnabled {
+						logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+					} else if config.Jira.Email == "" {
+						logger.Warn("JIRA email not configured in config.yaml")
+						logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+						logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
+					} else {
+						attachmentFiles := []string{versionFilePath}
+						if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+							logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
+						}
+					}
+				}
+				return
 			}
 		}
-	} else {
-		selectedLogFiles = logFiles
-	}
 
-	if len(selectedLogFiles) == 0 {
-		fmt.Println("No log files selected for download")
-		return
-	}
-	// Create output directory if it doesn't exist
-	if err := os.MkdirAll(*outputDir, 0755); err != nil {
-		fmt.Println("Failed to create output directory:", err)
-		return
-	}
-	// Download selected log files
-	totalFiles := len(selectedLogFiles)
-	logger.Info("Starting download of %d file(s) to %s", totalFiles, *outputDir)
-	fmt.Println(strings.Repeat("-", 50))
-
-	successCount := 0
-	failCount := 0
-	retrySuccessCount := 0
-
-	// Variables to collect download summary information
-	var downloadedFiles []string
-	var downloadSpeeds []string
-
-	for i, remotePath := range selectedLogFiles {
-		filename := remotePath[strings.LastIndex(remotePath, "/")+1:]
-		localPath := filepath.Join(*outputDir, filename)
-		logger.Info("Starting download %d of %d: %s", i+1, totalFiles, filename)
-
-		// Get initial file size for display
-		sftpClient, statErr := sftp.NewClient(awsClient)
-		if statErr == nil {
-			remoteFileInfo, statErr := sftpClient.Stat(remotePath)
-			if statErr == nil {
-				remoteFileSize := remoteFileInfo.Size()
-				logger.Debug("File size: %d bytes (%.2f MB)", remoteFileSize, float64(remoteFileSize)/(1024*1024))
+		// Perform log collection if requested
+		if collectLogs {
+			if selectedMode == "all" {
+				logger.Info("Running in all mode (logs + system info + app versions)...")
+			} else if selectedMode == "logs-only" {
+				logger.Info("Running in logs-only mode...")
+			} else if selectedMode == "config" {
+				logger.Info("Running in config mode (using config.yaml settings)...")
 			}
-			sftpClient.Close()
+			logger.Info("Starting log collection process...")
+
+			// Determine time-based collection settings
+			timeBasedEnabled := false
+			timeDurationStr := ""
+
+			// Check command-line flag first
+			if *timeDuration != "" {
+				// Special handling for explicit disable values
+				if *timeDuration == "0" || *timeDuration == "disabled" || *timeDuration == "false" {
+					timeBasedEnabled = false
+					timeDurationStr = ""
+					logger.Info("Time-based collection explicitly disabled via command line")
+				} else {
+					timeBasedEnabled = true
+					timeDurationStr = *timeDuration
+					logger.Info("Time-based collection enabled via command line: %s", timeDurationStr)
+				}
+			} else if config.LogCollection.TimeBasedCollection.Enabled {
+				// Use config settings if no command-line flag
+				timeBasedEnabled = true
+				timeDurationStr = config.LogCollection.TimeBasedCollection.Duration
+				logger.Info("Time-based collection enabled via config: %s", timeDurationStr)
+			}
+
+			// Start timing the entire log collection and archive creation process
+			overallStartTime := time.Now()
+
+			finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.SystemInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.DefaultEP1Logs,
+				struct {
+					Enabled              bool `yaml:"enabled"`
+					FilterDuringDownload bool `yaml:"filterDuringDownload"`
+					KeyValueFilters      []struct {
+						Key   string `yaml:"key"`
+						Value string `yaml:"value"`
+					} `yaml:"keyValueFilters"`
+					SpecificStrings []string `yaml:"specificStrings"`
+				}{
+					Enabled:              config.LogCollection.MessageFilter.Enabled,
+					FilterDuringDownload: config.LogCollection.MessageFilter.FilterDuringDownload,
+					KeyValueFilters:      config.LogCollection.MessageFilter.KeyValueFilters,
+					SpecificStrings:      config.LogCollection.MessageFilter.SpecificStrings,
+				},
+				config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection, config.LogCollection.PodFileCollection)
+			if err != nil {
+				logger.Error("Failed to collect logs: %v", err)
+				return
+			}
+
+			// Display overall timing
+			overallDuration := time.Since(overallStartTime)
+			logger.Info("Overall log collection and archiving completed in: %s", overallDuration.Round(time.Millisecond))
+
+			// Extract timestamp from archive name (e.g., app_log_20260217_095735 -> 20260217_095735)
+			// and store it in config for consistent naming across all output files
+			tsRe := regexp.MustCompile(`(\d{8}_\d{6})`)
+			if tsMatch := tsRe.FindString(finalArchiveName); tsMatch != "" {
+				config.archiveTimestamp = tsMatch
+				logger.Debug("Extracted archive timestamp: %s", tsMatch)
+			}
+
+			// Update the log pattern to look for the newly created archive
+			archivePattern := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
+			*logPattern = archivePattern
+			logger.Info("Updated log pattern to: %s", *logPattern)
+
+			// Give the system a moment to complete file operations
+			logger.Info("Waiting for file system operations to complete...")
+			time.Sleep(2 * time.Second)
 		}
 
-		// Create a temporary file path for download
-		tempFilePath := localPath + ".part"
-		logger.Debug("Created temporary file: %s", tempFilePath)
-		logger.Debug("Added start marker to file\n")
-		logger.Debug("Downloading to temporary file: %s", tempFilePath)
-
-		// Create connection parameters for parallel downloads
-		connParams := &ConnectionParams{
-			BastionClient:     bastionClient,
-			BastionUsername:   *username,
-			BastionPassword:   *password,
-			BastionHost:       *bastionHost,
-			BastionPort:       *bastionPort,
-			AWSHost:           *awsHost,
-			KeyPath:           *keyPath,
-			PreferredUsername: *awsUsername,
+		// Collect app versions if enabled and logs were collected
+		if collectAppVersions && collectLogs {
+			logger.Info("Collecting application version information...")
+			_, err = collectAppVersionsStandalone(awsClient, config, *outputDir)
+			if err != nil {
+				logger.Warn("Failed to collect app versions: %v", err)
+				// Don't return - continue with log downloads
+			} else {
+				logger.Info("App version collection completed successfully!")
+			}
 		}
 
-		// Record download start time for summary
-		downloadStartTime := time.Now()
-		err := downloadFileFromAWS(awsClient, remotePath, localPath, *autoRetry, *numChunks, connParams, downloadMethod)
-		downloadDuration := time.Since(downloadStartTime)
-
+		// List log files on AWS server
+		logger.Info("Fetching log files...")
+		session, err := awsClient.NewSession()
 		if err != nil {
-			// Check if this is a retry success but with some warning
-			if strings.Contains(err.Error(), "retry_success:") {
-				// Extract the real message
-				message := strings.TrimPrefix(err.Error(), "retry_success:")
-				logger.Warn("%s", message)
-				retrySuccessCount++
+			logger.Error("Failed to create session: %v", err)
+			return
+		}
+		defer session.Close()
+
+		var logFiles []string
+		output, err := session.Output("ls " + *logPattern + " 2>/dev/null || echo ''")
+		if err != nil {
+			logger.Debug("No existing log files found matching pattern %s: %v", *logPattern, err)
+			// Don't return here - continue to allow log collection or other operations
+			logFiles = []string{}
+			fmt.Println("No existing log files found. Logs will be collected from Kubernetes.")
+		} else {
+			logFiles = strings.Split(strings.TrimSpace(string(output)), "\n")
+			if len(logFiles) == 0 || (len(logFiles) == 1 && logFiles[0] == "") {
+				logFiles = []string{} // Reset to empty if no valid files
+				fmt.Println("No log files found matching pattern:", *logPattern)
+				fmt.Println("Logs will be collected from Kubernetes.")
 			} else {
-				logger.Error("Error: %s", err)
-				failCount++
-				continue
+				fmt.Println("Available log files:")
+				fmt.Println("--------------------")
+				for i, file := range logFiles {
+					fmt.Printf("%d. %s\n", i+1, file)
+				}
 			}
 		}
 
-		// Get file size for display
-		fileInfo, err := os.Stat(localPath)
-		var fileSize string
-		var fileSizeBytes int64
-		if err == nil {
-			fileSizeBytes = fileInfo.Size()
-			if fileSizeBytes == 0 {
-				logger.Warn("Warning: Downloaded file has zero bytes!")
-			}
+		if *listOnly {
+			return
+		}
 
-			if fileSizeBytes < 1024 {
-				fileSize = fmt.Sprintf("%d B", fileSizeBytes)
-			} else if fileSizeBytes < 1024*1024 {
-				fileSize = fmt.Sprintf("%.2f KB", float64(fileSizeBytes)/1024)
-			} else if fileSizeBytes < 1024*1024*1024 {
-				fileSize = fmt.Sprintf("%.2f MB", float64(fileSizeBytes)/(1024*1024))
+		// Select log files to download
+		if *interactive {
+			fmt.Println("Enter log file numbers to download (comma-separated, or 'all' for all files):")
+			reader := bufio.NewReader(os.Stdin)
+			input, _ := reader.ReadString('\n')
+			input = strings.TrimSpace(input)
+
+			if input == "all" {
+				selectedLogFiles = logFiles
 			} else {
-				fileSize = fmt.Sprintf("%.2f GB", float64(fileSizeBytes)/(1024*1024*1024))
+				selections := strings.Split(input, ",")
+				for _, s := range selections {
+					s = strings.TrimSpace(s)
+					idx, err := strconv.Atoi(s)
+					if err != nil || idx < 1 || idx > len(logFiles) {
+						logger.Warn("Invalid selection: %s", s)
+						continue
+					}
+					selectedLogFiles = append(selectedLogFiles, logFiles[idx-1])
+				}
 			}
 		} else {
-			fileSize = "unknown size"
-			logger.Warn("Cannot verify file size: %v", err)
+			selectedLogFiles = logFiles
 		}
 
-		// Calculate download speed and timing for summary
-		var durationStr, speedStr string
-		if downloadDuration.Hours() >= 1 {
-			durationStr = fmt.Sprintf("%.1f hours", downloadDuration.Hours())
-		} else if downloadDuration.Minutes() >= 1 {
-			durationStr = fmt.Sprintf("%.1f minutes", downloadDuration.Minutes())
+		if len(selectedLogFiles) == 0 {
+			logger.Info("No log files selected for download")
 		} else {
-			durationStr = fmt.Sprintf("%.1f seconds", downloadDuration.Seconds())
-		}
-
-		if fileSizeBytes > 0 {
-			bytesPerSecond := float64(fileSizeBytes) / downloadDuration.Seconds()
-			if bytesPerSecond >= 1024*1024 {
-				speedStr = fmt.Sprintf("%.2f MB/s", bytesPerSecond/(1024*1024))
-			} else if bytesPerSecond >= 1024 {
-				speedStr = fmt.Sprintf("%.2f KB/s", bytesPerSecond/1024)
-			} else {
-				speedStr = fmt.Sprintf("%.2f B/s", bytesPerSecond)
+			// Create output directory if it doesn't exist
+			if err := os.MkdirAll(*outputDir, 0755); err != nil {
+				fmt.Println("Failed to create output directory:", err)
+				return
 			}
-		} else {
-			speedStr = "unknown speed"
-		}
+			// Download selected log files
+			totalFiles = len(selectedLogFiles)
+			logger.Info("Starting download of %d file(s) to %s", totalFiles, *outputDir)
+			fmt.Println(strings.Repeat("-", 50))
 
-		// Store download information for summary instead of logging immediately
-		downloadedFiles = append(downloadedFiles, fmt.Sprintf("%s (%s)", filename, fileSize))
-		downloadSpeeds = append(downloadSpeeds, fmt.Sprintf("Download completed in %s (avg. %s)", durationStr, speedStr))
-		logger.Debug("Successfully saved %s (%s)", filename, fileSize)
-		successCount++
-	}
+			for i, remotePath := range selectedLogFiles {
+				filename := remotePath[strings.LastIndex(remotePath, "/")+1:]
+				localPath := filepath.Join(*outputDir, filename)
+				logger.Info("Starting download %d of %d: %s", i+1, totalFiles, filename)
 
-	// Delete source archive if log collection was performed and deletion is enabled
-	if collectLogs && finalArchiveName != "" && config.LogCollection.DeleteAfterCopy && successCount > 0 {
-		archiveToDelete := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
-		logger.Info("Post-download cleanup enabled, deleting source archive...")
-		if err := deleteArchiveFromAWS(awsClient, archiveToDelete, config.Environment); err != nil {
-			logger.Warn("Failed to delete source archive: %v", err)
-		}
-		// Note: tempDir cleanup is now handled immediately after archive creation in collectKubernetesLogs()
-	}
+				// Get initial file size for display
+				sftpClient, statErr := sftp.NewClient(awsClient)
+				if statErr == nil {
+					remoteFileInfo, statErr := sftpClient.Stat(remotePath)
+					if statErr == nil {
+						remoteFileSize := remoteFileInfo.Size()
+						logger.Debug("File size: %d bytes (%.2f MB)", remoteFileSize, float64(remoteFileSize)/(1024*1024))
+					}
+					sftpClient.Close()
+				}
+
+				// Create a temporary file path for download
+				tempFilePath := localPath + ".part"
+				logger.Debug("Created temporary file: %s", tempFilePath)
+				logger.Debug("Added start marker to file\n")
+				logger.Debug("Downloading to temporary file: %s", tempFilePath)
+
+				// Create connection parameters for parallel downloads
+				connParams := &ConnectionParams{
+					BastionClient:     bastionClient,
+					BastionUsername:   *username,
+					BastionPassword:   *password,
+					BastionHost:       *bastionHost,
+					BastionPort:       *bastionPort,
+					AWSHost:           *awsHost,
+					KeyPath:           *keyPath,
+					PreferredUsername: *awsUsername,
+				}
+
+				// Record download start time for summary
+				downloadStartTime := time.Now()
+				err := downloadFileFromAWS(awsClient, remotePath, localPath, *autoRetry, *numChunks, connParams, downloadMethod)
+				downloadDuration := time.Since(downloadStartTime)
+
+				if err != nil {
+					// Check if this is a retry success but with some warning
+					if strings.Contains(err.Error(), "retry_success:") {
+						// Extract the real message
+						message := strings.TrimPrefix(err.Error(), "retry_success:")
+						logger.Warn("%s", message)
+						retrySuccessCount++
+					} else {
+						logger.Error("Error: %s", err)
+						failCount++
+						continue
+					}
+				}
+
+				// Get file size for display
+				fileInfo, err := os.Stat(localPath)
+				var fileSize string
+				var fileSizeBytes int64
+				if err == nil {
+					fileSizeBytes = fileInfo.Size()
+					if fileSizeBytes == 0 {
+						logger.Warn("Warning: Downloaded file has zero bytes!")
+					}
+
+					if fileSizeBytes < 1024 {
+						fileSize = fmt.Sprintf("%d B", fileSizeBytes)
+					} else if fileSizeBytes < 1024*1024 {
+						fileSize = fmt.Sprintf("%.2f KB", float64(fileSizeBytes)/1024)
+					} else if fileSizeBytes < 1024*1024*1024 {
+						fileSize = fmt.Sprintf("%.2f MB", float64(fileSizeBytes)/(1024*1024))
+					} else {
+						fileSize = fmt.Sprintf("%.2f GB", float64(fileSizeBytes)/(1024*1024*1024))
+					}
+				} else {
+					fileSize = "unknown size"
+					logger.Warn("Cannot verify file size: %v", err)
+				}
+
+				// Calculate download speed and timing for summary
+				var durationStr, speedStr string
+				if downloadDuration.Hours() >= 1 {
+					durationStr = fmt.Sprintf("%.1f hours", downloadDuration.Hours())
+				} else if downloadDuration.Minutes() >= 1 {
+					durationStr = fmt.Sprintf("%.1f minutes", downloadDuration.Minutes())
+				} else {
+					durationStr = fmt.Sprintf("%.1f seconds", downloadDuration.Seconds())
+				}
+
+				if fileSizeBytes > 0 {
+					bytesPerSecond := float64(fileSizeBytes) / downloadDuration.Seconds()
+					if bytesPerSecond >= 1024*1024 {
+						speedStr = fmt.Sprintf("%.2f MB/s", bytesPerSecond/(1024*1024))
+					} else if bytesPerSecond >= 1024 {
+						speedStr = fmt.Sprintf("%.2f KB/s", bytesPerSecond/1024)
+					} else {
+						speedStr = fmt.Sprintf("%.2f B/s", bytesPerSecond)
+					}
+				} else {
+					speedStr = "unknown speed"
+				}
+
+				// Store download information for summary instead of logging immediately
+				downloadedFiles = append(downloadedFiles, fmt.Sprintf("%s (%s)", filename, fileSize))
+				downloadSpeeds = append(downloadSpeeds, fmt.Sprintf("Download completed in %s (avg. %s)", durationStr, speedStr))
+				logger.Debug("Successfully saved %s (%s)", filename, fileSize)
+				successCount++
+			}
+
+			// Delete source archive if log collection was performed and deletion is enabled
+			if collectLogs && finalArchiveName != "" && config.LogCollection.DeleteAfterCopy && successCount > 0 {
+				archiveToDelete := fmt.Sprintf("/home/%s/%s.tar.gz", *userID, finalArchiveName)
+				logger.Info("Post-download cleanup enabled, deleting source archive...")
+				if err := deleteArchiveFromAWS(awsClient, archiveToDelete, config.Environment); err != nil {
+					logger.Warn("Failed to delete source archive: %v", err)
+				}
+				// Note: tempDir cleanup is now handled immediately after archive creation in collectKubernetesLogs()
+			}
+		} // end of selectedLogFiles > 0 else block
+	} // end needsAWSConnection (AWS-dependent operations)
 
 	// Collect network device logs if enabled (in --all or config mode)
 	var deviceLogOutputDir string

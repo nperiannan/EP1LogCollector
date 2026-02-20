@@ -1,79 +1,97 @@
-# Global Configuration
-username: nperiannan
-environment: dl2r1
+# ============================================================================
+# EP1 LOG COLLECTOR - Simplified Configuration
+# ============================================================================
+# Quick Start: Edit username and environment below, then run: ./logcollector
+# Documentation: README.md | Quick Start: QUICKSTART.md
+# ============================================================================
 
-# Bastion Server Configuration
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  ESSENTIALS - Change these values                                       │
+# └─────────────────────────────────────────────────────────────────────────┘
+username:                                   # Enter your corp username (e.g. "nperiannan")
+environment: dl2r1                          # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.)
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  SSH CONNECTION                                                         │
+# └─────────────────────────────────────────────────────────────────────────┘
 bastion:
-  host: usnc-awsgtwy-02.extremenetworks.com
+  host: usnc-awsgtwy-02.extremenetworks.com # Bastion host ip or hostname
   port: 22
-  password: ""
-  keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion"    # Optional: SSH private key (e.g., ~/.ssh/id_rsa)
-  
-  # Password Multi-Source Retrieval (Priority Order):
-  # 1. Environment Variable: BASTION_PASSWORD
-  #    Set with: set BASTION_PASSWORD=your_password (Windows) or export BASTION_PASSWORD=your_password (Linux/Mac)
-  # 
-  # 2. Windows Credential Manager (Windows only):
-  #    Securely stored by Windows, automatically saved on first use
-  #    View/edit in: Control Panel -> Credential Manager -> Windows Credentials
-  #    Target name: LogCollector:Bastion:username@host
-  # 
-  # 3. Config file (this file):
-  #    password: "your_password_here" (can be encrypted)
-  # 
-  # 4. Interactive Prompt:
-  #    If password not found in any source, you'll be prompted (hidden input)
-  #    Password will be automatically saved to Windows Credential Manager for future use
+  keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion" # Path to SSH private key for bastion access ( Optional )
+  password: ""                              # Leave empty - Auto-uses Windows Credential Manager if empty
 
-# AWS Server Configuration
 aws:
   host: "{environment}-console.qa.xcloudiq.com"
-  keyPath: ~/.ssh/id_ed25519_26Q1              # Required: SSH public key for AWS server (e.g., ~/.ssh/id_rsa_aws)
+  keyPath: ~/.ssh/id_ed25519_26Q1           # Path to SSH public key on bastion host for AWS access ( Mandatory )
 
-# Log File Configuration
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  JIRA INTEGRATION - Attach logs to Jira tickets                         │
+# └─────────────────────────────────────────────────────────────────────────┘
+jira:
+  email: "{username}@extremenetworks.com"
+  apiToken: ""                              # Leave empty - Auto-retrieves from env/credential manager
+  attachmentEnabled: true
+  baseUrl: "https://extremenetworks.atlassian.net"
+  # Generate token: https://id.atlassian.com/manage-profile/security/api-tokens
+  # Usage: ./logcollector --all --jira XCP-12345
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  OUTPUT LOCATION                                                        │
+# └─────────────────────────────────────────────────────────────────────────┘
 logs:
   pattern: /home/{username}/*.gz
-  outputDir: C:\Logs\{timestamp}                         # Output directory with timestamp (e.g., C:\Logs\20240218_143015)
+  outputDir: C:\Logs\{timestamp}            # Specify output directory windows (e.g. C:\Logs\) or linux (e.g. /home/{username}/logs/)
 
-# General Options
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  BASIC OPTIONS                                                          │
+# └─────────────────────────────────────────────────────────────────────────┘
 options:
   autoRetry: true
-  numChunks: 8                      # Number of parallel download connections (1-10, default: 8)
-  logLevel: INFO
-  maxSSHSessions: 2                # Maximum concurrent SSH sessions per source (1-4, default: 1)
-  downloadMethod: "scp"             # Download method: "scp" (native SCP, 10x faster) or "sftp" (parallel SFTP). Default: scp
+  logLevel: INFO                            # INFO, DEBUG, WARN, ERROR
+  downloadMethod: "scp"                     # "scp" (faster) or "sftp" (parallel download)
+  numChunks: 8                              # Parallel downloads (1-10)
+  maxSSHSessions: 2                         # Concurrent sessions (1-4)
 
-# Kubernetes Log Collection Settings
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  LOG COLLECTION - Main Settings                                         │
+# └─────────────────────────────────────────────────────────────────────────┘
 logCollection:
-  enabled: true                     # Enable/disable log collection
-  logFileName: app_log
+  enabled: true
+  defaultEP1Logs: true                      # true = builtin logs + temporal; false = stil collects system info, version info, database
+                                            
+  logFileName: app_ep1_logs
   tempDir: "{environment}_{username}_templogs"
   useTimestamp: true
   deleteAfterCopy: true
-  autoDeleteTempDir: true            # Auto-delete existing tempDir without prompting (false = prompt user)
+  autoDeleteTempDir: true
   timestampFormat: "20060102_150405"
   customSources: []
-  # Time-based log collection (collect logs from last X time)
+  
+  # Time-based collection
   timeBasedCollection:
-    enabled: true                   # Enable time-based collection (false = collect full logs)
-    duration: ""                 # Duration like "15m", "30m", "1h", "2h" (leave empty for full logs)
-  # Temporal workflow information collection
-  # Reference: https://extremenetworks.atlassian.net/wiki/spaces/NCM/pages/371756102/Temporal+Cheat+Sheet
-  temporalWorkflowCollection:
-    enabled: true                   # Enable/disable temporal workflow data collection
-    workflowIdPrefix: ""            # Filter workflows by ID prefix (empty = all workflows), example: "deploy-site-cp-name" or "deploy-profile-cp1" or "deploy-device-cp2"
-    numberOfWorkflows: 3            # Number of recent workflows to collect (1-20, default 3)
-    namespace: "configuration"      # Temporal namespace to query
-  # Temporal schedule information collection
-  temporalScheduleCollection:
-    enabled: true                   # Enable/disable temporal schedule data collection
-    numberOfSchedules: 5            # Number of recent schedules to collect (1-20, default 5)
-    namespace: "configuration"      # Temporal namespace to query
-  # Log analysis and error detection
+    enabled: true
+    duration: ""                            # "15m", "30m", "1h", "2h" or empty for full logs
+  
+  # ┌─── Message Filtering - Extract Specific Logs ────────────────────┐
+  messageFilter:
+    enabled: false
+    filterDuringDownload: false             # Apply grep filters during kubectl logs (faster but less sophisticated)
+    keyValueFilters:
+      - key: "ownerID"
+        value: "1096"
+      - key: "serial"
+        value: ""
+    specificStrings: []
+    combineReplicas: true                   # Loki-style replica log merging
+    replicaPattern: "-[a-z0-9]{5,10}$"
+    sortByTimestamp: true
+    timestampPattern: '\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{3,6})?'
+  
+  # ┌─── Log Analysis - Automatic Error Detection ─────────────────────────┐
   logAnalysis:
-    enabled: true                  # Enable automatic log analysis for errors/issues
-    outputFile: "log_analysis_summary.txt"  # Output file name for analysis results
-    errorPatterns:                  # Patterns to search for in collected logs (case-insensitive)
+    enabled: false
+    outputFile: "log_analysis_summary.txt"
+    errorPatterns:
       - "error"
       - "panic"
       - "failure"
@@ -86,7 +104,7 @@ logCollection:
       - "unable to"
       - "cannot"
       - "permission denied"
-    excludeKeywords:                # Lines containing these keywords are excluded (false positive filtering)
+    excludeKeywords:
       - "ErrorLogLocation"
       - "ErrorFileLogSize"
       - "ServiceErrorFileLogSize"
@@ -94,23 +112,27 @@ logCollection:
       - "\"level\":\"debug\""
       - "error_count=0"
       - "errors=0"
-    maxMatches: 99                  # Maximum matches per log file to include in summary
-    contextLines: 2                 # Number of lines before/after each match to include
-    # Transaction/Correlation ID tracking for cross-file correlation
-    correlationKeys:                # Extract correlation IDs to group related errors across files
-      - pattern: 'TXN-\d+'          # Match transaction IDs like TXN-12345
+    maxMatches: 99
+    contextLines: 2
+    
+    # Advanced: Correlation ID tracking
+    correlationKeys:
+      - pattern: 'TXN-\d+'
         type: "transaction"
-      - pattern: 'REQ-[A-Z0-9]+'    # Match request IDs like REQ-ABC123
-        type: "request"  
-      - pattern: 'CORRELATION_ID=\S+'  # Match CORRELATION_ID=xyz
+      - pattern: 'REQ-[A-Z0-9]+'
+        type: "request"
+      - pattern: 'CORRELATION_ID=\S+'
         type: "correlation"
-      - pattern: 'traceId["\s:=]+([a-f0-9-]{36}|[a-f0-9]{32})'  # Match trace IDs (UUID or hex)
+      - pattern: 'traceId["\s:=]+([a-f0-9-]{36}|[a-f0-9]{32})'
         type: "trace"
-    timestampPatterns:              # Timestamp formats to parse for chronological correlation
-      - '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}'  # ISO 8601: 2026-02-18T14:30:15.123
-      - '\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]'     # Bracketed: [2026-02-18 14:30:15]
-      - '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}'  # Space-separated: 2026-02-18 14:30:15.123
-    # Semantic error grouping - group similar errors together for better classification
+    
+    # Advanced: Timestamp patterns
+    timestampPatterns:
+      - '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}'
+      - '\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]'
+      - '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}'
+    
+    # Advanced: Error grouping
     errorGroups:
       - name: "Database Connection Issues"
         patterns:
@@ -144,382 +166,162 @@ logCollection:
           - "too many open files"
           - "resource limit"
         severity: "HIGH"
-  # Post-download message filtering (creates filtered copies in filter/ directory)
-  messageFilter:
-    enabled: true                   # Enable/disable message filtering
-    keyValueFilters:                # Keep lines where key is absent OR key has matching value
-      - key: "ownerID"
-        value: "1096"
-      - key: "serial"
-        value: ""
-    specificStrings: []             # Only keep lines containing at least one of these strings (empty = no filter)
-    # Loki-style replica log merging (combine logs from replica pods into single files)
-    combineReplicas: true           # Merge replica pod logs into single file per service
-    replicaPattern: "-[a-z0-9]{5,10}$"  # Regex pattern to detect replica suffix (e.g., -abc123, -xyz789)
-    sortByTimestamp: true           # Sort combined logs chronologically by timestamp
-    timestampPattern: '\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{3,6})?'  # Regex to extract timestamp from log lines
-  # Pod file collection (collect specific files from inside pods)
-  podFileCollection:
-    enabled: true                  # Enable/disable pod file collection
-    collections:                    # List of pod file collection configurations
-      - namespace: "common"         # Kubernetes namespace
-        podPrefix: "cs-configuration"  # Pod name prefix to match
-        logPath: "/var/log/configuration/"  # Path inside the pod
-        filePatterns:               # File patterns to collect (supports wildcards)
-          - "*.log"                 # ALL .log files (server.log, error.log, etc.)
-        matchPodName: false         # Collect all files matching pattern (default)
-        # Wildcard Pattern Examples:
-        #   "*.log"          → All files ending with .log
-        #   "server*"        → All files starting with "server" (server.log, server_err.log)
-        #   "*error*"        → All files containing "error" in the name
-        #   "application*.log" → Files like application.log, application-2024.log
-        #   "*"              → ALL files (use carefully - might be too many!)
-        #   "server.log"     → Exact filename match (no wildcard)
-        #   ".log.gz"       → All files ending with .log.gz
-        #   "2024-*.log"     → All .log files starting with "2024-" (e.g., 2024-01.log, 2024-02.log)
-        #   "2024-??-??.log" → All .log files with date format (e.g., 2024-01-15.log, 2024-02-20.log)
-        #   "2024-0[1-2]-??.log" → All .log files from Jan and Feb 2024 (e.g., 2024-01-15.log, 2024-02-20.log)
-        #   "2024-*-??.log" → All .log files from 2024 (e.g., 2024-01-15.log, 2024-02-20.log, 2024-03-10.log)
-      
-      # NVO Orchestration Wired - Only collect logs matching current pod name
-      - namespace: "nvo"
-        podPrefix: "nvo-orchestration-wired"
-        logPath: "/data/log/nvo-orchestration-wired/"
-        filePatterns:
-          - "*.log"                 # All log files
-        matchPodName: true          # Only collect files where filename starts with pod name
-        # Example: For pod "nvo-orchestration-wired-7c59fdd6d6-7sqwc", collects:
-        #   ✓ nvo-orchestration-wired-7c59fdd6d6-7sqwc-server.log
-        #   ✓ nvo-orchestration-wired-7c59fdd6d6-7sqwc-server_err.log
-        #   ✗ nvo-orchestration-wired-779b85dbd4-xkqls-server.log (old pod - skipped)
-      
-      # NVO Orchestration Wireless - Only collect logs matching current pod name
-      - namespace: "nvo"
-        podPrefix: "nvo-orchestration-wireless"
-        logPath: "/data/log/nvo-orchestration-wireless/"
-        filePatterns:
-          - "*.log"                 # All log files
-        matchPodName: true          # Only collect files where filename starts with pod name
-        # Example: For pod "nvo-orchestration-wireless-7dd4bcdf5b-ldxmn", collects:
-        #   ✓ nvo-orchestration-wireless-7dd4bcdf5b-ldxmn-server.log
-        #   ✓ nvo-orchestration-wireless-7dd4bcdf5b-ldxmn-server_err.log
-        #   ✗ nvo-orchestration-wireless-5bbd464f64-nltbz-server.log (old pod - skipped)
-      
-      # Example: Add more collections as needed
-      # - namespace: "xiq"
-      #   podPrefix: "hmweb"
-      #   logPath: "/opt/app/logs/"
-      #   filePatterns:
-      #     - "*.log"
-      #     - "application*.log"
-      #     - "*.log.gz"
-      #   matchPodName: false
-# General System Information Collection
-generalInfo:
-  enabled: false
-  outputDir: "General"
-  commands:
-    - name: "nodes_detailed"
-      command: "kubectl get nodes -o wide"
-      description: "Get nodes with detailed information"
-    - name: "pods_current_namespace"
-      command: "kubectl get pods -n {environment} -o wide"
-      description: "Get pods in current environment namespace"
-    - name: "node_memory_cpu_info"
-      command: "kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.capacity.cpu,MEMORY:.status.capacity.memory"
-      description: "CPU and memory information of each node"
-    - name: "pods_all_namespaces"
-      command: "kubectl get pods --all-namespaces -o wide"
-      description: "Get pods in all namespaces"
-    - name: "nodes_cpu_usage"
-      command: "kubectl top node --sort-by=cpu"
-      description: "Get nodes with high CPU usage"
-    - name: "node_memory_usage"
-      command: "kubectl top node --sort-by=memory"
-      description: "Get nodes with high memory usage"
-    - name: "pods_cpu_memory_usage"
-      command: "kubectl top pod --all-namespaces --containers"
-      description: "Get pods with top cpu"
+  
 
-# App Version Collection Settings
+  # ┌─── Temporal Workflows - Collect workflow execution data ─────────────┐
+  # Note: Controlled by defaultEP1Logs setting (above)
+  temporalWorkflowCollection:
+    enabled: true
+    workflowIdPrefix: ""                    # Filter by prefix or empty for all
+    numberOfWorkflows: 3                    # 1-20 recent workflows
+    namespace: "configuration"
+    customAliases: []                       # Optional custom bash aliases
+  
+  # ┌─── Temporal Schedules - Collect schedule information ────────────────┐
+  # Note: Controlled by defaultEP1Logs setting (above)
+  temporalScheduleCollection:
+    enabled: true
+    numberOfSchedules: 5
+    namespace: "configuration"
+  
+  # ┌─── Pod File Collection - Collect Files from Inside Pods ─────────────┐
+  # Note: Built-in collections (cs-configuration, nvo-orchestration-wired/wireless)
+  #       are controlled by defaultEP1Logs setting (above)
+  # Add only ADDITIONAL collections below (beyond built-in defaults)
+  podFileCollection:
+    enabled: false                      # Enable/disable pod file collection             
+    collections:                        # List of pod file collection configurations
+      - namespace: "common"             # Kubernetes namespace
+        podPrefix: "cs-configuration"   # Pod name prefix to match
+        logPath: "/var/log/configuration/"  # Path inside the pod
+        filePatterns:                   # File patterns to collect (supports wildcards)
+          - "*.log"                     # ALL .log files (server.log, error.log, *.log.gz, etc.)
+        matchPodName: true              # Collect all files matching pod name prefix (e.g. cs-configuration-abc123-server.log)
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  SYSTEM INFO COLLECTION - kubectl commands                              │
+# └─────────────────────────────────────────────────────────────────────────┘
+# Note: Always runs when enabled (independent of defaultEP1Logs setting)
+systemInfo:
+  enabled: false
+  outputDir: "System_Info"
+  commandTimeout: 180                     # Timeout per command in seconds (60-300, default: 180)
+  commands:
+    - name: "kubectl_get_pods_environment"
+      command: "kubectl get pods -n {environment} -o wide"
+    
+    - name: "kubectl_get_pods_all_namespaces"
+      command: "kubectl get pods --all-namespaces -o wide"
+    
+    - name: "kubectl_cluster_info"
+      command: "kubectl cluster-info"
+    
+    - name: "kubectl_get_deployments"
+      command: "kubectl get deployments -n {environment}"
+    
+    - name: "kubectl_get_services"
+      command: "kubectl get services -n {environment}"
+    
+    - name: "kubectl_top_nodes"
+      command: "kubectl top nodes"
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  APP VERSION INFO - Check application versions                          │
+# └─────────────────────────────────────────────────────────────────────────┘
+# Note: Always runs when enabled (independent of defaultEP1Logs setting)
 appVersionCollection:
-  enabled: true                     # Enable/disable app version collection
-  outputFileName: "{environment}_app_versions_{timestamp}.txt"  # Output file name for version information
-  printToLog: true                  # Print version information to console/log output
-  namespaces:                       # Namespaces and pod prefixes to check for versions
+  enabled: true
+  outputFileName: "App_Version_Info.txt"
+  printToLog: true
+  namespaces:
     - namespace: "common"
       description: "Common services namespace"
       podPrefixes: ["cas-api-service", "cls-api-service", "cns-api-service", "cs-configstate", "cs-configuration", "cs-metaflow-cacheupdater", "cs-tagging", "common-kafka", "temporal", "device-connector"]
-    - namespace: "{environment}"     # Dynamic: uses 'xiq' if the namespace exists, otherwise environment name (e.g., dl2r1)
+    
+    - namespace: "{environment}"
       description: "Environment-specific services (XIQ namespace)"
       podPrefixes: ["hmweb", "teconfig", "copilot-flink", "default-kafka"]
+    
     - namespace: "nvo"
       description: "NVO services namespace"
       podPrefixes: ["nvo-edge", "nvo-network"]
 
-# Database Query Collection Settings
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  DATABASE QUERIES - Troubleshooting data collection                     │
+# └─────────────────────────────────────────────────────────────────────────┘
 databaseCollection:
-  enabled: true                     # Enable/disable database query collection
-  outputDir: "Database"             # Subdirectory within main outputDir for database query results
+  enabled: false
+  outputDir: "Database"
+  queryTimeout: 60
   
-  # Global parameters that can be used in SQL queries
+  # Query parameters
   parameters:
-    serial_number: ""               # Device serial number (e.g., "12345678")
-    owner_id: "1096"                    # Owner/tenant ID (e.g., "1096")
+    serial_number: ""                       # Device serial number (optional)
+    owner_id: "1096"                        # Tenant/Owner ID
   
-  # Connection and query timeouts
-  queryTimeout: 60                  # Query execution timeout in seconds
+  # Database aliases: Uses bash aliases from AWS server (psqlplatdb, psqlaccountdb, etc.)
   
-  # Database aliases from AWS environment
-  # Format: alias_name: "psqlrds -U username -d database"
-  # 
-  # NOTE: This is a reference list of available aliases. The tool will automatically
-  #       check if each alias exists in the AWS environment before executing queries.
-  #       If an alias is not available, that database will be gracefully skipped with
-  #       a warning message, and the tool will continue with other databases.
-  # 
-  # The actual connection details for psqlrds are read from the AWS environment.
-  aliases:
-    psqlrds: "psql -h aurora-dl2.cluster-cjmu4y64cxc2.us-east-2.rds.amazonaws.com"
-    psqla3db: "psqlrds -U a3user -d a3"
-    psqlaccountdb: "psqlrds -U accountuser -d accountdb"
-    psqlassetsdb: "psqlrds -U assetsuser -d assetsdb"
-    psqlconfigdb_1: "psqlrds -U configuser_1 -d configdb_1"
-    psqldcsdb: "psqlrds -U dcsuser1 -d dcs_db"
-    psqlplatdb: "psqlrds -U postgres -d platform_common_db"
-    psqlportaldb: "psqlrds -U portaluser -d portaldb"
-    psqlproductinfodb: "psqlrds -U productinfouser -d productinfodb"
-    psqlredirectordb: "psqlrds -U redirectoruser -d redirectordb"
-    psqlscheduledb: "psqlrds -U scheduleuser -d scheduledb"
-    psqlsystemdb: "psqlrds -U systemuser -d systemdb"
-    psqltemporaldb: "psqlrds -U temporaluser temporaldb"
-  
-  # Database queries with automatic cross-database parameter sharing
+  # Queries to execute
   databases:
-    # Assets Database
-    - name: "assetsdb"
-      alias: "psqlassetsdb"
-      enabled: false
+    # Platform Common DB - Usually the starting point
+    - name: "platform_common_db"
+      alias: "psqlplatdb"
+      enabled: true
       queries:
-        - name: "get_device_by_serial"
-          sql: "SELECT asset_device_id, serial_number, owner_id, device_name, mac_address FROM devices WHERE serial_number = '{serial_number}'"
-          parameters: ["asset_device_id"]  # Extract asset_device_id from results and add to global parameters
-        - name: "get_device_history"
-          sql: "SELECT * FROM device_history WHERE asset_device_id = '{asset_device_id}' ORDER BY created_at DESC LIMIT 20"
-          # Uses asset_device_id extracted from previous query (automatic dependency resolution)
+        - name: "get_asset_devices_by_owner"
+          sql: "SELECT serial_number, created_at, initial_collection_done, id as asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'"
+          parameters: ["asset_device_id", "serial_number"]
+        
+        - name: "get_inferred_device_info"
+          sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{platform_common_db.asset_device_id}'"
+          # Uses asset_device_id from previous query (namespace optional within same database)
     
-    # Config Database
+   
+    # Config DB - Configuration data
     - name: "configdb_1"
       alias: "psqlconfigdb_1"
       enabled: false
       queries:
         - name: "get_device_config"
           sql: "SELECT config_id, device_id, serial_number, config_data FROM device_configs WHERE serial_number = '{serial_number}'"
-          parameters: ["config_id"]  # Extract config_id from results
+          parameters: ["config_id"]
+        
         - name: "get_config_history"
           sql: "SELECT * FROM config_history WHERE config_id = '{config_id}' ORDER BY updated_at DESC LIMIT 10"
-          # Uses config_id extracted from previous query
-    
-    # Platform Common Database
-    - name: "platform_common_db"
-      alias: "psqlplatdb"
-      enabled: true
-      queries:
-        - name: "get_asset_devices_by_owner"
-          sql: "SELECT serial_number, created_at, initial_collection_done, id AS asset_device_id FROM asset_device WHERE owner_id = '{owner_id}'"
-          parameters: ["asset_device_id", "serial_number"]  # Extract multiple columns from results
-        - name: "get_inferred_device_info"
-          sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{asset_device_id}'"
-          # Uses asset_device_id from previous query (namespace optional within same database)
-  
-  # Query Execution Features (v1.3.3 build #21):
-  # 
-  # SECURITY: Only SELECT queries are allowed. Any query containing INSERT, UPDATE,
-  #           DELETE, DROP, CREATE, ALTER, TRUNCATE, or other data-modifying keywords
-  #           will be rejected. This is a log collector tool - it should not modify data.
-  # 
-  # 1. MULTI-VALUE PARAMETERS (CSV support):
-  #    Configure multiple values separated by commas in parameters:
-  #      parameters:
-  #        owner_id: "1096, 2345, 3456"
-  #        serial_number: "SN001, SN002, SN003"
-  #    Query automatically executes N times (once per value), results aggregated.
-  # 
-  # 2. PARAMETER EXTRACTION (cross-database sharing):
-  #    Extract column values from query results and add to global parameters:
-  #      queries:
-  #        - name: "query1"
-  #          sql: "SELECT asset_device_id, owner_id FROM devices WHERE ..."
-  #          parameters: ["asset_device_id", "owner_id"]  # Extract these columns
-  #    Creates: platform_common_db.asset_device_id, platform_common_db.owner_id
-  #    Also creates fallback: asset_device_id, owner_id (if not already defined)
-  # 
-  # 3. CROSS-DATABASE PARAMETER USAGE:
-  #    Parameters extracted by one database can be used by other databases:
-  #      Database 1 (platform_common_db):
-  #        - Extract: asset_device_id = [12345, 67890]
-  #      Database 2 (assetsdb):
-  #        - Use: sql: "SELECT * FROM devices WHERE asset_device_id = '{asset_device_id}'"
-  #      Database 3 (configdb_1):
-  #        - Use: sql: "SELECT * FROM configs WHERE asset_device_id = '{asset_device_id}'"
-  # 
-  # 4. NAMESPACE COLLISION PREVENTION:
-  #    Parameters are namespaced by database name to prevent collisions:
-  #      - platform_common_db.asset_device_id (with namespace)
-  #      - asset_device_id (without namespace, fallback)
-  #    Use in SQL: {asset_device_id} or {platform_common_db.asset_device_id}
-  # 
-  # 5. AUTOMATIC DEPENDENCY RESOLUTION:
-  #    No manual dependsOn/referenceColumn needed!
-  #    Code automatically:
-  #      - Detects required parameters from SQL: {param_name}
-  #      - Defers queries missing parameters
-  #      - Executes queries when parameters become available
-  #      - Detects circular dependencies
-  # 
-  # 6. THREE-TIER PARAMETER LOOKUP:
-  #    When resolving {param_name}, code tries:
-  #      1. Exact match: globalParams["param_name"]
-  #      2. Current DB namespace: globalParams["current_db.param_name"]
-  #      3. Any DB namespace: Search for "*.param_name" pattern
-  #    Note: Within the same database, namespace prefix is optional (fallback works)
-  # 
-  # Example Usage:
-  #   parameters:
-  #     owner_id: "1096, 2345"  # 2 owners
-  #   
-  #   databases:
-  #     - name: "platform_common_db"
-  #       queries:
-  #         - sql: "SELECT asset_device_id FROM asset_device WHERE owner_id = '{owner_id}' LIMIT 5"
-  #           parameters: ["asset_device_id"]
-  #           # Executes 2 times (owner_id=1096, owner_id=2345)
-  #           # Returns 10 devices total
-  #           # Extracts: platform_common_db.asset_device_id = [10 values]
-  #     
-  #     - name: "assetsdb"
-  #       queries:
-  #         - sql: "SELECT * FROM devices WHERE asset_device_id = '{asset_device_id}'"
-  #           # Uses asset_device_id from platform_common_db
-  #           # Executes 10 times (once per device)
-  #           # Results aggregated automatically
 
-# JIRA Integration Settings
-jira:
-  email: "{username}@extremenetworks.com" # Supports templates: {username}, {environment}
-  apiToken: ""                            # OPTIONAL: API token (see multi-source retrieval below)
-  attachmentEnabled: true                 # Enable/disable automatic file attachment to JIRA issues
-  baseUrl: "https://extremenetworks.atlassian.net"  # JIRA instance base URL
-  # API Token Multi-Source Retrieval (Priority Order):
-  # 1. Environment Variable: JIRA_API_TOKEN
-  #    Set with: set JIRA_API_TOKEN=your_token (Windows) or export JIRA_API_TOKEN=your_token (Linux/Mac)
-  # 
-  # 2. Windows Credential Manager (Windows only):
-  #    Securely stored by Windows, automatically saved on first use
-  #    View/edit in: Control Panel -> Credential Manager -> Windows Credentials
-  #    Target name: LogCollector:JIRA:your-email@example.com
-  # 
-  # 3. Config file (this file):
-  #    apiToken: "your_token_here"
-  # 
-  # 4. Interactive Prompt:
-  #    If token not found in any source, you'll be prompted (hidden input)
-  #    Token will be automatically saved to Windows Credential Manager for future use
-  # 
-  # Generate API token at: https://id.atlassian.com/manage-profile/security/api-tokens
-
-  # Usage: Run with --jira flag to attach downloaded files to a JIRA issue
-  # Example: ./logcollector --all --jira XCP-17614
-  # 
-  # Files attached: archive (.tar.gz), logger_info, app_versions, devicelogs, version_info
-
-# Network Device Log Collection Settings
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  NETWORK DEVICE LOG COLLECTION - Collect logs from switches (NOS)       │
+# └─────────────────────────────────────────────────────────────────────────┘
 deviceLogCollection:
-  enabled: true                      # Master enable/disable for device log collection
-  outputDir: "Device"                # Subdirectory within main outputDir for device logs
-  parallelDownloads: true            # Download from multiple devices concurrently
-  globalTimeout: 600                 # Total timeout per device (seconds)
+  enabled: false
+  outputDir: "Device"
+  parallelDownloads: true                   # Download from multiple devices concurrently
+  globalTimeout: 600                        # Total timeout per device (seconds)
   
   # CLI Settings
   cliSettings:
-    commandTimeout: 180              # Max timeout per command (seconds)
-    commandDelay: 1                  # Delay between commands (seconds)
+    commandTimeout: 180                     # Max timeout per command (seconds)
+    commandDelay: 1                         # Delay between commands (seconds)
   
-  # EXOS Device Type Defaults
-  exosDefaults:
-    pagingDisableCommand: "disable clipaging"
-    diagnosticCommands:
-      - name: "version"
-        command: "show version"
-        description: "Software version and hardware info"
-      - name: "switch"
-        command: "show switch"
-        description: "Switch status and uptime"
-      - name: "inlets"
-        command: "show inlets"
-        description: "Inlets status"
-      - name: "iqagent"
-        command: "show iqagent"
-        description: "IQ Agent status"
-      - name: "telemetry"
-        command: "show telemetry"
-        description: "Telemetry configuration"
-      - name: "vlan"
-        command: "show vlan"
-        description: "VLAN configuration"
-      - name: "running_config"
-        command: "show configuration"
-        description: "Running configuration"
-      - name: "openapi_logs"
-        command: "show openapi-server logs"
-        description: "OpenAPI server logs (may produce continuous output)"
+  # Note: Device-specific defaults (paging disable, enable, config commands) are
+  #       built into the code. Use "useDefaults: true" to apply them per device.
   
-  # VOSS Device Type Defaults
-  vossDefaults:
-    enableCommand: "enable"
-    configCommand: "configure terminal"
-    pagingDisableCommand: "terminal more disable"
-    diagnosticCommands:
-      - name: "software"
-        command: "show software"
-        description: "Software version information"
-      - name: "sys_info"
-        command: "show sys-info"
-        description: "System information and uptime"
-      - name: "vlan"
-        command: "show vlan basic"
-        description: "VLAN configuration"
-      - name: "iqagent"
-        command: "show application iqagent"
-        description: "IQ Agent status"
-      - name: "inlets"
-        command: "show application inlets"
-        description: "Inlets status"
-      - name: "openapi"
-        command: "show application openapi"
-        description: "OpenAPI status"
-      - name: "telegraf"
-        command: "show application telegraf"
-        description: "Telegraf status"
-      - name: "running_config"
-        command: "show running-config"
-        description: "Running configuration"
-  
-  # Individual Devices
+  # ┌─── Individual Devices ────────────────────────────────────────────────┐
   devices:
+    # EXOS Device Example
     - name: "core-switch-exos"
-      type: "exos"                   # Device type: "exos" or "voss"
-      enabled: true                  # Per-device enable/disable
-      ipAddress: "10.127.34.23"
+      type: "exos"                          # Device type: "exos" or "voss"
+      enabled: true                         # Set to true to enable
+      ipAddress: ""
       port: 22
       username: "admin"
-      password: ""                   # Plain text password
+      password: ""                          # Auto-uses Windows Credential Manager if empty
       
       # Diagnostic Commands
       diagnostics:
         enabled: true
-        useDefaults: true            # Use exosDefaults.diagnosticCommands
-        additionalCommands: []       # Device-specific extras
+        useDefaults: true                   # Use exosDefaults.diagnosticCommands
+        additionalCommands: []              # Device-specific extras
       
       # Log File Collection
       logs:
@@ -527,7 +329,7 @@ deviceLogCollection:
         compressionEnabled: true
         compressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz -C /usr/local/tmp/eciq/ openapi_server.log hiveagent.log agent.log"
         compressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz"
-        fallbackFiles:               # Auto-fallback if compression fails
+        fallbackFiles:                      # Auto-fallback if compression fails
           - "/usr/local/tmp/eciq/agent.log"
           - "/usr/local/tmp/eciq/hiveagent.log"
           - "/usr/local/tmp/eciq/openapi_server.log"
@@ -535,140 +337,33 @@ deviceLogCollection:
         removeOldLogs: false
         oldLogsPattern: "/usr/local/tmp/eciq/*.log.*"
     
-    - name: "access-switch-exos"
-      type: "exos"
+    # VOSS Device Example
+    - name: "voss-switch"
+      type: "voss"
       enabled: false
-      ipAddress: "10.127.34.24"
+      ipAddress: ""
       port: 22
-      username: "admin"
+      username: "rwa"
       password: ""
       
       diagnostics:
         enabled: true
-        useDefaults: true
-        additionalCommands:
-          - name: "custom_check"
-            command: "show process"
-            description: "Process list"
-      
-      logs:
-        enabled: true
-        compressionEnabled: false    # Skip compression, download individual files
-        compressedFilePath: ""
-        fallbackFiles:
-          - "/usr/local/tmp/eciq/agent.log"
-        removeCompressedFile: false
-        removeOldLogs: false
-        oldLogsPattern: ""
-    
-    - name: "distribution-switch-exos"
-      type: "exos"
-      enabled: false
-      ipAddress: "10.127.34.25"
-      port: 22
-      username: "rwa"
-      password: "rwa"
-      
-      diagnostics:
-        enabled: true               # Skip diagnostics for this device
-        useDefaults: true
+        useDefaults: true                   # Use vossDefaults.diagnosticCommands
         additionalCommands: []
       
       logs:
         enabled: true
-        compressionEnabled: true
-        compressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz -C /usr/local/tmp/eciq/ *.log"
-        compressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz"
-        fallbackFiles:
-          - "/usr/local/tmp/eciq/agent.log"
-        removeCompressedFile: true
-        removeOldLogs: false
-        oldLogsPattern: ""
-
-    - name: "Man-flo-0035"
-      type: "voss"
-      enabled: false
-      ipAddress: "10.139.121.231"
-      port: 22
-      username: "rwa"
-      password: "rwa"
-      
-      diagnostics:
-        enabled: true
-        useDefaults: true            # Use vossDefaults.diagnosticCommands
-        additionalCommands: []
-      
-      logs:
-        enabled: true
-        compressionEnabled: false    # VOSS doesn't support on-device tar
+        compressionEnabled: false           # VOSS doesn't support on-device tar
         compressionCommand: ""
         compressedFilePath: ""
-        fallbackFiles:               # Download individual files from /intflash/
+        fallbackFiles:                      # Download individual files from /intflash/
           - "/intflash/openapi/openapi_server.log"
-          - "/intflash/alarmLog"
           - "/intflash/config.cfg"
-          - "/intflash/diag_logs"
         removeCompressedFile: false
         removeOldLogs: false
         oldLogsPattern: ""
 
 # ============================================================================
-# Temporal Cheat Sheet
-# ============================================================================
-# These are bash aliases for debugging Temporal workflows when exec'd into
-# a Temporal admin pod. Copy and paste these commands into your bash session.
-# 
-# Usage:
-#   1. kubectl exec -it <temporal-admin-pod> -n common -- bash
-#   2. Copy/paste the aliases below
-#   3. Use them: tc-list, tc-input <workflow-id>, tc-output <workflow-id>, etc.
+# End of Configuration
 # ============================================================================
 
-Temporal_Cheat_Sheet: |
-  # List all workflows in configuration namespace
-  alias tc-list='temporal workflow list --namespace configuration'
-
-  # Show workflow input (decoded from base64 and pretty-printed JSON)
-  alias tc-input='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"; }; f'
-
-  # Show workflow output (decoded from base64 and pretty-printed JSON)
-  alias tc-output='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"; }; f'
-
-  # Show both input and output for a workflow
-  alias tc-both='f(){ echo "=== INPUT ===" && tc-input "$1" && echo -e "\n=== OUTPUT ===" && tc-output "$1"; }; f'
-
-  # List all activities for a workflow with event IDs and types
-  alias tc-activities='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""; }; f'
-
-  # Show activity failure details for a specific activity by name
-  alias tc-activity-failure='f(){
-    SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-      jq -r --arg activityName "$2" \
-        ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
-    if [ -n "$SCHED_ID" ]; then
-      temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-      jq -r --arg sid "$SCHED_ID" \
-        ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | \
-      jq . 2>/dev/null || echo "No failure data found for activity $2";
-    else
-      echo "Activity $2 not found";
-    fi
-  }; f'
-
-  # Show activity input by activity name
-  alias tc-activity-input-by-name='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"$2\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity $2"; }; f'
-
-  # Show activity output by activity name
-  alias tc-activity-output='f(){
-    SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-      jq -r --arg activityName "$2" \
-        ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
-    if [ -n "$SCHED_ID" ]; then
-      temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-      jq -r --arg sid "$SCHED_ID" \
-        ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | \
-      base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity $2";
-    else
-      echo "Activity $2 not found";
-    fi
-  }; f'

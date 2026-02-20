@@ -10,6 +10,7 @@ LogCollector is a command-line tool that automates the collection of logs and di
 - **Temporal workflow support** — Simplifies complex workflow log collection by automatically gathering workflow histories, schedules, and correlated logs across services
 - **Database query collection** — Execute PostgreSQL queries via SSH tunneling (Bastion → AWS → RDS) with cross-database parameter passing and automatic dependency resolution
 - **Network device diagnostics** — Executes CLI commands on EXOS/VOSS switches and downloads logs via SFTP and SCP
+- **Dynamic device detection** — Automatically discovers devices from the database (hm_device table) by owner_id, with type-based default credentials and NOS log paths
 - **Message filtering** — Extract specific log entries by key-value pairs or strings, with Loki-style replica merging
 - **Log analysis** — Pattern-based error detection with severity classification, correlation ID tracking, and grouped error reporting
 - **Replica handling** — Automatically merges logs from replica pods and filters out old pod logs from persistent directories
@@ -519,61 +520,92 @@ databaseCollection:
 │  NETWORK DEVICE LOG COLLECTION - EXOS/VOSS switches (read-only)         │
 └─────────────────────────────────────────────────────────────────────────┘
 deviceLogCollection:
-  enabled: false
+  enabled: true
   outputDir: "Device"
   parallelDownloads: true                   # Download from multiple devices concurrently
   globalTimeout: 600                        # Total timeout per device (seconds)
+
+  # Default NOS Log Files — use built-in EXOS/VOSS log paths
+  # When enabled, devices don't need logs.compressionCommand/fallbackFiles in config
+  defaultNosLogFiles:
+    enabled: true                            # Use hardcoded NOS log paths
 
   cliSettings:
     commandTimeout: 180                     # Max timeout per command (seconds)
     commandDelay: 1                         # Delay between commands (seconds)
 
   devices:
-    # EXOS Device Example
+    # EXOS Device Example (port/username/password are optional with type-based defaults)
     - name: "core-switch-exos"
       type: "exos"                          # "exos" or "voss"
       enabled: true
       ipAddress: "10.x.x.x"
-      port: 22
-      username: "admin"
-      password: ""                          # Leave empty → auto-uses Credential Manager
+      # port: 22                            # Optional (default: 22)
+      # username: "admin"                   # Optional (default: "admin" for EXOS)
+      # password: ""                        # Optional (default: "" for EXOS)
 
       diagnostics:
         enabled: true
         useDefaults: true                   # Built-in EXOS diagnostic commands (show version, etc.)
         additionalCommands: []              # Device-specific extras
 
-      logs:
-        enabled: true
-        compressionEnabled: true
-        compressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz ..."
-        compressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz"
-        fallbackFiles:                      # Auto-fallback if compression fails
-          - "/usr/local/tmp/eciq/agent.log"
-          - "/usr/local/tmp/eciq/hiveagent.log"
-          - "/usr/local/tmp/eciq/openapi_server.log"
-        removeCompressedFile: true
+      # logs section is optional when defaultNosLogFiles.enabled = true
+      # If specified, it overrides the built-in defaults for this device
 
     # VOSS Device Example
     - name: "voss-switch"
       type: "voss"
       enabled: false
       ipAddress: "10.x.x.x"
-      port: 22
-      username: "rwa"
-      password: ""
+      # port: 22                            # Optional (default: 22)
+      # username: "rwa"                     # Optional (default: "rwa" for VOSS)
+      # password: "rwa"                     # Optional (default: "rwa" for VOSS)
 
       diagnostics:
         enabled: true
         useDefaults: true                   # Built-in VOSS diagnostic commands
-
-      logs:
-        enabled: true
-        compressionEnabled: false           # VOSS doesn't support on-device tar
-        fallbackFiles:
-          - "/intflash/openapi/openapi_server.log"
-          - "/intflash/config.cfg"
 ```
+
+#### Default Credentials & Log Paths
+
+| Device Type | Default Port | Default Username | Default Password | Compression |
+|-------------|:------------|:----------------|:----------------|:------------|
+| **EXOS** | 22 | `admin` | (empty) | `tar -czf` on device → single `.tar.gz` download |
+| **VOSS** | 22 | `rwa` | `rwa` | Not supported → individual file downloads |
+
+**Default EXOS log files** (when `defaultNosLogFiles.enabled: true`):
+- `/usr/local/tmp/eciq/openapi_server.log`
+- `/usr/local/tmp/eciq/hiveagent.log`  
+- `/usr/local/tmp/eciq/agent.log`
+
+**Default VOSS log files**:
+- `/intflash/openapi/openapi_server.log`
+- `/intflash/config.cfg`
+
+### Dynamic Device Detection
+
+When enabled, the tool automatically discovers devices from the database during AWS connection, eliminating the need to manually configure device IP addresses in config.yaml.
+
+```yaml
+logCollection:
+  dynamicDeviceDetection:
+    enabled: true                            # Query configdb_1 for devices
+    maxDevices: 3                            # Max devices to collect from
+```
+
+**How it works:**
+1. During AWS phase, queries `hm_device` table in `configdb_1` for the configured `owner_id`
+2. Prints a table of all detected devices (hostname, family, IP, serial number)
+3. If `dynamicDeviceDetection.enabled: true`, builds a device list from DB results
+4. Detected devices replace config.yaml static devices for log collection
+5. Type-based defaults (credentials, log paths) are applied automatically
+
+**Requirements:**
+- AWS connection (bastion → AWS hop)
+- `owner_id` set in `databaseCollection.parameters`
+- `psqlconfigdb_1` bash alias available on AWS server
+
+**Note:** `--device-logs` standalone mode always uses config.yaml devices (ignores dynamic detection).
 
 ---
 

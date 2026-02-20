@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.0.2"   // Semantic version (set via -ldflags)
+	appVersion  = "2.1.1"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -299,11 +299,11 @@ func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] [%s] %s\n", timestamp, level.String(), message)
 
-	// Terminal output: truncate to 118 visible characters + "..." (121 total)
-	const maxTerminalWidth = 118
+	// Terminal output: truncate to 125 visible characters + " ..." (129 total)
+	const maxTerminalWidth = 125
 	lineNoNewline := strings.TrimRight(line, "\n")
 	if len(lineNoNewline) > maxTerminalWidth {
-		fmt.Println(lineNoNewline[:maxTerminalWidth] + "...")
+		fmt.Println(lineNoNewline[:maxTerminalWidth] + " ...")
 	} else {
 		fmt.Print(line)
 	}
@@ -755,16 +755,32 @@ type NetworkDevice struct {
 	Logs        DeviceLogConfig        `yaml:"logs"`
 }
 
+// DetectedDevice represents a device discovered from the database (hm_device table)
+type DetectedDevice struct {
+	SerialNumber       string // serial_number column
+	ConfiguredHostName string // configured_host_name column
+	DeviceFamily       string // device_family column (e.g., EXOS, VOSS)
+	SoftwareVersion    string // software_version column
+	AgentVersion       string // agent_version column
+	IPAddress          string // ip_address column
+	IsConnected        string // is_connected column
+	InletsCapable      string // inlets_capable column
+	SimType            string // sim_type column
+}
+
 // DeviceLogCollection contains configuration for network device log collection
 type DeviceLogCollection struct {
-	Enabled           bool              `yaml:"enabled"`
-	OutputDir         string            `yaml:"outputDir"`
-	ParallelDownloads bool              `yaml:"parallelDownloads"`
-	GlobalTimeout     int               `yaml:"globalTimeout"`
-	CLISettings       DeviceCLISettings `yaml:"cliSettings"`
-	ExosDefaults      ExosDefaultConfig `yaml:"exosDefaults"`
-	VossDefaults      VossDefaultConfig `yaml:"vossDefaults"`
-	Devices           []NetworkDevice   `yaml:"devices"`
+	Enabled            bool              `yaml:"enabled"`
+	OutputDir          string            `yaml:"outputDir"`
+	ParallelDownloads  bool              `yaml:"parallelDownloads"`
+	GlobalTimeout      int               `yaml:"globalTimeout"`
+	CLISettings        DeviceCLISettings `yaml:"cliSettings"`
+	ExosDefaults       ExosDefaultConfig `yaml:"exosDefaults"`
+	VossDefaults       VossDefaultConfig `yaml:"vossDefaults"`
+	DefaultNosLogFiles struct {
+		Enabled bool `yaml:"enabled"` // When true, use hardcoded NOS log file paths (EXOS/VOSS) instead of config.yaml
+	} `yaml:"defaultNosLogFiles"`
+	Devices []NetworkDevice `yaml:"devices"`
 }
 
 // DatabaseQuery represents a single SQL query to execute
@@ -826,8 +842,12 @@ type Config struct {
 	} `yaml:"options"`
 	// New section for log collection
 	LogCollection struct {
-		Enabled             bool           `yaml:"enabled"`
-		DefaultEP1Logs      bool           `yaml:"defaultEP1Logs"` // Enable/disable default EP1 log collection (kubectl logs + temporal) (default: true)
+		Enabled                bool `yaml:"enabled"`
+		DefaultEP1Logs         bool `yaml:"defaultEP1Logs"` // Enable/disable default EP1 log collection (kubectl logs + temporal) (default: true)
+		DynamicDeviceDetection struct {
+			Enabled    bool `yaml:"enabled"`    // When true, detect devices from configdb_1 during AWS phase
+			MaxDevices int  `yaml:"maxDevices"` // Maximum number of devices to use from DB (default: 3)
+		} `yaml:"dynamicDeviceDetection"`
 		LogFileName         string         `yaml:"logFileName"`
 		CustomSources       []PodLogSource `yaml:"customSources"`
 		TempDir             string         `yaml:"tempDir"`
@@ -7983,6 +8003,43 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+// getDefaultExosLogConfig returns the hardcoded default log file configuration for EXOS devices
+func getDefaultExosLogConfig() DeviceLogConfig {
+	return DeviceLogConfig{
+		Enabled:            true,
+		CompressionEnabled: true,
+		CompressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz -C /usr/local/tmp/eciq/ openapi_server.log hiveagent.log agent.log",
+		CompressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz",
+		FallbackFiles: []string{
+			"/usr/local/tmp/eciq/agent.log",
+			"/usr/local/tmp/eciq/hiveagent.log",
+			"/usr/local/tmp/eciq/openapi_server.log",
+		},
+		RemoveCompressedFile: true,
+		RemoveOldLogs:        false,
+	}
+}
+
+// getDefaultVossLogConfig returns the hardcoded default log file configuration for VOSS devices
+func getDefaultVossLogConfig() DeviceLogConfig {
+	return DeviceLogConfig{
+		Enabled:            true,
+		CompressionEnabled: false,
+		FallbackFiles: []string{
+			"/intflash/openapi/openapi_server.log",
+			"/intflash/config.cfg",
+		},
+	}
+}
+
+// getDefaultDiagnosticConfig returns the default diagnostic configuration
+func getDefaultDiagnosticConfig() DeviceDiagnosticConfig {
+	return DeviceDiagnosticConfig{
+		Enabled:     true,
+		UseDefaults: true,
+	}
+}
+
 // collectDeviceLogsFromDevice connects to a single EXOS device, disables paging,
 // collects diagnostics and log files within a global timeout.
 func collectDeviceLogsFromDevice(device NetworkDevice, dlc DeviceLogCollection, outputDir string, logger *Logger) error {
@@ -8013,12 +8070,52 @@ func collectDeviceLogsFromDevice(device NetworkDevice, dlc DeviceLogCollection, 
 // collectDeviceLogsFromDeviceInner performs the actual device collection work
 func collectDeviceLogsFromDeviceInner(device NetworkDevice, dlc DeviceLogCollection, outputDir string, logger *Logger) error {
 	startTime := time.Now()
+
+	// Apply default credentials based on device type if not specified
+	deviceType := strings.ToLower(device.Type)
+	if device.Port == 0 {
+		device.Port = 22
+	}
+	switch deviceType {
+	case "exos":
+		if device.Username == "" {
+			device.Username = "admin"
+		}
+		// Password defaults to "" for EXOS (no change needed since zero-value is "")
+	case "voss":
+		if device.Username == "" {
+			device.Username = "rwa"
+		}
+		if device.Password == "" {
+			device.Password = "rwa"
+		}
+	}
+
+	// Apply default NOS log/diagnostic configs when defaultNosLogFiles is enabled
+	if dlc.DefaultNosLogFiles.Enabled {
+		switch deviceType {
+		case "exos":
+			if len(device.Logs.FallbackFiles) == 0 && device.Logs.CompressedFilePath == "" {
+				device.Logs = getDefaultExosLogConfig()
+				logger.Debug("Applied default EXOS log file configuration for '%s'", device.Name)
+			}
+		case "voss":
+			if len(device.Logs.FallbackFiles) == 0 {
+				device.Logs = getDefaultVossLogConfig()
+				logger.Debug("Applied default VOSS log file configuration for '%s'", device.Name)
+			}
+		}
+		// Apply default diagnostics if not explicitly configured
+		if !device.Diagnostics.Enabled && !device.Diagnostics.UseDefaults {
+			device.Diagnostics = getDefaultDiagnosticConfig()
+			logger.Debug("Applied default diagnostic configuration for '%s'", device.Name)
+		}
+	}
+
 	logger.Info("========================================")
 	logger.Info("Starting collection from device: %s (%s)", device.Name, device.IPAddress)
 	logger.Info("Device type: %s", device.Type)
 	logger.Info("========================================")
-
-	deviceType := strings.ToLower(device.Type)
 
 	// Device-specific output directory (created only after successful connection)
 	deviceOutputDir := filepath.Join(outputDir, device.Name)
@@ -8240,6 +8337,142 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 // ============================================================================
 // Database Query Collection Functions
 // ============================================================================
+
+// queryDeviceInfoFromDB queries the hm_device table in configdb_1 to detect
+// devices belonging to a given owner_id. This is used for dynamic device detection.
+// It prints the results as a table and returns the detected devices.
+func queryDeviceInfoFromDB(awsClient *ssh.Client, ownerID string, dbc DatabaseCollection, logger *Logger) ([]DetectedDevice, error) {
+	alias := "psqlconfigdb_1"
+
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  DEVICE INFO QUERY - Detecting devices from database")
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("Querying hm_device table for owner_id = %s ...", ownerID)
+
+	// Check if the alias is available on the AWS server
+	if !isAliasAvailable(awsClient, alias, dbc.Aliases, logger) {
+		return nil, fmt.Errorf("bash alias '%s' is not available on AWS server", alias)
+	}
+
+	// Build and execute the query
+	sql := fmt.Sprintf("SELECT serial_number, configured_host_name, device_family, software_version, agent_version, ip_address, is_connected, inlets_capable, sim_type FROM hm_device WHERE owner_id = '%s'", ownerID)
+
+	// Use base64 encoding to safely pass SQL through shell layers (same as executeSingleQuery)
+	encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
+	fullCommand := fmt.Sprintf(
+		`sudo bash -c 'shopt -s expand_aliases; source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
+		encodedSQL, alias)
+
+	logger.Debug("Executing device info query via %s...", alias)
+
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH session: %v", err)
+	}
+	defer session.Close()
+
+	output, err := session.CombinedOutput(fullCommand)
+	outputStr := string(output)
+
+	if err != nil {
+		return nil, fmt.Errorf("device info query failed: %v: %s", err, outputStr)
+	}
+
+	// Parse CSV output
+	results, err := parseCSV(outputStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse device info results: %v", err)
+	}
+
+	if len(results) <= 1 {
+		logger.Info("No devices found in hm_device for owner_id = %s", ownerID)
+		return nil, nil
+	}
+
+	// Parse into DetectedDevice structs (skip header row)
+	var devices []DetectedDevice
+	for i := 1; i < len(results); i++ {
+		row := results[i]
+		if len(row) < 9 {
+			continue
+		}
+		devices = append(devices, DetectedDevice{
+			SerialNumber:       strings.TrimSpace(row[0]),
+			ConfiguredHostName: strings.TrimSpace(row[1]),
+			DeviceFamily:       strings.TrimSpace(row[2]),
+			SoftwareVersion:    strings.TrimSpace(row[3]),
+			AgentVersion:       strings.TrimSpace(row[4]),
+			IPAddress:          strings.TrimSpace(row[5]),
+			IsConnected:        strings.TrimSpace(row[6]),
+			InletsCapable:      strings.TrimSpace(row[7]),
+			SimType:            strings.TrimSpace(row[8]),
+		})
+	}
+
+	// Print results as a formatted table
+	logger.Info("")
+	logger.Info("Detected %d device(s) from database:", len(devices))
+	logger.Info("%-18s %-24s %-8s %-18s %-14s %-16s %-6s %-8s %-8s", "SERIAL", "HOST NAME", "FAMILY", "SW VERSION", "AGENT VERSION", "IP ADDRESS", "CONN", "INLETS", "SIM")
+	logger.Info("%s %s %s %s %s %s %s %s %s", strings.Repeat("-", 18), strings.Repeat("-", 24), strings.Repeat("-", 8), strings.Repeat("-", 18), strings.Repeat("-", 14), strings.Repeat("-", 16), strings.Repeat("-", 6), strings.Repeat("-", 8), strings.Repeat("-", 8))
+	for _, d := range devices {
+		logger.Info("%-18s %-24s %-8s %-18s %-14s %-16s %-6s %-8s %-8s", d.SerialNumber, d.ConfiguredHostName, d.DeviceFamily, d.SoftwareVersion, d.AgentVersion, d.IPAddress, d.IsConnected, d.InletsCapable, d.SimType)
+	}
+	logger.Info("")
+
+	return devices, nil
+}
+
+// buildNetworkDevicesFromDetected converts database-detected devices into NetworkDevice
+// slice suitable for device log collection, applying type-based defaults.
+// maxDevices limits how many devices to process (0 = no limit).
+func buildNetworkDevicesFromDetected(detected []DetectedDevice, maxDevices int, dlc DeviceLogCollection, logger *Logger) []NetworkDevice {
+	var devices []NetworkDevice
+	for i, d := range detected {
+		if maxDevices > 0 && i >= maxDevices {
+			logger.Info("Reached maxDevices limit (%d), skipping remaining %d device(s)", maxDevices, len(detected)-maxDevices)
+			break
+		}
+
+		// Skip devices without IP address
+		if d.IPAddress == "" {
+			logger.Warn("Skipping device '%s' (serial: %s) — no IP address", d.ConfiguredHostName, d.SerialNumber)
+			continue
+		}
+
+		// Map device_family to device type
+		deviceType := strings.ToLower(d.DeviceFamily)
+		if deviceType == "" {
+			deviceType = "exos" // Default to exos if unknown
+			logger.Warn("Device '%s' has unknown family, defaulting to EXOS", d.ConfiguredHostName)
+		}
+
+		// Determine device name (use hostname if available, otherwise serial)
+		name := d.ConfiguredHostName
+		if name == "" {
+			name = d.SerialNumber
+		}
+
+		// Build NetworkDevice with defaults — actual log/credential defaults are applied in collectDeviceLogsFromDeviceInner
+		dev := NetworkDevice{
+			Name:      name,
+			Type:      deviceType,
+			Enabled:   true,
+			IPAddress: d.IPAddress,
+			// Port, Username, Password left at zero values — defaults applied later
+			Diagnostics: DeviceDiagnosticConfig{
+				Enabled:     true,
+				UseDefaults: true,
+			},
+			Logs: DeviceLogConfig{
+				Enabled: true,
+				// Log paths will be populated by defaultNosLogFiles defaults in collectDeviceLogsFromDeviceInner
+			},
+		}
+		devices = append(devices, dev)
+		logger.Debug("Built NetworkDevice: name=%s type=%s ip=%s", dev.Name, dev.Type, dev.IPAddress)
+	}
+	return devices
+}
 
 // processDatabaseCollection executes database queries and saves results
 func processDatabaseCollection(awsClient *ssh.Client, config Config, baseOutputDir string, timestamp string, logger *Logger) (string, error) {
@@ -9632,7 +9865,12 @@ func main() {
 
 	// Determine if bastion/AWS connection is needed
 	// Device log collection connects directly to switches — no bastion/AWS required
+	// UNLESS dynamic device detection is enabled (needs DB query via AWS)
+	// Note: --device-logs standalone mode always uses config.yaml devices (handled before this point)
 	needsAWSConnection := collectLogs || collectInfo || collectAppVersions || collectDatabase || *listOnly
+	if selectedMode != "device-logs" && collectDeviceLogs && config.LogCollection.DynamicDeviceDetection.Enabled && config.DatabaseCollection.Parameters["owner_id"] != "" {
+		needsAWSConnection = true
+	}
 
 	var bastionClient *ssh.Client
 	var awsClient *ssh.Client
@@ -9714,6 +9952,42 @@ func main() {
 		// When CLI flags explicitly request system info collection, override config.yaml's enabled flag
 		if collectInfo {
 			config.SystemInfo.Enabled = true
+		}
+
+		// ── Device Info Query ──────────────────────────────────────────────
+		// Always query hm_device from configdb_1 when owner_id is set and AWS is connected.
+		// Results are printed as a table for visibility. If dynamicDeviceDetection is enabled,
+		// detected devices will replace config.yaml static devices for log collection.
+		var detectedDevices []DetectedDevice
+		ownerID := config.DatabaseCollection.Parameters["owner_id"]
+		if ownerID != "" {
+			devices, err := queryDeviceInfoFromDB(awsClient, ownerID, config.DatabaseCollection, logger)
+			if err != nil {
+				logger.Warn("Device info query failed: %v", err)
+			} else {
+				detectedDevices = devices
+			}
+		}
+
+		// Apply dynamic device detection: replace config.yaml devices with DB-detected devices
+		if config.LogCollection.DynamicDeviceDetection.Enabled && len(detectedDevices) > 0 && collectDeviceLogs {
+			maxDevices := config.LogCollection.DynamicDeviceDetection.MaxDevices
+			if maxDevices <= 0 {
+				maxDevices = 3 // Default
+			}
+			dynamicDevices := buildNetworkDevicesFromDetected(detectedDevices, maxDevices, config.DeviceLogCollection, logger)
+			if len(dynamicDevices) > 0 {
+				logger.Info("Dynamic device detection: using %d device(s) from database (replacing config.yaml devices)", len(dynamicDevices))
+				config.DeviceLogCollection.Devices = dynamicDevices
+				// Ensure defaultNosLogFiles is enabled for dynamic devices (they need default log paths)
+				config.DeviceLogCollection.DefaultNosLogFiles.Enabled = true
+				// Enable device log collection in case it was disabled
+				config.DeviceLogCollection.Enabled = true
+				collectDeviceLogs = true
+			} else {
+				logger.Warn("Dynamic device detection: no usable devices found (all may lack IP addresses)")
+				logger.Info("Falling back to config.yaml device list")
+			}
 		}
 
 		// Handle standalone operation modes

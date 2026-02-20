@@ -58,6 +58,15 @@ options:
 logCollection:
   enabled: true
   defaultEP1Logs: true                      # true = builtin logs + temporal; false = stil collects system info, version info, database
+  
+  # ┌─── Dynamic Device Detection ─────────────────────────────────────────┐
+  # When enabled, queries configdb_1 (hm_device table) to discover devices
+  # belonging to the owner_id. Detected devices replace config.yaml static devices.
+  # Requires: AWS connection + owner_id set in databaseCollection.parameters
+  # Note: --device-logs standalone mode always uses config.yaml devices
+  dynamicDeviceDetection:
+    enabled: true                            # Auto-detect devices from database
+    maxDevices: 3                            # Max devices to collect from (0 = no limit)
                                             
   logFileName: app_ep1_logs
   tempDir: "{environment}_{username}_templogs"
@@ -298,6 +307,14 @@ deviceLogCollection:
   parallelDownloads: true                   # Download from multiple devices concurrently
   globalTimeout: 600                        # Total timeout per device (seconds)
   
+  # ┌─── Default NOS Log Files ────────────────────────────────────────────┐
+  # When enabled, uses hardcoded EXOS/VOSS log file paths built into the code.
+  # This means device entries don't need logs.compressionCommand, logs.compressedFilePath,
+  # or logs.fallbackFiles — they are automatically applied based on device type.
+  # Useful with dynamicDeviceDetection where devices are discovered at runtime.
+  defaultNosLogFiles:
+    enabled: true                            # Use built-in NOS log paths (EXOS/VOSS)
+  
   # CLI Settings
   cliSettings:
     commandTimeout: 180                     # Max timeout per command (seconds)
@@ -307,15 +324,19 @@ deviceLogCollection:
   #       built into the code. Use "useDefaults: true" to apply them per device.
   
   # ┌─── Individual Devices ────────────────────────────────────────────────┐
+  # Note: port, username, password are OPTIONAL with type-based defaults:
+  #   EXOS: port=22, username=admin, password=""
+  #   VOSS: port=22, username=rwa, password=rwa
+  # When defaultNosLogFiles is enabled, logs section is also optional.
   devices:
     # EXOS Device Example
     - name: "core-switch-exos"
       type: "exos"                          # Device type: "exos" or "voss"
       enabled: true                         # Set to true to enable
       ipAddress: ""
-      port: 22
-      username: "admin"
-      password: ""                          # Auto-uses Windows Credential Manager if empty
+      # port: 22                            # Optional (default: 22)
+      # username: "admin"                   # Optional (default: "admin" for EXOS)
+      # password: ""                        # Optional (default: "" for EXOS)
       
       # Diagnostic Commands
       diagnostics:
@@ -342,9 +363,9 @@ deviceLogCollection:
       type: "voss"
       enabled: false
       ipAddress: ""
-      port: 22
-      username: "rwa"
-      password: ""
+      # port: 22                            # Optional (default: 22)
+      # username: "rwa"                     # Optional (default: "rwa" for VOSS)
+      # password: "rwa"                     # Optional (default: "rwa" for VOSS)
       
       diagnostics:
         enabled: true

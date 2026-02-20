@@ -4,9 +4,9 @@ A command-line tool to collect logs, system info, and application versions from 
 
 **Documentation:** [README.md](README.md)
 
-## Latest Release: v2.0.2
+## Latest Release: v2.1.1
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v2.0.2)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v2.1.1)
 
 | Platform | Binary |
 |----------|--------|

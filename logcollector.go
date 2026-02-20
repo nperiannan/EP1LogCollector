@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.0.1"   // Semantic version (set via -ldflags)
+	appVersion  = "2.0.2"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -5905,13 +5905,28 @@ func filterDownloadedLogs(archivePath, outputDir string, filterConfig struct {
 			logger.Warn("Invalid key pattern '%s', skipping", kv.Key)
 			continue
 		}
-		escapedKey := regexp.QuoteMeta(kv.Key)
+
+		// Build flexible key pattern: allow optional '_' at camelCase transitions
+		// so "ownerID" also matches "owner_id", "OwnerID", etc.
+		// Also allow optional '\"' or '"' between key and delimiter for JSON format ("key":value)
+		// and escaped JSON (\"key\":value) common in nested log messages
+		var flexKeyBuf strings.Builder
+		for i := 0; i < len(kv.Key); i++ {
+			if i > 0 && kv.Key[i] >= 'A' && kv.Key[i] <= 'Z' && kv.Key[i-1] >= 'a' && kv.Key[i-1] <= 'z' {
+				flexKeyBuf.WriteString("_?")
+			}
+			flexKeyBuf.WriteString(regexp.QuoteMeta(string(kv.Key[i])))
+		}
+		flexKey := flexKeyBuf.String()
+
 		escapedVal := regexp.QuoteMeta(kv.Value)
-		fullRe, err := regexp.Compile("(?i)" + escapedKey + `\s*[:=]\s*"?` + escapedVal + `"?`)
+		// Pattern: key (with optional _ at case transitions) + optional \" or " + whitespace + : or = + whitespace + optional \" or " + value + optional \" or "
+		fullRe, err := regexp.Compile("(?i)" + flexKey + `\\?"?\s*[:=]\s*\\?"?` + escapedVal + `\\?"?`)
 		if err != nil {
 			logger.Warn("Invalid key-value pattern for key='%s' value='%s', skipping", kv.Key, kv.Value)
 			continue
 		}
+		logger.Debug("  Key-value regex: %s", fullRe.String())
 		kvFilters = append(kvFilters, kvFilter{keyPattern: keyRe, fullPattern: fullRe})
 	}
 
@@ -8161,6 +8176,8 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 		return "", fmt.Errorf("failed to create output directory %s: %v", timestampDir, err)
 	}
 
+	var collectionErr error
+
 	if dlc.ParallelDownloads && len(enabledDevices) > 1 {
 		// Parallel collection with goroutines
 		logger.Info("Processing %d devices in parallel...", len(enabledDevices))
@@ -8187,7 +8204,7 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 			errors = append(errors, err.Error())
 		}
 		if len(errors) > 0 {
-			return timestampDir, fmt.Errorf("%d device(s) failed: %s", len(errors), strings.Join(errors, "; "))
+			collectionErr = fmt.Errorf("%d device(s) failed: %s", len(errors), strings.Join(errors, "; "))
 		}
 	} else {
 		// Sequential collection
@@ -8200,15 +8217,24 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 			}
 		}
 		if len(errors) > 0 {
-			return timestampDir, fmt.Errorf("%d device(s) failed: %s", len(errors), strings.Join(errors, "; "))
+			collectionErr = fmt.Errorf("%d device(s) failed: %s", len(errors), strings.Join(errors, "; "))
 		}
+	}
+
+	// Check if output directory is empty (all devices may have failed)
+	// If empty, remove it to avoid compressing/uploading an empty directory
+	entries, _ := os.ReadDir(timestampDir)
+	if len(entries) == 0 {
+		logger.Warn("Device log output directory is empty (all devices may have failed), removing: %s", timestampDir)
+		os.RemoveAll(timestampDir)
+		return "", collectionErr
 	}
 
 	logger.Info("========================================")
 	logger.Info("Device log collection complete!")
 	logger.Info("Output directory: %s", timestampDir)
 	logger.Info("========================================")
-	return timestampDir, nil
+	return timestampDir, collectionErr
 }
 
 // ============================================================================

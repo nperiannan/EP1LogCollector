@@ -515,55 +515,107 @@ databaseCollection:
 
 ### Network Device Logs
 
+The tool collects diagnostics (CLI show commands) and log files from EXOS/VOSS switches via direct SSH. There are two ways to use it:
+
+- **`--all` or `config` mode** — Device logs collected alongside K8s logs (supports dynamic detection from DB)
+- **`--device-logs` standalone mode** — Collects only device logs using config.yaml devices (no bastion/AWS needed)
+
+#### Minimal Configuration (Recommended)
+
+With `defaultNosLogFiles.enabled: true`, you only need the device IP — everything else uses defaults:
+
 ```yaml
-┌─────────────────────────────────────────────────────────────────────────┐
-│  NETWORK DEVICE LOG COLLECTION - EXOS/VOSS switches (read-only)         │
-└─────────────────────────────────────────────────────────────────────────┘
 deviceLogCollection:
   enabled: true
-  outputDir: "Device"
-  parallelDownloads: true                   # Download from multiple devices concurrently
-  globalTimeout: 600                        # Total timeout per device (seconds)
-
-  # Default NOS Log Files — use built-in EXOS/VOSS log paths
-  # When enabled, devices don't need logs.compressionCommand/fallbackFiles in config
   defaultNosLogFiles:
-    enabled: true                            # Use hardcoded NOS log paths
-
-  cliSettings:
-    commandTimeout: 180                     # Max timeout per command (seconds)
-    commandDelay: 1                         # Delay between commands (seconds)
+    enabled: true                            # Built-in EXOS/VOSS log paths & compression
 
   devices:
-    # EXOS Device Example (port/username/password are optional with type-based defaults)
-    - name: "core-switch-exos"
-      type: "exos"                          # "exos" or "voss"
+    - name: "my-exos-switch"
+      type: "exos"
       enabled: true
-      ipAddress: "10.x.x.x"
-      # port: 22                            # Optional (default: 22)
-      # username: "admin"                   # Optional (default: "admin" for EXOS)
-      # password: ""                        # Optional (default: "" for EXOS)
+      ipAddress: "10.127.34.23"               # Only required field (besides name/type)
+```
 
-      diagnostics:
+Run: `./logcollector --device-logs`
+
+The tool will:
+1. Connect to the device using default credentials (EXOS: `admin` / empty password, port 22)
+2. Run built-in diagnostic commands (`show version`, `show switch`, etc.)
+3. Compress and download the default log files via SFTP
+
+#### Overriding Defaults
+
+Override any default by specifying it explicitly:
+
+```yaml
+  devices:
+    # Custom credentials
+    - name: "secure-switch"
+      type: "exos"
+      enabled: true
+      ipAddress: "10.127.34.50"
+      port: 2222                              # Non-standard SSH port
+      username: "myuser"                      # Custom username
+      password: "mypassword"                  # Custom password
+
+    # Custom log files (overrides built-in defaults for this device)
+    - name: "switch-with-extra-logs"
+      type: "exos"
+      enabled: true
+      ipAddress: "10.127.34.51"
+      logs:
         enabled: true
-        useDefaults: true                   # Built-in EXOS diagnostic commands (show version, etc.)
-        additionalCommands: []              # Device-specific extras
+        compressionEnabled: true
+        compressionCommand: "run script shell tar -czf /tmp/custom.tar.gz -C /tmp/ app1.log app2.log"
+        compressedFilePath: "/tmp/custom.tar.gz"
+        fallbackFiles:
+          - "/tmp/app1.log"
+          - "/tmp/app2.log"
+        removeCompressedFile: true
 
-      # logs section is optional when defaultNosLogFiles.enabled = true
-      # If specified, it overrides the built-in defaults for this device
-
-    # VOSS Device Example
-    - name: "voss-switch"
+    # VOSS with custom credentials
+    - name: "fabric-switch"
       type: "voss"
-      enabled: false
-      ipAddress: "10.x.x.x"
-      # port: 22                            # Optional (default: 22)
-      # username: "rwa"                     # Optional (default: "rwa" for VOSS)
-      # password: "rwa"                     # Optional (default: "rwa" for VOSS)
+      enabled: true
+      ipAddress: "10.127.35.10"
+      username: "admin"                       # Override default "rwa"
+      password: "secret"                      # Override default "rwa"
+```
 
-      diagnostics:
+#### Full Configuration Reference
+
+```yaml
+deviceLogCollection:
+  enabled: true
+  outputDir: "Device"                        # Output subdirectory name
+  parallelDownloads: true                    # Download from multiple devices concurrently
+  globalTimeout: 600                         # Total timeout per device (seconds)
+
+  defaultNosLogFiles:
+    enabled: true                            # true = use built-in log paths per device type
+                                             # false = each device must specify its own logs section
+
+  cliSettings:
+    commandTimeout: 180                      # Max timeout per CLI command (seconds)
+    commandDelay: 1                          # Delay between commands (seconds)
+
+  devices:
+    - name: "switch-name"                    # Display name for this device
+      type: "exos"                           # "exos" or "voss"
+      enabled: true                          # true to collect, false to skip
+      ipAddress: "10.x.x.x"                  # Device IP address (REQUIRED)
+      # port: 22                             # Optional (default: 22)
+      # username: "admin"                    # Optional (default: "admin" for EXOS, "rwa" for VOSS)
+      # password: ""                         # Optional (default: "" for EXOS, "rwa" for VOSS)
+
+      diagnostics:                           # Optional — defaults to enabled with built-in commands
         enabled: true
-        useDefaults: true                   # Built-in VOSS diagnostic commands
+        useDefaults: true                    # Use built-in show commands
+        additionalCommands: []               # Add custom commands on top of defaults
+
+      # logs: ...                            # Optional when defaultNosLogFiles.enabled = true
+                                             # Specify only to override or add custom log files
 ```
 
 #### Default Credentials & Log Paths

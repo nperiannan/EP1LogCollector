@@ -329,7 +329,7 @@ deviceLogCollection:
   #   VOSS: port=22, username=rwa, password=rwa
   # When defaultNosLogFiles is enabled, logs section is also optional.
   devices:
-    # EXOS Device Example
+    # EXOS Device Example (minimal — defaults handle credentials + log paths)
     - name: "core-switch-exos"
       type: "exos"                          # Device type: "exos" or "voss"
       enabled: true                         # Set to true to enable
@@ -338,51 +338,38 @@ deviceLogCollection:
       # username: "admin"                   # Optional (default: "admin" for EXOS)
       # password: ""                        # Optional (default: "" for EXOS)
       
-      # Diagnostic Commands
+      # Diagnostics — built-in show commands (show version, show switch, etc.)
       diagnostics:
         enabled: true
-        useDefaults: true                   # Use exosDefaults.diagnosticCommands
-        additionalCommands: []              # Device-specific extras
+        useDefaults: true
+        additionalCommands: []              # Add device-specific extras here
       
-      # Log File Collection
-      logs:
-        enabled: true
-        compressionEnabled: true
-        compressionCommand: "run script shell tar -czf /usr/local/tmp/eciq/nos_logs.tar.gz -C /usr/local/tmp/eciq/ openapi_server.log hiveagent.log agent.log"
-        compressedFilePath: "/usr/local/tmp/eciq/nos_logs.tar.gz"
-        fallbackFiles:                      # Auto-fallback if compression fails
-          - "/usr/local/tmp/eciq/agent.log"
-          - "/usr/local/tmp/eciq/hiveagent.log"
-          - "/usr/local/tmp/eciq/openapi_server.log"
-        removeCompressedFile: true
-        removeOldLogs: false
-        oldLogsPattern: "/usr/local/tmp/eciq/*.log.*"
+      # Logs — handled automatically by defaultNosLogFiles when enabled.
+      # Only add a "logs:" section here to collect ADDITIONAL files beyond defaults.
+      # Example to add extra log files:
+      # logs:
+      #   enabled: true
+      #   fallbackFiles:
+      #     - "/usr/local/tmp/eciq/custom_app.log"
     
-    # VOSS Device Example
+    # VOSS Device Example (minimal)
     - name: "voss-switch"
       type: "voss"
       enabled: false
       ipAddress: ""
-      # port: 22                            # Optional (default: 22)
-      # username: "rwa"                     # Optional (default: "rwa" for VOSS)
-      # password: "rwa"                     # Optional (default: "rwa" for VOSS)
       
       diagnostics:
         enabled: true
-        useDefaults: true                   # Use vossDefaults.diagnosticCommands
+        useDefaults: true
         additionalCommands: []
       
-      logs:
-        enabled: true
-        compressionEnabled: false           # VOSS doesn't support on-device tar
-        compressionCommand: ""
-        compressedFilePath: ""
-        fallbackFiles:                      # Download individual files from /intflash/
-          - "/intflash/openapi/openapi_server.log"
-          - "/intflash/config.cfg"
-        removeCompressedFile: false
-        removeOldLogs: false
-        oldLogsPattern: ""
+      # Logs — handled automatically by defaultNosLogFiles when enabled.
+      # Only add a "logs:" section here to collect ADDITIONAL files beyond defaults.
+      # Example:
+      # logs:
+      #   enabled: true
+      #   fallbackFiles:
+      #     - "/intflash/custom_file.log"
 
 # ============================================================================
 # End of Configuration

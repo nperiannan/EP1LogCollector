@@ -294,21 +294,50 @@ jira:
 ## Quick Start: Device Logs
 
 Collect diagnostics and logs from network devices (EXOS/VOSS switches).
+No bastion/AWS connection needed — connects directly to devices via SSH.
 
-**1. Configure devices in config.yaml:**
+**1. Configure devices in config.yaml (minimal):**
 ```yaml
 deviceLogCollection:
   enabled: true
+  defaultNosLogFiles:
+    enabled: true                   # Use built-in EXOS/VOSS log paths (no manual config needed)
+
   devices:
-    - name: switch-1
-      host: 192.168.10.1
-      username: admin
-      password: "switch_password"
-      type: exos
-      commands:
-        - "show version"
-        - "show configuration"
-        - "show log messages"
+    - name: "my-exos-switch"
+      type: "exos"                  # "exos" or "voss"
+      enabled: true
+      ipAddress: "10.127.34.23"     # Device IP (REQUIRED)
+      # port, username, password are optional — type-based defaults applied:
+      #   EXOS: port=22, username=admin, password=""
+      #   VOSS: port=22, username=rwa, password=rwa
+```
+
+**Override credentials when needed:**
+```yaml
+    - name: "secure-switch"
+      type: "exos"
+      enabled: true
+      ipAddress: "10.127.34.50"
+      port: 2222                    # Non-standard port
+      username: "myuser"            # Custom username
+      password: "mypass"            # Custom password
+```
+
+**Override log files when needed** (only if you need different files than defaults):
+```yaml
+    - name: "custom-logs-switch"
+      type: "exos"
+      enabled: true
+      ipAddress: "10.127.34.51"
+      logs:
+        enabled: true
+        compressionEnabled: true
+        compressionCommand: "run script shell tar -czf /tmp/custom.tar.gz -C /tmp/ app.log"
+        compressedFilePath: "/tmp/custom.tar.gz"
+        fallbackFiles:
+          - "/tmp/app.log"
+        removeCompressedFile: true
 ```
 
 **2. Run collection:**
@@ -318,15 +347,20 @@ deviceLogCollection:
 
 **3. Output location:**
 ```
-C:/Logs/20260219_143025/
+Device_20260220_143025/
 ├── logger_info.txt
-└── DeviceLogs/
-    └── switch-1_diagnostics_20260219_143025.txt
+├── my-exos-switch/
+│   ├── my-exos-switch_diagnostics_20260220_143025.txt
+│   └── nos_logs_10_127_34_23.tar.gz
+└── secure-switch/
+    ├── secure-switch_diagnostics_20260220_143025.txt
+    └── nos_logs_10_127_34_50.tar.gz
 ```
 
-**Supported device types:**
-- `exos` - Extreme Networks EXOS switches
-- `voss` - Extreme Networks VOSS (Fabric) switches
+**What gets collected:**
+- **Diagnostics**: Built-in `show` commands (show version, show switch, show vlan, etc.)
+- **Log files (EXOS)**: `openapi_server.log`, `hiveagent.log`, `agent.log` — compressed via tar on device
+- **Log files (VOSS)**: `openapi_server.log`, `config.cfg` — downloaded individually via SFTP
 
 ## Quick Start: Database Queries
 
@@ -453,10 +487,11 @@ C:/Logs/20260219_143025/
 - Multiple collection configurations
 
 **Device Log Collection** (`deviceLogCollection.enabled`):
-- Collect diagnostics from network devices
-- Supports EXOS and VOSS switches
-- Configurable commands per device
-- Direct SSH connection to devices
+- Collect diagnostics and log files from EXOS/VOSS switches
+- `defaultNosLogFiles.enabled: true` — built-in log paths, no manual config needed
+- Type-based default credentials: EXOS (`admin`/empty), VOSS (`rwa`/`rwa`)
+- Override port, username, password, or log files per device as needed
+- Direct SSH connection to devices (no bastion required)
 
 **Database Collection** (`databaseCollection.enabled`):
 - Execute PostgreSQL queries via SSH tunneling

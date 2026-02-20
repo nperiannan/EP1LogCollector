@@ -2,7 +2,7 @@
 # Usage: .\build-all.ps1 [-Version "1.3.1"]
 
 param(
-    [string]$Version = "2.1.2"
+    [string]$Version = "2.1.3"
 )
 
 $ErrorActionPreference = "Stop"

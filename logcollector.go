@@ -8372,6 +8372,107 @@ type OwnerIDResolution struct {
 	OwnerID     string
 }
 
+// buildBashAliasQueryCommand builds a robust command that resolves a bash alias
+// definition from common profile files, converts it to a concrete psql command,
+// and executes the provided base64-encoded SQL.
+func buildBashAliasQueryCommand(alias, encodedSQL string) string {
+	return fmt.Sprintf(
+		`sudo bash -c 'ALIAS_LINE=$(grep -hE "^[[:space:]]*alias[[:space:]]+%s=" /root/.bashrc /root/.bash_profile /root/.profile /root/.bash_aliases /etc/profile /etc/bashrc /etc/profile.d/* /home/*/.bashrc /home/*/.bash_profile /home/*/.profile /home/*/.bash_aliases 2>/dev/null | tail -n1); if [ -z "$ALIAS_LINE" ]; then echo "alias not found: %s" >&2; exit 127; fi; shopt -s expand_aliases; eval "$ALIAS_LINE"; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
+		alias, alias, encodedSQL, alias,
+	)
+}
+
+// buildBashAliasQueryCommandInteractive builds a command that runs in interactive
+// bash mode and attempts to execute the alias after sourcing common profile files.
+func buildBashAliasQueryCommandInteractive(alias, encodedSQL string) string {
+	return fmt.Sprintf(
+		`sudo bash -ic 'shopt -s expand_aliases; source /etc/profile 2>/dev/null; source /etc/bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; source /root/.bashrc 2>/dev/null; source /root/.bash_aliases 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
+		encodedSQL, alias,
+	)
+}
+
+// buildBashAliasQueryCommandNonInteractive builds a command that runs in
+// non-interactive mode but still sources common profile files and executes alias.
+func buildBashAliasQueryCommandNonInteractive(alias, encodedSQL string) string {
+	return fmt.Sprintf(
+		`sudo bash -c 'shopt -s expand_aliases; source /etc/profile 2>/dev/null; source /etc/bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; source /root/.bashrc 2>/dev/null; source /root/.bash_aliases 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
+		encodedSQL, alias,
+	)
+}
+
+// buildBashAliasCheckCommand checks whether an alias definition exists in common
+// profile files on the AWS server without requiring interactive shell behavior.
+func buildBashAliasCheckCommand(alias string) string {
+	return fmt.Sprintf(
+		`sudo bash -c 'ALIAS_LINE=$(grep -hE "^[[:space:]]*alias[[:space:]]+%s=" /root/.bashrc /root/.bash_profile /root/.profile /root/.bash_aliases /etc/profile /etc/bashrc /etc/profile.d/* /home/*/.bashrc /home/*/.bash_profile /home/*/.profile /home/*/.bash_aliases 2>/dev/null | tail -n1); if [ -n "$ALIAS_LINE" ]; then echo "ALIAS_OK"; else echo "ALIAS_NOT_FOUND"; fi'`,
+		alias,
+	)
+}
+
+// executeBashAliasQueryWithFallback executes SQL via bash alias using multiple
+// shell strategies and returns the first successful output.
+func executeBashAliasQueryWithFallback(awsClient *ssh.Client, alias, sql string, logger *Logger) (string, error) {
+	encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
+
+	strategies := []struct {
+		name    string
+		command string
+	}{
+		{name: "alias-definition parse", command: buildBashAliasQueryCommand(alias, encodedSQL)},
+		{name: "non-interactive sourced alias", command: buildBashAliasQueryCommandNonInteractive(alias, encodedSQL)},
+		{name: "interactive bash alias", command: buildBashAliasQueryCommandInteractive(alias, encodedSQL)},
+	}
+
+	var errorDetails []string
+	for _, strategy := range strategies {
+		session, err := awsClient.NewSession()
+		if err != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("%s: failed to create SSH session: %v", strategy.name, err))
+			continue
+		}
+
+		output, runErr := session.CombinedOutput(strategy.command)
+		session.Close()
+
+		outputStr := strings.TrimSpace(string(output))
+		outputStr = sanitizeBashNoise(outputStr)
+		if runErr == nil {
+			logger.Debug("DB alias query succeeded using strategy: %s", strategy.name)
+			return outputStr, nil
+		}
+
+		if outputStr == "" {
+			outputStr = "(no stdout/stderr)"
+		}
+		errorDetails = append(errorDetails, fmt.Sprintf("%s: %v: %s", strategy.name, runErr, outputStr))
+	}
+
+	return "", fmt.Errorf("all alias execution strategies failed for '%s': %s", alias, strings.Join(errorDetails, " | "))
+}
+
+// sanitizeBashNoise removes known shell job-control noise lines that can appear
+// when commands run in pseudo-interactive shells without a TTY.
+func sanitizeBashNoise(output string) string {
+	if output == "" {
+		return output
+	}
+
+	var cleaned []string
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "bash:") && (strings.Contains(lower, "terminal process group") || strings.Contains(lower, "job control")) {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+
+	return strings.Join(cleaned, "\n")
+}
+
 // resolveOwnerIDFromAccountDB queries the accountdb to resolve an owner ID
 // from a user's login email. Uses a JOIN across acct_user and iam_app_owner
 // to get the login name, display name, customer ID, and owner ID in one query.
@@ -8383,11 +8484,6 @@ func resolveOwnerIDFromAccountDB(awsClient *ssh.Client, loginEmail string, dbc D
 	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("Querying accountdb for login email: %s", loginEmail)
 
-	// Check if the alias is available on the AWS server
-	if !isAliasAvailable(awsClient, alias, dbc.Aliases, logger) {
-		return nil, fmt.Errorf("bash alias '%s' is not available on AWS server", alias)
-	}
-
 	// Build the join query
 	sql := fmt.Sprintf(
 		"SELECT au.login_name, au.display_name, au.owner_customer, iao.id AS owner_id "+
@@ -8395,22 +8491,9 @@ func resolveOwnerIDFromAccountDB(awsClient *ssh.Client, loginEmail string, dbc D
 			"JOIN iam_app_owner iao ON iao.customer_id = au.owner_customer::integer "+
 			"WHERE au.login_name = '%s'", loginEmail)
 
-	// Use base64 encoding to safely pass SQL through shell layers
-	encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
-	fullCommand := fmt.Sprintf(
-		`sudo bash -c 'shopt -s expand_aliases; source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
-		encodedSQL, alias)
-
 	logger.Debug("Executing owner ID resolution query via %s...", alias)
 
-	session, err := awsClient.NewSession()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSH session: %v", err)
-	}
-	defer session.Close()
-
-	output, err := session.CombinedOutput(fullCommand)
-	outputStr := string(output)
+	outputStr, err := executeBashAliasQueryWithFallback(awsClient, alias, sql, logger)
 
 	if err != nil {
 		return nil, fmt.Errorf("accountdb query failed: %v: %s", err, outputStr)
@@ -8427,9 +8510,26 @@ func resolveOwnerIDFromAccountDB(awsClient *ssh.Client, loginEmail string, dbc D
 	}
 
 	// Expect: login_name, display_name, owner_customer, owner_id
-	row := results[1]
-	if len(row) < 4 {
-		return nil, fmt.Errorf("unexpected result format from accountdb (got %d columns, expected 4)", len(row))
+	// Be robust to shell noise and duplicate header rows by selecting the first
+	// non-header row that has at least 4 columns.
+	var row []string
+	for i := 1; i < len(results); i++ {
+		candidate := results[i]
+		if len(candidate) < 4 {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(candidate[0]), "login_name") {
+			continue
+		}
+		row = candidate
+		break
+	}
+	if row == nil {
+		colCount := 0
+		if len(results) > 1 {
+			colCount = len(results[1])
+		}
+		return nil, fmt.Errorf("unexpected result format from accountdb (got %d columns, expected >= 4)", colCount)
 	}
 
 	resolution := &OwnerIDResolution{
@@ -8467,30 +8567,12 @@ func queryDeviceInfoFromDB(awsClient *ssh.Client, ownerID string, dbc DatabaseCo
 	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("Querying hm_device table for owner_id = %s ...", ownerID)
 
-	// Check if the alias is available on the AWS server
-	if !isAliasAvailable(awsClient, alias, dbc.Aliases, logger) {
-		return nil, fmt.Errorf("bash alias '%s' is not available on AWS server", alias)
-	}
-
 	// Build and execute the query
 	sql := fmt.Sprintf("SELECT serial_number, configured_host_name, device_family, software_version, agent_version, ip_address, is_connected, inlets_capable, sim_type FROM hm_device WHERE owner_id = '%s'", ownerID)
 
-	// Use base64 encoding to safely pass SQL through shell layers (same as executeSingleQuery)
-	encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
-	fullCommand := fmt.Sprintf(
-		`sudo bash -c 'shopt -s expand_aliases; source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
-		encodedSQL, alias)
-
 	logger.Debug("Executing device info query via %s...", alias)
 
-	session, err := awsClient.NewSession()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSH session: %v", err)
-	}
-	defer session.Close()
-
-	output, err := session.CombinedOutput(fullCommand)
-	outputStr := string(output)
+	outputStr, err := executeBashAliasQueryWithFallback(awsClient, alias, sql, logger)
 
 	if err != nil {
 		return nil, fmt.Errorf("device info query failed: %v: %s", err, outputStr)
@@ -8507,11 +8589,14 @@ func queryDeviceInfoFromDB(awsClient *ssh.Client, ownerID string, dbc DatabaseCo
 		return nil, nil
 	}
 
-	// Parse into DetectedDevice structs (skip header row)
+	// Parse into DetectedDevice structs (skip header row and any duplicate header rows)
 	var devices []DetectedDevice
 	for i := 1; i < len(results); i++ {
 		row := results[i]
 		if len(row) < 9 {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(row[0]), "serial_number") {
 			continue
 		}
 		devices = append(devices, DetectedDevice{
@@ -8737,9 +8822,7 @@ func isAliasAvailable(awsClient *ssh.Client, alias string, aliases map[string]st
 		// Bash alias mode: Test if the alias exists on the AWS server
 		logger.Debug("  Testing bash alias '%s' on AWS server...", alias)
 
-		// Test if alias exists by running as root (where aliases are defined)
-		// Source root's bash profile, then check if alias is defined
-		testCmd := fmt.Sprintf(`sudo bash -c 'source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; alias %s >/dev/null 2>&1 && echo "ALIAS_OK" || echo "ALIAS_NOT_FOUND"'`, alias)
+		testCmd := buildBashAliasCheckCommand(alias)
 
 		session, err := awsClient.NewSession()
 		if err != nil {
@@ -9063,13 +9146,50 @@ func extractParametersFromResults(results [][]string, paramNames []string) map[s
 		return extracted
 	}
 
-	header := results[0]
+	// Find the best header row (first row that looks like a column header set)
+	// by checking whether it can satisfy at least one requested parameter.
+	headerRowIndex := -1
+	bestMatchCount := -1
+	for rowIndex, row := range results {
+		matchCount := 0
+		for _, paramName := range paramNames {
+			target := paramName
+			if strings.Contains(target, ".") {
+				parts := strings.Split(target, ".")
+				target = parts[len(parts)-1]
+			}
+			for _, col := range row {
+				if strings.EqualFold(strings.TrimSpace(col), target) || strings.HasSuffix(strings.ToLower(strings.TrimSpace(col)), "."+strings.ToLower(target)) {
+					matchCount++
+					break
+				}
+			}
+		}
+
+		if matchCount > bestMatchCount {
+			bestMatchCount = matchCount
+			headerRowIndex = rowIndex
+		}
+	}
+
+	if headerRowIndex == -1 {
+		return extracted
+	}
+
+	header := results[headerRowIndex]
 
 	for _, paramName := range paramNames {
+		target := paramName
+		if strings.Contains(target, ".") {
+			parts := strings.Split(target, ".")
+			target = parts[len(parts)-1]
+		}
+
 		// Find column index
 		columnIndex := -1
 		for i, col := range header {
-			if strings.EqualFold(col, paramName) {
+			normalizedCol := strings.TrimSpace(col)
+			if strings.EqualFold(normalizedCol, target) || strings.HasSuffix(strings.ToLower(normalizedCol), "."+strings.ToLower(target)) {
 				columnIndex = i
 				break
 			}
@@ -9081,8 +9201,22 @@ func extractParametersFromResults(results [][]string, paramNames []string) map[s
 
 		// Extract values from all data rows
 		values := []string{}
-		for i := 1; i < len(results); i++ {
+		for i := headerRowIndex + 1; i < len(results); i++ {
 			if columnIndex < len(results[i]) {
+				// Skip duplicate header rows that may appear in output
+				if len(results[i]) == len(header) {
+					isDuplicateHeader := true
+					for j := range header {
+						if !strings.EqualFold(strings.TrimSpace(results[i][j]), strings.TrimSpace(header[j])) {
+							isDuplicateHeader = false
+							break
+						}
+					}
+					if isDuplicateHeader {
+						continue
+					}
+				}
+
 				value := strings.TrimSpace(results[i][columnIndex])
 				if value != "" {
 					values = append(values, value)
@@ -9204,24 +9338,7 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 		// Bash alias mode: Use bash aliases from AWS server (portable, environment-agnostic)
 		logger.Debug("      [Bash Alias Mode] Using bash alias '%s' from AWS server", alias)
 
-		// For bash alias mode, we use a heredoc approach to avoid all quoting issues.
-		// The SQL may contain single quotes (for string values like UUIDs), double quotes,
-		// and other special characters that are hard to escape through multiple shell layers.
-		//
-		// Strategy: Use base64 encoding to safely pass the SQL through shell layers,
-		// then decode and execute on the server.
-		encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
-
 		psqlCommand = fmt.Sprintf(`%s -c "<query>" --csv`, alias)
-
-		// Decode the SQL on the server side, avoiding all quoting issues
-		// 1. Source bash profile to load aliases
-		// 2. Enable alias expansion
-		// 3. Decode the base64-encoded SQL
-		// 4. Execute via eval (needed for alias expansion)
-		fullCommand = fmt.Sprintf(
-			`sudo bash -c 'shopt -s expand_aliases; source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
-			encodedSQL, alias)
 	}
 
 	logger.Debug("      Executing on AWS server (as root): %s", psqlCommand)
@@ -9234,13 +9351,24 @@ func executeSingleQuery(awsClient *ssh.Client, alias string, sqlTemplate string,
 	}
 	defer session.Close()
 
-	output, err := session.CombinedOutput(fullCommand)
-	outputStr := string(output)
-
-	if err != nil {
-		logger.Debug("      Command failed: %v", err)
-		logger.Debug("      Output: %s", outputStr)
-		return nil, fmt.Errorf("%v: %s", err, outputStr)
+	var outputStr string
+	if len(dbc.Aliases) > 0 {
+		output, err := session.CombinedOutput(fullCommand)
+		outputStr = string(output)
+		outputStr = sanitizeBashNoise(outputStr)
+		if err != nil {
+			logger.Debug("      Command failed: %v", err)
+			logger.Debug("      Output: %s", outputStr)
+			return nil, fmt.Errorf("%v: %s", err, outputStr)
+		}
+	} else {
+		session.Close()
+		outputStr, err = executeBashAliasQueryWithFallback(awsClient, alias, sql, logger)
+		if err != nil {
+			logger.Debug("      Command failed: %v", err)
+			logger.Debug("      Output: %s", outputStr)
+			return nil, fmt.Errorf("%v: %s", err, outputStr)
+		}
 	}
 
 	logger.Debug("      Query executed successfully, parsing results...")
@@ -9410,6 +9538,33 @@ func parseCSV(csvData string) ([][]string, error) {
 		results = append(results, fields)
 	}
 
+	// Some environments/alias wrappers can emit the CSV header row more than once.
+	// Keep the first row as header and drop any duplicate header rows afterwards.
+	if len(results) > 1 {
+		header := results[0]
+		deduped := make([][]string, 0, len(results))
+		deduped = append(deduped, header)
+
+		for i := 1; i < len(results); i++ {
+			row := results[i]
+			if len(row) == len(header) {
+				isDuplicateHeader := true
+				for j := range header {
+					if !strings.EqualFold(strings.TrimSpace(row[j]), strings.TrimSpace(header[j])) {
+						isDuplicateHeader = false
+						break
+					}
+				}
+				if isDuplicateHeader {
+					continue
+				}
+			}
+			deduped = append(deduped, row)
+		}
+
+		results = deduped
+	}
+
 	return results, nil
 }
 
@@ -9419,24 +9574,45 @@ func extractColumnValues(results [][]string, columnName string) []string {
 		return nil
 	}
 
-	// Find column index from header row
-	header := results[0]
+	// Find the actual header row that contains this column name.
+	// This avoids failures when shell noise appears before the CSV header.
+	headerRowIndex := -1
 	columnIndex := -1
-	for i, col := range header {
-		if strings.EqualFold(col, columnName) {
-			columnIndex = i
+	for rowIndex, row := range results {
+		for i, col := range row {
+			if strings.EqualFold(strings.TrimSpace(col), columnName) {
+				headerRowIndex = rowIndex
+				columnIndex = i
+				break
+			}
+		}
+		if headerRowIndex != -1 {
 			break
 		}
 	}
 
-	if columnIndex == -1 {
+	if headerRowIndex == -1 || columnIndex == -1 {
 		return nil
 	}
 
-	// Extract values from data rows
+	// Extract values from rows after the detected header row.
+	header := results[headerRowIndex]
 	var values []string
-	for i := 1; i < len(results); i++ {
+	for i := headerRowIndex + 1; i < len(results); i++ {
 		if columnIndex < len(results[i]) {
+			if len(results[i]) == len(header) {
+				isDuplicateHeader := true
+				for j := range header {
+					if !strings.EqualFold(strings.TrimSpace(results[i][j]), strings.TrimSpace(header[j])) {
+						isDuplicateHeader = false
+						break
+					}
+				}
+				if isDuplicateHeader {
+					continue
+				}
+			}
+
 			value := strings.TrimSpace(results[i][columnIndex])
 			if value != "" {
 				values = append(values, value)
@@ -10123,12 +10299,12 @@ func main() {
 		}
 
 		// ── Device Info Query ──────────────────────────────────────────────
-		// Always query hm_device from configdb_1 when owner_id is set and AWS is connected.
-		// Results are printed as a table for visibility. If dynamicDeviceDetection is enabled,
-		// detected devices will replace config.yaml static devices for log collection.
+		// Query hm_device from configdb_1 only when dynamic device detection is enabled
+		// and device log collection is requested. If devices are found, they replace
+		// config.yaml static devices for device log collection.
 		var detectedDevices []DetectedDevice
 		ownerID := config.OwnerID
-		if ownerID != "" {
+		if ownerID != "" && collectDeviceLogs && config.LogCollection.DynamicDeviceDetection.Enabled {
 			devices, err := queryDeviceInfoFromDB(awsClient, ownerID, config.DatabaseCollection, logger)
 			if err != nil {
 				logger.Warn("Device info query failed: %v", err)
@@ -10540,21 +10716,20 @@ func main() {
 						logger.Warn("Warning: Downloaded file has zero bytes!")
 					}
 
-					if fileSizeBytes < 1024 {
-						fileSize = fmt.Sprintf("%d B", fileSizeBytes)
-					} else if fileSizeBytes < 1024*1024 {
-						fileSize = fmt.Sprintf("%.2f KB", float64(fileSizeBytes)/1024)
-					} else if fileSizeBytes < 1024*1024*1024 {
-						fileSize = fmt.Sprintf("%.2f MB", float64(fileSizeBytes)/(1024*1024))
-					} else {
+					if fileSizeBytes >= 1024*1024*1024 {
 						fileSize = fmt.Sprintf("%.2f GB", float64(fileSizeBytes)/(1024*1024*1024))
+					} else if fileSizeBytes >= 1024*1024 {
+						fileSize = fmt.Sprintf("%.2f MB", float64(fileSizeBytes)/(1024*1024))
+					} else if fileSizeBytes >= 1024 {
+						fileSize = fmt.Sprintf("%.2f KB", float64(fileSizeBytes)/1024)
+					} else {
+						fileSize = fmt.Sprintf("%d B", fileSizeBytes)
 					}
 				} else {
-					fileSize = "unknown size"
 					logger.Warn("Cannot verify file size: %v", err)
+					fileSize = "unknown size"
 				}
 
-				// Calculate download speed and timing for summary
 				var durationStr, speedStr string
 				if downloadDuration.Hours() >= 1 {
 					durationStr = fmt.Sprintf("%.1f hours", downloadDuration.Hours())

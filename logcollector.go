@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.1.1"   // Semantic version (set via -ldflags)
+	appVersion  = "2.1.2"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -817,8 +817,10 @@ type DatabaseCollection struct {
 
 // Configuration structure for the application
 type Config struct {
-	Username         string `yaml:"username"`    // Global username for all connections
-	Environment      string `yaml:"environment"` // Environment identifier (e.g., dl1r1, g2r1)
+	Username         string `yaml:"username"`     // Global username for all connections
+	Environment      string `yaml:"environment"`  // Environment identifier (e.g., dl1r1, g2r1)
+	EnvLoginID       string `yaml:"env_login_id"` // Login email for automatic owner ID resolution from accountdb
+	OwnerID          string `yaml:"ownerID"`      // Tenant/Owner ID — used by dynamic device detection, database queries, and message filters
 	archiveTimestamp string // Runtime-only: timestamp extracted from archive name (not persisted in YAML)
 	Bastion          struct {
 		Host     string `yaml:"host"`
@@ -951,6 +953,30 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Set default for MaxSSHSessions if not configured
 	if config.Options.MaxSSHSessions <= 0 {
 		config.Options.MaxSSHSessions = 1 // Conservative default
+	}
+
+	// Apply {username} and {environment} template replacement to env_login_id
+	if config.EnvLoginID != "" {
+		config.EnvLoginID = strings.ReplaceAll(config.EnvLoginID, "{username}", config.Username)
+		config.EnvLoginID = strings.ReplaceAll(config.EnvLoginID, "{environment}", config.Environment)
+	}
+
+	// Propagate top-level ownerID into databaseCollection.parameters so SQL {owner_id} substitution works
+	if config.OwnerID != "" {
+		if config.DatabaseCollection.Parameters == nil {
+			config.DatabaseCollection.Parameters = make(map[string]string)
+		}
+		// Only seed if not already set in parameters (allow explicit override)
+		if config.DatabaseCollection.Parameters["owner_id"] == "" {
+			config.DatabaseCollection.Parameters["owner_id"] = config.OwnerID
+		}
+		// Auto-fill messageFilter ownerID value if empty
+		for i := range config.LogCollection.MessageFilter.KeyValueFilters {
+			kv := &config.LogCollection.MessageFilter.KeyValueFilters[i]
+			if strings.EqualFold(kv.Key, "ownerID") && kv.Value == "" {
+				kv.Value = config.OwnerID
+			}
+		}
 	}
 
 	return &config, nil
@@ -8338,6 +8364,98 @@ func processDeviceLogCollection(config Config, baseOutputDir string, timestamp s
 // Database Query Collection Functions
 // ============================================================================
 
+// OwnerIDResolution holds the result of an owner ID lookup from accountdb.
+type OwnerIDResolution struct {
+	LoginName   string
+	DisplayName string
+	CustomerID  string
+	OwnerID     string
+}
+
+// resolveOwnerIDFromAccountDB queries the accountdb to resolve an owner ID
+// from a user's login email. Uses a JOIN across acct_user and iam_app_owner
+// to get the login name, display name, customer ID, and owner ID in one query.
+func resolveOwnerIDFromAccountDB(awsClient *ssh.Client, loginEmail string, dbc DatabaseCollection, logger *Logger) (*OwnerIDResolution, error) {
+	alias := "psqlaccountdb"
+
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  OWNER ID RESOLUTION - Looking up owner from accountdb")
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("Querying accountdb for login email: %s", loginEmail)
+
+	// Check if the alias is available on the AWS server
+	if !isAliasAvailable(awsClient, alias, dbc.Aliases, logger) {
+		return nil, fmt.Errorf("bash alias '%s' is not available on AWS server", alias)
+	}
+
+	// Build the join query
+	sql := fmt.Sprintf(
+		"SELECT au.login_name, au.display_name, au.owner_customer, iao.id AS owner_id "+
+			"FROM acct_user au "+
+			"JOIN iam_app_owner iao ON iao.customer_id = au.owner_customer::integer "+
+			"WHERE au.login_name = '%s'", loginEmail)
+
+	// Use base64 encoding to safely pass SQL through shell layers
+	encodedSQL := base64.StdEncoding.EncodeToString([]byte(sql))
+	fullCommand := fmt.Sprintf(
+		`sudo bash -c 'shopt -s expand_aliases; source /root/.bashrc 2>/dev/null; source /root/.bash_profile 2>/dev/null; SQL=$(echo %s | base64 -d); eval "%s -c \"$SQL\" --csv"'`,
+		encodedSQL, alias)
+
+	logger.Debug("Executing owner ID resolution query via %s...", alias)
+
+	session, err := awsClient.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH session: %v", err)
+	}
+	defer session.Close()
+
+	output, err := session.CombinedOutput(fullCommand)
+	outputStr := string(output)
+
+	if err != nil {
+		return nil, fmt.Errorf("accountdb query failed: %v: %s", err, outputStr)
+	}
+
+	// Parse CSV output
+	results, err := parseCSV(outputStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse accountdb results: %v", err)
+	}
+
+	if len(results) <= 1 {
+		return nil, fmt.Errorf("no account found for login email '%s'", loginEmail)
+	}
+
+	// Expect: login_name, display_name, owner_customer, owner_id
+	row := results[1]
+	if len(row) < 4 {
+		return nil, fmt.Errorf("unexpected result format from accountdb (got %d columns, expected 4)", len(row))
+	}
+
+	resolution := &OwnerIDResolution{
+		LoginName:   strings.TrimSpace(row[0]),
+		DisplayName: strings.TrimSpace(row[1]),
+		CustomerID:  strings.TrimSpace(row[2]),
+		OwnerID:     strings.TrimSpace(row[3]),
+	}
+
+	if resolution.OwnerID == "" {
+		return nil, fmt.Errorf("owner ID resolved to empty value for login email '%s'", loginEmail)
+	}
+
+	// Print resolution results
+	logger.Info("%s", strings.Repeat("-", 50))
+	logger.Info("  Login ID    : %s", resolution.LoginName)
+	logger.Info("  Display Name: %s", resolution.DisplayName)
+	logger.Info("  Customer ID : %s", resolution.CustomerID)
+	logger.Info("  Owner ID    : %s", resolution.OwnerID)
+	logger.Info("%s", strings.Repeat("-", 50))
+	logger.Info("Using Owner ID: %s (resolved from env_login_id)", resolution.OwnerID)
+	logger.Info("%s", strings.Repeat("=", 70))
+
+	return resolution, nil
+}
+
 // queryDeviceInfoFromDB queries the hm_device table in configdb_1 to detect
 // devices belonging to a given owner_id. This is used for dynamic device detection.
 // It prints the results as a table and returns the detected devices.
@@ -9866,10 +9984,14 @@ func main() {
 	// Determine if bastion/AWS connection is needed
 	// Device log collection connects directly to switches — no bastion/AWS required
 	// UNLESS dynamic device detection is enabled (needs DB query via AWS)
+	// or env_login_id is set (needs accountdb query to resolve ownerID)
 	// Note: --device-logs standalone mode always uses config.yaml devices (handled before this point)
 	needsAWSConnection := collectLogs || collectInfo || collectAppVersions || collectDatabase || *listOnly
-	if selectedMode != "device-logs" && collectDeviceLogs && config.LogCollection.DynamicDeviceDetection.Enabled && config.DatabaseCollection.Parameters["owner_id"] != "" {
+	if selectedMode != "device-logs" && collectDeviceLogs && config.LogCollection.DynamicDeviceDetection.Enabled && (config.OwnerID != "" || config.EnvLoginID != "") {
 		needsAWSConnection = true
+	}
+	if config.EnvLoginID != "" {
+		needsAWSConnection = true // Need AWS to resolve ownerID from accountdb
 	}
 
 	var bastionClient *ssh.Client
@@ -9954,12 +10076,58 @@ func main() {
 			config.SystemInfo.Enabled = true
 		}
 
+		// ── Owner ID Resolution ────────────────────────────────────────────
+		// If env_login_id is set, query accountdb to resolve the ownerID from the user's login email.
+		// The resolved ownerID always overrides any static ownerID in config.yaml.
+		// This also propagates the ownerID into databaseCollection.parameters and messageFilter.
+		if config.EnvLoginID != "" {
+			resolution, err := resolveOwnerIDFromAccountDB(awsClient, config.EnvLoginID, config.DatabaseCollection, logger)
+			if err != nil {
+				logger.Warn("Owner ID resolution from accountdb failed: %v", err)
+				if config.OwnerID == "" {
+					logger.Warn("No static ownerID configured either — features requiring ownerID will be limited")
+				} else {
+					logger.Info("Falling back to static ownerID: %s", config.OwnerID)
+				}
+			} else {
+				// Override config.OwnerID with the resolved value
+				config.OwnerID = resolution.OwnerID
+				// Re-propagate into databaseCollection.parameters
+				if config.DatabaseCollection.Parameters == nil {
+					config.DatabaseCollection.Parameters = make(map[string]string)
+				}
+				config.DatabaseCollection.Parameters["owner_id"] = config.OwnerID
+				// Re-propagate into messageFilter ownerID
+				for i := range config.LogCollection.MessageFilter.KeyValueFilters {
+					kv := &config.LogCollection.MessageFilter.KeyValueFilters[i]
+					if strings.EqualFold(kv.Key, "ownerID") {
+						kv.Value = config.OwnerID
+					}
+				}
+			}
+		}
+
+		// ── Limited Mode Warning ───────────────────────────────────────────
+		// If no ownerID is available after resolution attempts, warn about limited functionality.
+		if config.OwnerID == "" {
+			logger.Warn("%s", strings.Repeat("=", 70))
+			logger.Warn("  NO OWNER ID AVAILABLE")
+			logger.Warn("%s", strings.Repeat("=", 70))
+			logger.Warn("The following features will be skipped:")
+			logger.Warn("  - Dynamic device detection (requires ownerID)")
+			logger.Warn("  - Database queries using {owner_id} parameter")
+			logger.Warn("  - Message filter ownerID matching (other filters still apply)")
+			logger.Warn("")
+			logger.Warn("To resolve: set env_login_id (XIQ login email) or ownerID in config.yaml")
+			logger.Warn("%s", strings.Repeat("=", 70))
+		}
+
 		// ── Device Info Query ──────────────────────────────────────────────
 		// Always query hm_device from configdb_1 when owner_id is set and AWS is connected.
 		// Results are printed as a table for visibility. If dynamicDeviceDetection is enabled,
 		// detected devices will replace config.yaml static devices for log collection.
 		var detectedDevices []DetectedDevice
-		ownerID := config.DatabaseCollection.Parameters["owner_id"]
+		ownerID := config.OwnerID
 		if ownerID != "" {
 			devices, err := queryDeviceInfoFromDB(awsClient, ownerID, config.DatabaseCollection, logger)
 			if err != nil {

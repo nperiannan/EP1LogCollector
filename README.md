@@ -10,7 +10,8 @@ LogCollector is a command-line tool that automates the collection of logs and di
 - **Temporal workflow support** — Simplifies complex workflow log collection by automatically gathering workflow histories, schedules, and correlated logs across services
 - **Database query collection** — Execute PostgreSQL queries via SSH tunneling (Bastion → AWS → RDS) with cross-database parameter passing and automatic dependency resolution
 - **Network device diagnostics** — Executes CLI commands on EXOS/VOSS switches and downloads logs via SFTP and SCP
-- **Dynamic device detection** — Automatically discovers devices from the database (hm_device table) by owner_id, with type-based default credentials and NOS log paths
+- **Dynamic device detection** — Automatically discovers devices from the database (hm_device table) by `ownerID`, with type-based default credentials and NOS log paths
+- **Automatic owner ID resolution** — Resolves `ownerID` from login email via `accountdb`, so users don't need to know their tenant ID
 - **Message filtering** — Extract specific log entries by key-value pairs or strings, with Loki-style replica merging
 - **Log analysis** — Pattern-based error detection with severity classification, correlation ID tracking, and grouped error reporting
 - **Replica handling** — Automatically merges logs from replica pods and filters out old pod logs from persistent directories
@@ -93,14 +94,16 @@ go build -o logcollector        # Linux/macOS
 
 ### 2. Configure
 
-Edit `config.yaml` — at minimum set these two fields:
+Edit `config.yaml` — at minimum set these fields:
 
 ```yaml
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  ESSENTIALS - Change these values                                       │
 └─────────────────────────────────────────────────────────────────────────┘
-username: yourname        # Your corp username
-environment: dl2r1        # Target environment (dl2r1, g2r1, g2r2, ws3r1, etc.)
+username: yourname                              # Your corp username
+environment: dl2r1                              # Target environment (dl2r1, g2r1, g2r2, ws3r1, etc.)
+env_login_id: "you@extremenetworks.com"          # XIQ login email — auto-resolves ownerID
+ownerID: ""                                      # Or set manually if email is unavailable
 ```
 
 ### 3. Run
@@ -179,7 +182,18 @@ The full `config.yaml` is organized into clearly labeled sections. Below is each
 └─────────────────────────────────────────────────────────────────────────┘
 username: yourname                          # Corp username (used for SSH, paths, JIRA)
 environment: dl2r1                          # Target environment (dl2r1, g2r1, g2r2, ws3r1)
+env_login_id: "you@extremenetworks.com"      # XIQ login email — auto-resolves ownerID from accountdb
+ownerID: ""                                  # Tenant/Owner ID — auto-resolved from email, or set manually
 ```
+
+**Owner ID resolution priority:**
+
+| `env_login_id` | `ownerID` | Behavior |
+|---|---|---|
+| Set (email) | Empty | Queries accountdb → resolves ownerID automatically |
+| Set (email) | Set (e.g. "1096") | Queries accountdb → **overrides** static ownerID with resolved value |
+| Empty | Set (e.g. "1096") | Uses static ownerID as-is (no accountdb query) |
+| Empty | Empty | **Limited mode** — skips dynamic detection, DB queries with `{owner_id}`, ownerID filter |
 
 ### SSH Connection
 
@@ -273,7 +287,7 @@ Filter logs to extract only relevant entries. Useful for isolating specific owne
                                             # false = filter after download (more sophisticated)
     keyValueFilters:                         # Match lines containing key=value or key:value
       - key: "ownerID"
-        value: "1096"
+        value: ""                           # Auto-filled from top-level ownerID (leave empty to use common value)
       - key: "serial"
         value: ""                           # Empty value = match any line with this key
     specificStrings: []                      # Match lines containing any of these strings
@@ -474,7 +488,7 @@ databaseCollection:
   # Global parameters used across all queries
   parameters:
     serial_number: ""                       # Device serial number (optional)
-    owner_id: "1096"                        # Tenant/Owner ID
+    # Note: owner_id is auto-populated from top-level ownerID setting
 
   # Queries to execute
   databases:
@@ -646,7 +660,7 @@ logCollection:
 ```
 
 **How it works:**
-1. During AWS phase, queries `hm_device` table in `configdb_1` for the configured `owner_id`
+1. During AWS phase, queries `hm_device` table in `configdb_1` for the configured `ownerID`
 2. Prints a table of all detected devices (hostname, family, IP, serial number)
 3. If `dynamicDeviceDetection.enabled: true`, builds a device list from DB results
 4. Detected devices replace config.yaml static devices for log collection
@@ -654,10 +668,42 @@ logCollection:
 
 **Requirements:**
 - AWS connection (bastion → AWS hop)
-- `owner_id` set in `databaseCollection.parameters`
+- `ownerID` available (either via `env_login_id` auto-resolution or set manually in config.yaml)
 - `psqlconfigdb_1` bash alias available on AWS server
 
 **Note:** `--device-logs` standalone mode always uses config.yaml devices (ignores dynamic detection).
+
+### Automatic Owner ID Resolution
+
+When `env_login_id` is set to your XIQ login email, the tool queries `accountdb` (via `psqlaccountdb`) to automatically resolve your `ownerID`. This eliminates the need to manually look up your tenant ID.
+
+```yaml
+env_login_id: "nperiannan@extremenetworks.com"   # Queries accountdb to resolve ownerID
+ownerID: ""                                       # Auto-filled at runtime
+```
+
+**Console output when resolved:**
+```
+======================================================================
+  OWNER ID RESOLUTION - Looking up owner from accountdb
+======================================================================
+Querying accountdb for login email: nperiannan@extremenetworks.com
+--------------------------------------------------
+  Login ID    : nperiannan@extremenetworks.com
+  Display Name: Natarajan Periannan
+  Customer ID : 4867
+  Owner ID    : 1007
+--------------------------------------------------
+Using Owner ID: 1007 (resolved from env_login_id)
+======================================================================
+```
+
+The resolved `ownerID` is automatically propagated to:
+- Dynamic device detection (`hm_device` query)
+- Database queries (`{owner_id}` parameter substitution)
+- Message filter (`ownerID` key-value filter)
+
+If the accountdb lookup fails and a static `ownerID` is set, it falls back to the static value.
 
 ---
 

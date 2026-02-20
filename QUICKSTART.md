@@ -4,9 +4,9 @@ A command-line tool to collect logs, system info, and application versions from 
 
 **Documentation:** [README.md](README.md)
 
-## Latest Release: v2.1.1
+## Latest Release: v2.1.2
 
-**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v2.1.1)
+**Download cross-platform binaries from:** [GitHub Releases](https://github.com/nperiannan/EP1LogCollector/releases/tag/v2.1.2)
 
 | Platform | Binary |
 |----------|--------|
@@ -53,8 +53,10 @@ go build -o logcollector.exe
 **Minimum Required Configuration:**
 ```yaml
 # Connection Details
-username: your-username          # Your username for SSH connections
-environment: dev                 # Environment name (dev/staging/prod)
+username: your-username                  # Your username for SSH connections
+environment: dev                         # Environment name (dev/staging/prod)
+env_login_id: "you@extremenetworks.com"  # XIQ login email (auto-resolves ownerID)
+ownerID: ""                              # Or set manually if email unavailable
 
 # Bastion Server
 bastion:
@@ -373,7 +375,7 @@ databaseCollection:
   
   # Global parameters used across all queries
   parameters:
-    owner_id: "1096"                 # Initial parameter - used by first query
+    # Note: owner_id is auto-populated from top-level ownerID setting
   
   # Database configurations
   databases:
@@ -384,7 +386,7 @@ databaseCollection:
         - name: get_owner_devices
           sql: "SELECT id AS asset_device_id, name FROM devices WHERE owner_id = {owner_id};"
           parameters: ["asset_device_id", "serial_number"]  # Extract columns for next queries
-          # :owner_id comes from parameters above (value: "1096")
+          # :owner_id auto-populated from top-level ownerID setting
           # Returns: asset_device_id column values are extracted for next query
         
         # Query 2: Get details for each device from Query 1
@@ -414,7 +416,7 @@ C:/Logs/20260219_143025/
 - **SSH tunneling**: Queries executed via bastion → AWS → RDS
 
 **How parameter passing works:**
-1. Query 1 uses `{owner_id}` from `parameters` section (value: "1096")
+1. Query 1 uses `{owner_id}` auto-populated from top-level `ownerID` setting (e.g., "1096")
 2. Query 1 extracts columns via `parameters: ["asset_device_id", "serial_number"]`
 3. Query 1 returns `asset_device_id` with multiple values (e.g., "abc-123", "def-456")
 4. Query 2 uses `{asset_device_id}` which runs once per value extracted from Query 1
@@ -610,7 +612,7 @@ messageFilter:
   enabled: true
   keyValueFilters:
     - key: "ownerID"
-      value: "1096"      # Keep only ownerID=1096 lines
+      value: ""           # Auto-filled from top-level ownerID (leave empty to use common value)
   specificStrings:
     - "Payment"          # Keep lines containing "Payment"
     - "Transaction"

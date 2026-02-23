@@ -290,6 +290,14 @@ func (l *Logger) CopyLogFileTo(outputDir string, archiveTimestamp string) {
 
 // Log prints a message with the specified log level
 func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
+	// Nil-safe: if logger is not yet initialized, fall back to stdout
+	if l == nil {
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		message := fmt.Sprintf(format, args...)
+		fmt.Printf("[%s] [%s] %s\n", timestamp, level.String(), message)
+		return
+	}
+
 	// Only print if the message level is >= minimum level
 	if level < l.minLevel {
 		return
@@ -944,6 +952,13 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("error reading config file: %v", err)
 	}
 
+	// Normalize line endings (strip \r from Windows CRLF) and remove BOM for cross-platform robustness
+	text := string(data)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.TrimPrefix(text, "\xEF\xBB\xBF") // UTF-8 BOM
+	data = []byte(text)
+
 	// Parse the YAML config
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
@@ -1292,20 +1307,31 @@ func sshConnectAWSViaBastionWithLogging(bastionClient *ssh.Client, awsHost, keyP
 		return nil, fmt.Errorf("failed to read key file from bastion at %s: %v", keyPath, err)
 	}
 
-	// Try to parse the key, print debug info if it fails
+	// Try to parse the key; if passphrase-protected, prompt the user
 	key, err := ssh.ParsePrivateKey(keyBytes)
 	if err != nil {
-		// Check if it might be a permission error
-		if strings.Contains(err.Error(), "cannot decode encrypted private keys") {
-			return nil, fmt.Errorf("the key appears to be password-protected, which is not supported: %v", err)
+		// Detect passphrase-protected keys (covers both x/crypto error strings)
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "passphrase") || strings.Contains(errMsg, "cannot decode encrypted private keys") {
+			if verboseLogging {
+				logger.Info("SSH key %s is passphrase-protected, prompting for passphrase...", keyPath)
+			}
+			passphrase, promptErr := promptPassword(fmt.Sprintf("Enter passphrase for key %s: ", keyPath))
+			if promptErr != nil {
+				return nil, fmt.Errorf("failed to read passphrase: %v", promptErr)
+			}
+			key, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse private key with passphrase: %v", err)
+			}
+		} else {
+			// Print the first few characters of the key for debugging
+			keyPreview := string(keyBytes)
+			if len(keyPreview) > 100 {
+				keyPreview = keyPreview[:100] + "..."
+			}
+			return nil, fmt.Errorf("failed to parse private key: %v\nKey begins with: %s", err, keyPreview)
 		}
-
-		// Print the first few characters of the key for debugging
-		keyPreview := string(keyBytes)
-		if len(keyPreview) > 100 {
-			keyPreview = keyPreview[:100] + "..."
-		}
-		return nil, fmt.Errorf("failed to parse private key: %v\nKey begins with: %s", err, keyPreview)
 	}
 
 	// Setup users to try
@@ -9791,7 +9817,8 @@ func main() {
 	// Load configuration from file
 	config, err := LoadConfig(*configFile)
 	if err != nil {
-		logger.Warn("Warning: Failed to load config file: %v", err)
+		// logger is not initialized yet — use fmt.Printf to avoid nil dereference
+		fmt.Printf("Warning: Failed to load config file %s: %v\n", *configFile, err)
 		config = &Config{} // Use empty config if loading fails
 	}
 

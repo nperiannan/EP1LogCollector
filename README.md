@@ -4,6 +4,20 @@
 
 LogCollector is a command-line tool that automates the collection of logs and diagnostics from Kubernetes clusters and network devices through our SSH bastion host. Instead of manually SSH-ing into systems, navigating directories, and copying files, this tool handles everything with a single command. This utility can significantly streamline our log collection and reduces the overhead.
 
+## Release Notes
+
+### v2.1.4 (2026-02-23)
+
+**Bug Fixes:**
+- **Fixed crash on Linux when config fails to load** — The global logger was not yet initialized when `LoadConfig()` reported errors, causing a nil pointer dereference (SIGSEGV). The logger is now nil-safe and early error paths use direct console output.
+- **Fixed YAML parsing failure on Linux** — Unquoted config values containing backslashes and special characters (e.g., `C:\Logs\{timestamp}`) caused `mapping values are not allowed in this context` errors. Values with special characters are now properly quoted in the default config.
+- **Cross-platform YAML robustness** — `LoadConfig` now normalizes Windows CRLF line endings and strips UTF-8 BOM before parsing, preventing subtle parse failures when config files are edited on Windows and used on Linux/macOS.
+
+**Enhancements:**
+- **Passphrase-protected SSH key support** — When the AWS SSH key is passphrase-protected, the tool now interactively prompts for the passphrase (masked input) instead of failing with `this private key is passphrase protected`.
+
+> **Note:** The Windows paths shown in Go panic stack traces (e.g., `C:/Users/.../logcollector.go:294`) are compile-time source paths embedded by the Go compiler — they are NOT hardcoded runtime paths and do not affect execution on any platform.
+
 ## Key Features
 
 - **Kubernetes log collection** — Gathers pod logs across namespaces with time-based filtering (e.g., last 15 minutes), includes system info and application versions

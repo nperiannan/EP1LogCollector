@@ -159,6 +159,7 @@ Reads `config.yaml` and runs whichever sections have `enabled: true`:
 | `--version` | App version info only | Yes |
 | `--database` | Database queries only | Yes |
 | `--device-logs` | Network device logs only | **No** |
+| `--analyze <path>` | Analyze local log files/directory | **No** |
 
 ### Common Flag Combinations
 
@@ -180,7 +181,42 @@ Reads `config.yaml` and runs whichever sections have `enabled: true`:
 
 # List available log archives on AWS (without downloading)
 ./logcollector --list
+
+# Standalone analysis of already-collected logs
+./logcollector --analyze /path/to/logs
+
+# Analyze with custom report output directory
+./logcollector --analyze /path/to/logs --outdir /path/to/reports
 ```
+
+---
+
+### Standalone Log Analyzer (`--analyze`)
+
+Analyze previously-collected log files without connecting to any remote server. This mode reuses the same analysis engine that runs automatically during log collection.
+
+**Features:**
+- Recursive directory scanning — finds all text files in nested directories
+- Auto-extracts `.tar.gz` archives found during scan
+- Error pattern detection with configurable patterns from `config.yaml`
+- Cross-file error correlation
+- Correlation ID tracking (trace IDs, request IDs)
+- Kubernetes pod status analysis
+- Generates a detailed analytics report file
+
+**Usage:**
+```bash
+# Analyze an entire directory tree
+./logcollector --analyze /path/to/collected-logs
+
+# Analyze a single file
+./logcollector --analyze /path/to/logfile.log
+
+# Analyze with report written to a specific directory
+./logcollector --analyze /path/to/logs --outdir /tmp/reports
+```
+
+Analysis settings (error patterns, exclude keywords, context lines, correlation keys) are read from the `logCollection.logAnalysis` section of `config.yaml`.
 
 ---
 
@@ -861,6 +897,7 @@ export JIRA_API_TOKEN="atatt3xFfGF0abc123..."
 | `--version` | | Collect only app version info |
 | `--device-logs` | | Collect only network device logs |
 | `--database` | | Collect only database query results |
+| `--analyze` | | Analyze local log files/directory (no SSH required) |
 | `--time-duration` | config | Time window for logs (`15m`, `1h`, `2h`, `0` to disable) |
 | `--jira` | | JIRA issue ID to attach results (e.g., `XCP-12345`) |
 | `--outdir` | config | Override output directory |

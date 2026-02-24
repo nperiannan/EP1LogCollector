@@ -4935,6 +4935,291 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 	return nil
 }
 
+// analyzeLocalDirectory performs standalone log analysis on a local directory (or single file).
+// It recursively scans for log/text files and runs the same analysis pipeline used during
+// log downloads, without requiring any SSH connections or remote operations.
+// Usage: logcollector --analyze /path/to/logs [--outdir /path/to/report]
+func analyzeLocalDirectory(targetPath string, reportOutputDir string, logAnalysisConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	OutputFile      string   `yaml:"outputFile"`
+	ErrorPatterns   []string `yaml:"errorPatterns"`
+	ExcludeKeywords []string `yaml:"excludeKeywords"`
+	MaxMatches      int      `yaml:"maxMatches"`
+	ContextLines    int      `yaml:"contextLines"`
+	CorrelationKeys []struct {
+		Pattern string `yaml:"pattern"`
+		Type    string `yaml:"type"`
+	} `yaml:"correlationKeys"`
+	TimestampPatterns []string `yaml:"timestampPatterns"`
+	ErrorGroups       []struct {
+		Name     string   `yaml:"name"`
+		Patterns []string `yaml:"patterns"`
+		Severity string   `yaml:"severity"`
+	} `yaml:"errorGroups"`
+}) error {
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  LOG ANALYZER — Standalone Local Log Analysis")
+	logger.Info("%s", strings.Repeat("=", 70))
+
+	// Validate target path exists
+	info, err := os.Stat(targetPath)
+	if err != nil {
+		return fmt.Errorf("cannot access path '%s': %v", targetPath, err)
+	}
+
+	// Set defaults
+	if logAnalysisConfig.OutputFile == "" {
+		logAnalysisConfig.OutputFile = "log_analysis_summary.txt"
+	}
+	if logAnalysisConfig.MaxMatches <= 0 {
+		logAnalysisConfig.MaxMatches = 99
+	}
+	if logAnalysisConfig.ContextLines < 0 {
+		logAnalysisConfig.ContextLines = 2
+	}
+	if len(logAnalysisConfig.ErrorPatterns) == 0 {
+		logAnalysisConfig.ErrorPatterns = []string{"error", "panic", "failure", "failed", "exception", "fatal", "critical", "timeout", "connection refused", "unable to", "cannot", "permission denied"}
+	}
+
+	// Compile regex patterns (case-insensitive)
+	var compiledPatterns []*regexp.Regexp
+	for _, pattern := range logAnalysisConfig.ErrorPatterns {
+		re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(pattern))
+		if err != nil {
+			logger.Warn("Invalid error pattern '%s', skipping: %v", pattern, err)
+			continue
+		}
+		compiledPatterns = append(compiledPatterns, re)
+	}
+	if len(compiledPatterns) == 0 {
+		return fmt.Errorf("no valid error patterns compiled")
+	}
+
+	// Compile exclude keyword patterns (case-insensitive)
+	var compiledExcludes []*regexp.Regexp
+	for _, exclude := range logAnalysisConfig.ExcludeKeywords {
+		re, err := regexp.Compile("(?i)" + regexp.QuoteMeta(exclude))
+		if err != nil {
+			logger.Warn("Invalid exclude keyword '%s', skipping: %v", exclude, err)
+			continue
+		}
+		compiledExcludes = append(compiledExcludes, re)
+	}
+
+	// Compile correlation ID patterns
+	var correlationRegexes []struct {
+		regex *regexp.Regexp
+		typ   string
+	}
+	for _, corrKey := range logAnalysisConfig.CorrelationKeys {
+		re, err := regexp.Compile(corrKey.Pattern)
+		if err != nil {
+			logger.Warn("Invalid correlation pattern '%s', skipping: %v", corrKey.Pattern, err)
+			continue
+		}
+		correlationRegexes = append(correlationRegexes, struct {
+			regex *regexp.Regexp
+			typ   string
+		}{regex: re, typ: corrKey.Type})
+	}
+
+	// Compile timestamp patterns
+	var timestampRegexes []*regexp.Regexp
+	for _, tsPattern := range logAnalysisConfig.TimestampPatterns {
+		re, err := regexp.Compile(tsPattern)
+		if err != nil {
+			logger.Warn("Invalid timestamp pattern '%s', skipping: %v", tsPattern, err)
+			continue
+		}
+		timestampRegexes = append(timestampRegexes, re)
+	}
+
+	logger.Info("Target path: %s", targetPath)
+	logger.Info("Analyzing with %d error patterns, %d exclude keywords, %d context lines",
+		len(compiledPatterns), len(compiledExcludes), logAnalysisConfig.ContextLines)
+	logger.Info("Patterns: %s", strings.Join(logAnalysisConfig.ErrorPatterns, ", "))
+	if len(logAnalysisConfig.ExcludeKeywords) > 0 {
+		logger.Info("Excludes: %s", strings.Join(logAnalysisConfig.ExcludeKeywords, ", "))
+	}
+	if len(correlationRegexes) > 0 {
+		logger.Info("Correlation ID tracking enabled: %d patterns", len(correlationRegexes))
+	}
+
+	// Discover log/text files
+	var logFiles []string
+	baseDir := targetPath // used for relative path display
+
+	if !info.IsDir() {
+		// Single file mode
+		baseDir = filepath.Dir(targetPath)
+		lowerPath := strings.ToLower(targetPath)
+		if strings.HasSuffix(lowerPath, ".tar.gz") || strings.HasSuffix(lowerPath, ".tgz") {
+			// Extract tar.gz archive and analyze its contents
+			logger.Info("Archive mode: extracting %s for analysis...", filepath.Base(targetPath))
+			extractDir, extractErr := extractTarGz(targetPath)
+			if extractErr != nil {
+				return fmt.Errorf("failed to extract archive '%s': %v", filepath.Base(targetPath), extractErr)
+			}
+			baseDir = extractDir
+			// Walk the extracted directory for analyzable files
+			filepath.Walk(extractDir, func(ePath string, eInfo os.FileInfo, eErr error) error {
+				if eErr != nil || eInfo.IsDir() {
+					return nil
+				}
+				ext := strings.ToLower(filepath.Ext(ePath))
+				switch ext {
+				case ".log", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".out", ".err", "":
+					logFiles = append(logFiles, ePath)
+				default:
+					if isLikelyTextFile(ePath) {
+						logFiles = append(logFiles, ePath)
+					}
+				}
+				return nil
+			})
+		} else {
+			logFiles = append(logFiles, targetPath)
+			logger.Info("Single file mode: %s", filepath.Base(targetPath))
+		}
+	} else {
+		// Recursive directory scan
+		err = filepath.Walk(targetPath, func(path string, fi os.FileInfo, err error) error {
+			if err != nil {
+				return nil // Skip inaccessible files
+			}
+			if fi.IsDir() {
+				return nil
+			}
+
+			// Check for .tar.gz archives — extract and add their contents
+			if strings.HasSuffix(strings.ToLower(path), ".tar.gz") || strings.HasSuffix(strings.ToLower(path), ".tgz") {
+				logger.Info("Found archive: %s — extracting for analysis...", filepath.Base(path))
+				extractDir, extractErr := extractTarGz(path)
+				if extractErr != nil {
+					logger.Warn("Failed to extract %s: %v (skipping)", filepath.Base(path), extractErr)
+					return nil
+				}
+				// Walk the extracted directory
+				filepath.Walk(extractDir, func(ePath string, eInfo os.FileInfo, eErr error) error {
+					if eErr != nil || eInfo.IsDir() {
+						return nil
+					}
+					ext := strings.ToLower(filepath.Ext(ePath))
+					switch ext {
+					case ".log", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".out", ".err", "":
+						logFiles = append(logFiles, ePath)
+					default:
+						if isLikelyTextFile(ePath) {
+							logFiles = append(logFiles, ePath)
+						}
+					}
+					return nil
+				})
+				return nil
+			}
+
+			// Regular text/log files
+			ext := strings.ToLower(filepath.Ext(path))
+			switch ext {
+			case ".log", ".txt", ".json", ".yaml", ".yml", ".xml", ".csv", ".out", ".err", "":
+				logFiles = append(logFiles, path)
+			default:
+				if isLikelyTextFile(path) {
+					logFiles = append(logFiles, path)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to walk directory: %v", err)
+		}
+	}
+
+	if len(logFiles) == 0 {
+		logger.Warn("No log/text files found to analyze in: %s", targetPath)
+		return nil
+	}
+
+	logger.Info("Found %d file(s) to analyze", len(logFiles))
+
+	// Categorize files for informational logging
+	categorizeAnalyzedFiles(logFiles, baseDir)
+
+	// Analyze each file
+	var allSummaries []FileAnalysisSummary
+	globalPatternCounts := make(map[string]int)
+	patternFileMap := make(map[string]map[string]int)
+	totalMatchesFound := 0
+
+	for _, filePath := range logFiles {
+		relPath, err := filepath.Rel(baseDir, filePath)
+		if err != nil {
+			relPath = filePath // fallback to absolute path
+		}
+		summary := analyzeFileForPatterns(filePath, relPath, compiledPatterns, compiledExcludes,
+			logAnalysisConfig.ErrorPatterns, logAnalysisConfig.MaxMatches, logAnalysisConfig.ContextLines,
+			correlationRegexes, timestampRegexes)
+
+		if summary.TotalMatches > 0 {
+			allSummaries = append(allSummaries, summary)
+			totalMatchesFound += summary.TotalMatches
+
+			for pattern, count := range summary.PatternCounts {
+				globalPatternCounts[pattern] += count
+				if patternFileMap[pattern] == nil {
+					patternFileMap[pattern] = make(map[string]int)
+				}
+				patternFileMap[pattern][summary.FileName] = count
+			}
+		}
+	}
+
+	logger.Info("Analysis complete: %d total matches across %d file(s)", totalMatchesFound, len(allSummaries))
+
+	// Pod status analysis
+	podStatusIssues := analyzePodStatus(logFiles, baseDir)
+	if len(podStatusIssues) > 0 {
+		logger.Warn("Found %d problematic pod(s) with status issues", len(podStatusIssues))
+	}
+
+	// Correlate errors across files
+	correlatedIssues := correlateErrors(allSummaries, globalPatternCounts, patternFileMap)
+
+	// Correlate by correlation IDs
+	var correlationIDIssues []CorrelationIDIssue
+	if len(correlationRegexes) > 0 {
+		correlationIDIssues = correlateByCorrelationIDs(allSummaries)
+		if len(correlationIDIssues) > 0 {
+			logger.Info("Found %d correlation ID groups across files", len(correlationIDIssues))
+		}
+	}
+
+	// Store for report generator
+	globalPatternFileMap = patternFileMap
+
+	// Generate report
+	reportFileName := logAnalysisConfig.OutputFile
+	timestamp := time.Now().Format("20060102_150405")
+	ext := filepath.Ext(reportFileName)
+	base := strings.TrimSuffix(reportFileName, ext)
+	reportFileName = fmt.Sprintf("%s_%s%s", base, timestamp, ext)
+
+	reportPath := filepath.Join(reportOutputDir, reportFileName)
+	err = generateAnalyticsReport(reportPath, allSummaries, correlatedIssues,
+		globalPatternCounts, logAnalysisConfig, totalMatchesFound, targetPath, correlationIDIssues, podStatusIssues)
+	if err != nil {
+		return fmt.Errorf("failed to generate analytics report: %v", err)
+	}
+
+	logger.Info("")
+	logger.Info("Log analytics report generated: %s", reportPath)
+
+	// Print console summary
+	printAnalyticsSummary(allSummaries, correlatedIssues, totalMatchesFound)
+
+	return nil
+}
+
 // extractTarGz extracts a .tar.gz archive to a temporary directory and returns the path
 func extractTarGz(archivePath string) (string, error) {
 	// Create temp directory for extraction
@@ -9689,6 +9974,9 @@ func main() {
 	// JIRA integration flag
 	jiraIssueID := flag.String("jira", "", "JIRA issue ID to attach files (e.g., XCP-17614). Requires jira config in config.yaml")
 
+	// Standalone log analyzer flag
+	analyzeDir := flag.String("analyze", "", "Analyze local log files/directory for errors (no SSH required). Path to directory or file")
+
 	// Version display flag
 	showVersion := flag.Bool("v", false, "Show build version and exit")
 
@@ -9701,7 +9989,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --logs-only        Collect only logs\n")
 		fmt.Fprintf(os.Stderr, "  --sys-info         Collect only general system info (kubectl commands)\n")
 		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n")
-		fmt.Fprintf(os.Stderr, "  --device-logs      Collect only network device logs and diagnostics\n\n")
+		fmt.Fprintf(os.Stderr, "  --device-logs      Collect only network device logs and diagnostics\n")
+		fmt.Fprintf(os.Stderr, "  --database         Collect only database query results\n")
+		fmt.Fprintf(os.Stderr, "  --analyze <path>   Analyze local log files/directory (no SSH required)\n\n")
 		fmt.Fprintf(os.Stderr, "General Options:\n")
 		flag.PrintDefaults()
 	}
@@ -9734,10 +10024,13 @@ func main() {
 	if *modeDatabase {
 		modeCount++
 	}
+	if *analyzeDir != "" {
+		modeCount++
+	}
 
 	if modeCount > 1 {
 		fmt.Fprintln(os.Stderr, "Error: Only one operation mode can be specified at a time")
-		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs, --database")
+		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs, --database, --analyze")
 		os.Exit(1)
 	}
 
@@ -9808,6 +10101,9 @@ func main() {
 		collectDeviceLogs = false
 		collectDatabase = true
 		selectedMode = "database"
+	} else if *analyzeDir != "" {
+		// --analyze mode: standalone local log analysis (no SSH required)
+		selectedMode = "analyze"
 	} else if modeCount == 0 {
 		// No mode specified: use config.yaml settings (default behavior)
 		selectedMode = "config"
@@ -9872,6 +10168,13 @@ func main() {
 		*outputDir = strings.ReplaceAll(*outputDir, "{environment}", config.Environment)
 
 		loggerOutputDir = *outputDir
+	} else if selectedMode == "analyze" {
+		// For analyze mode: logger goes to current directory (or --outdir if specified)
+		if *outputDir != "" {
+			loggerOutputDir = *outputDir
+		} else {
+			loggerOutputDir = "." // Current directory
+		}
 	} else {
 		// For other modes (--all, --logs, --info, etc.): use outputDir from config or flag
 		if *outputDir == "" {
@@ -10086,6 +10389,39 @@ func main() {
 			*awsUsername, _ = reader.ReadString('\n')
 			*awsUsername = strings.TrimSpace(*awsUsername)
 		}
+	}
+
+	// --analyze mode: standalone local log analysis (no SSH required)
+	if selectedMode == "analyze" {
+		logger.Info("Running in analyze mode (standalone local log analysis)...")
+		logger.Info("")
+
+		// Determine report output directory
+		analyzeOutputDir := *outputDir
+		if analyzeOutputDir == "" || analyzeOutputDir == "." {
+			// Default: place report next to the analyzed path
+			info, err := os.Stat(*analyzeDir)
+			if err == nil && info.IsDir() {
+				analyzeOutputDir = *analyzeDir
+			} else {
+				analyzeOutputDir = filepath.Dir(*analyzeDir)
+			}
+		}
+
+		// Ensure output directory exists
+		if err := os.MkdirAll(analyzeOutputDir, 0755); err != nil {
+			logger.Error("Failed to create output directory %s: %v", analyzeOutputDir, err)
+			return
+		}
+
+		// Use logAnalysis config from config.yaml (with overridden Enabled=true since user explicitly asked)
+		analysisConfig := config.LogCollection.LogAnalysis
+		analysisConfig.Enabled = true
+
+		if err := analyzeLocalDirectory(*analyzeDir, analyzeOutputDir, analysisConfig); err != nil {
+			logger.Error("Log analysis failed: %v", err)
+		}
+		return
 	}
 
 	// --device-logs mode: collect only network device logs and diagnostics

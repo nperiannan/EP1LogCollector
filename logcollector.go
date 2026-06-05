@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.1.3"   // Semantic version (set via -ldflags)
+	appVersion  = "2.1.6"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -3809,6 +3809,24 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		// Write the complete workflow file
 		writeFileToRemote(awsClient, wfOutputFile, wfContent.String())
 		logger.Info("  Saved workflow data to: %s", wfOutputFile)
+
+		// 4e: Detailed workflow event history (--detailed flag) — separate file
+		logger.Debug("  Collecting detailed workflow event history...")
+		detailedCmd := fmt.Sprintf(`kubectl exec %s -n common -- temporal workflow show --namespace %s --workflow-id "%s" --detailed`,
+			adminPod, temporalNamespace, workflowID)
+		detailedOutput := executeTemporalCommand(awsClient, detailedCmd)
+
+		var detailedContent strings.Builder
+		detailedContent.WriteString("# Temporal Workflow Detailed Event History\n")
+		detailedContent.WriteString(fmt.Sprintf("# Workflow ID: %s\n", workflowID))
+		detailedContent.WriteString(fmt.Sprintf("# Namespace: %s\n", temporalNamespace))
+		detailedContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+		detailedContent.WriteString(fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60)))
+		detailedContent.WriteString(detailedOutput + "\n")
+
+		detailedOutputFile := fmt.Sprintf("%s/%s_detailed.txt", temporalOutputDir, safeWfID)
+		writeFileToRemote(awsClient, detailedOutputFile, detailedContent.String())
+		logger.Info("  Saved detailed workflow history to: %s", detailedOutputFile)
 	}
 
 	logger.Info("Temporal workflow collection completed: %d workflow(s) collected", len(workflowIDs))

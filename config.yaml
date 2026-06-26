@@ -8,7 +8,7 @@
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  ESSENTIALS - Change these values                                       │
 # └─────────────────────────────────────────────────────────────────────────┘
-username: nperiannan                            # Enter your corp username (e.g. "nperiannan") ( Mandatory )
+username: nperiannan  # Enter your corp username (e.g. "nperiannan") ( Mandatory )
 environment: dl2r1                              # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.) ( Mandatory )
 env_login_id: "{username}@extremenetworks.com"  # XIQ login email — auto-resolves ownerID from accountdb (overrides static ownerID)
 ownerID: ""                                     # Tenant/Owner ID — auto-resolved from env_login_id, or set manually if email unavailable
@@ -17,14 +17,14 @@ ownerID: ""                                     # Tenant/Owner ID — auto-resol
 # │  SSH CONNECTION                                                         │
 # └─────────────────────────────────────────────────────────────────────────┘
 bastion:
-  host: usnc-awsgtwy-02.extremenetworks.com # Bastion host ip or hostname
+  host: usnc-awsgtwy-02.extremenetworks.com  # Bastion host ip or hostname
   port: 22
   keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion" # Path to SSH private key for bastion access ( Optional )
   password: ""                              # Leave empty - Auto-uses Windows Credential Manager if empty
 
 aws:
   host: "{environment}-console.qa.xcloudiq.com"
-  keyPath: ~/.ssh/id_ed25519_26Q1           # Path to SSH public key on bastion host for AWS access ( Mandatory )
+  keyPath: ~/.ssh/id_ed25519_26Q1  # Path to SSH public key on bastion host for AWS access ( Mandatory )
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  JIRA INTEGRATION - Attach logs to Jira tickets                         │
@@ -186,6 +186,8 @@ logCollection:
     workflowIdPrefix: ""                    # Filter by prefix or empty for all
     numberOfWorkflows: 3                    # 1-20 recent workflows
     namespace: "configuration"
+    filterByOwnerID: true                   # Filter workflows by resolved ownerID via: temporal workflow list --query 'OwnerId="<ownerID>"'
+    codecEndpoint: "http://codec-server:9011"  # Decode zlib-compressed payloads (NGC 25.13.0+). Empty = raw binary blobs.
     customAliases: []                       # Optional custom bash aliases
   
   # ┌─── Temporal Schedules - Collect schedule information ────────────────┐
@@ -284,8 +286,23 @@ databaseCollection:
           parameters: ["asset_device_id", "serial_number"]
         
         - name: "get_inferred_device_info"
-          sql: "SELECT * FROM inferred_device WHERE asset_device_id = '{platform_common_db.asset_device_id}'"
+          sql: "SELECT *, id AS device_id FROM inferred_device WHERE asset_device_id = '{platform_common_db.asset_device_id}'"
+          parameters: ["device_id"]              # Expose inferred_device.id as device_id for the conflict-resolution queries below
           # Uses asset_device_id from previous query (namespace optional within same database)
+        
+        # ┌─── Conflict Resolution Debugging ────────────────────────────────┐
+        # device_id is auto-resolved from get_inferred_device_info (inferred_device.id).
+        # The engine runs these automatically once device_id is available, once per device.
+        - name: "get_device_configuration_assignment"
+          sql: "SELECT * FROM device_configuration_assignment WHERE device_id = '{platform_common_db.device_id}'"
+          # Expect exactly ONE row per device. Multiple rows = inconsistent DB state
+          # (typically caused by moving devices across CPs without proper cleanup).
+        
+        - name: "get_device_conflict"
+          sql: "SELECT * FROM device_conflict WHERE device_id = '{platform_common_db.device_id}'"
+        
+        - name: "get_device_summary_intent"
+          sql: "SELECT device_intent FROM device_summary WHERE device_id = '{platform_common_db.device_id}'"
     
    
     # Config DB - Configuration data

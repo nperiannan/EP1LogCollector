@@ -2,7 +2,7 @@
 # Usage: .\build-all.ps1 [-Version "1.3.1"]
 
 param(
-    [string]$Version = "2.1.6"
+    [string]$Version = "2.2.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,11 +34,20 @@ Write-Host "`nBuilding LogCollector v$Version (build #$buildNum) for all platfor
 Write-Host ("=" * 70) -ForegroundColor Cyan
 
 # Platform configurations: GOOS, GOARCH, OutputName
+# CLI builds (standard console binaries) + GUI builds (Windows suppresses the
+# console window via -H=windowsgui; other platforms reuse the same binary under
+# a -gui name for a consistent download set).
 $platforms = @(
-    @{OS="windows"; Arch="amd64"; Output="logcollector-windows-amd64.exe"; Name="Windows (x64)"},
-    @{OS="linux"; Arch="amd64"; Output="logcollector-linux-amd64"; Name="Linux (x64)"},
-    @{OS="darwin"; Arch="amd64"; Output="logcollector-darwin-amd64"; Name="macOS (Intel)"},
-    @{OS="darwin"; Arch="arm64"; Output="logcollector-darwin-arm64"; Name="macOS (Apple Silicon)"}
+    # ── CLI builds ──
+    @{OS="windows"; Arch="amd64"; Output="logcollector-windows-amd64.exe"; Name="Windows (x64)"; Extra=""},
+    @{OS="linux"; Arch="amd64"; Output="logcollector-linux-amd64"; Name="Linux (x64)"; Extra=""},
+    @{OS="darwin"; Arch="amd64"; Output="logcollector-darwin-amd64"; Name="macOS (Intel)"; Extra=""},
+    @{OS="darwin"; Arch="arm64"; Output="logcollector-darwin-arm64"; Name="macOS (Apple Silicon)"; Extra=""},
+    # ── GUI builds ──
+    @{OS="windows"; Arch="amd64"; Output="logcollector-gui-windows-amd64.exe"; Name="Windows (x64) GUI"; Extra="-H=windowsgui"},
+    @{OS="linux"; Arch="amd64"; Output="logcollector-gui-linux-amd64"; Name="Linux (x64) GUI"; Extra=""},
+    @{OS="darwin"; Arch="amd64"; Output="logcollector-gui-darwin-amd64"; Name="macOS (Intel) GUI"; Extra=""},
+    @{OS="darwin"; Arch="arm64"; Output="logcollector-gui-darwin-arm64"; Name="macOS (Apple Silicon) GUI"; Extra=""}
 )
 
 $successCount = 0
@@ -55,8 +64,12 @@ foreach ($platform in $platforms) {
     $env:GOARCH = $platform.Arch
     $env:CGO_ENABLED = "0"
     
+    # Append any platform-specific extra linker flags (e.g. -H=windowsgui for GUI builds)
+    $buildLdflags = $ldflags
+    if ($platform.Extra -ne "") { $buildLdflags = "$ldflags $($platform.Extra)" }
+    
     try {
-        $output = & go build -ldflags $ldflags -o $outputPath . 2>&1
+        $output = & go build -ldflags $buildLdflags -o $outputPath . 2>&1
         
         if ($LASTEXITCODE -eq 0) {
             $fileSize = (Get-Item $outputPath).Length / 1MB

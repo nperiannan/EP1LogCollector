@@ -146,6 +146,7 @@ Reads `config.yaml` and runs whichever sections have `enabled: true`:
 | `--database` | Database queries only | Yes |
 | `--device-logs` | Network device logs only | **No** |
 | `--analyze <path>` | Analyze local log files/directory | **No** |
+| `--gui` | Launch web-based GUI control panel (use `--gui-port` for a custom port) | **No** |
 
 ### Common Flag Combinations
 
@@ -203,6 +204,41 @@ Analyze previously-collected log files without connecting to any remote server. 
 ```
 
 Analysis settings (error patterns, exclude keywords, context lines, correlation keys) are read from the `logCollection.logAnalysis` section of `config.yaml`.
+
+---
+
+### GUI Mode (`--gui`)
+
+Launch a local web-based control panel to edit configuration, run collections, and browse output from the browser.
+
+```bash
+# Launch the GUI on the default port (9090)
+./logcollector --gui
+
+# Launch the GUI on a custom port
+./logcollector --gui --gui-port 8080
+```
+
+The server runs at `http://127.0.0.1:<port>` and opens your browser automatically. Press `Ctrl+C` to stop it.
+
+#### Windows launcher: `run-gui.ps1`
+
+A PowerShell helper that wraps `--gui` with a custom-port option and an auto-build step.
+
+**Usage:**
+```powershell
+.\run-gui.ps1                       # GUI on the default port (9090)
+.\run-gui.ps1 -Port 8080           # GUI on a custom port
+.\run-gui.ps1 -Port 8080 -Build    # Rebuild logcollector.exe first, then launch
+.\run-gui.ps1 -Config my.yaml      # Use a different config file
+```
+
+**What it does:**
+- `-Port` (default `9090`, validated to `1024–65535`) maps to the binary's `--gui-port` flag.
+- Auto-builds `logcollector.exe` via `build.ps1` if it's missing or `-Build` is passed.
+- Resolves paths relative to the script, so it works from any working directory.
+- Pre-checks that the port is free (`Get-NetTCPConnection`) and exits with a clear message if it's taken.
+- Runs `logcollector.exe --gui --gui-port <Port> --config <Config>`. The binary serves on `http://127.0.0.1:<Port>` and opens the browser itself; `Ctrl+C` stops it.
 
 ---
 

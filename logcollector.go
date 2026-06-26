@@ -874,6 +874,9 @@ type Config struct {
 			WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`  // Filter by workflow ID prefix
 			NumberOfWorkflows int      `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
 			Namespace         string   `yaml:"namespace"`         // Temporal namespace (default: configuration)
+			FilterByOwnerID   bool     `yaml:"filterByOwnerID"`   // Filter workflows by resolved ownerID via temporal --query 'OwnerId="..."'
+			CodecEndpoint     string   `yaml:"codecEndpoint"`     // Codec server endpoint to decode zlib-compressed payloads (NGC 25.13.0+)
+			OwnerID           string   `yaml:"-"`                 // Resolved ownerID injected at runtime (not from yaml)
 			CustomAliases     []string `yaml:"customAliases"`     // Optional custom bash aliases to append to cheat sheet
 		} `yaml:"temporalWorkflowCollection"`
 		TemporalScheduleCollection struct {
@@ -1428,6 +1431,9 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`
 	NumberOfWorkflows int      `yaml:"numberOfWorkflows"`
 	Namespace         string   `yaml:"namespace"`
+	FilterByOwnerID   bool     `yaml:"filterByOwnerID"`
+	CodecEndpoint     string   `yaml:"codecEndpoint"`
+	OwnerID           string   `yaml:"-"`
 	CustomAliases     []string `yaml:"customAliases"`
 }, temporalScheduleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
@@ -3599,6 +3605,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`
 	NumberOfWorkflows int      `yaml:"numberOfWorkflows"`
 	Namespace         string   `yaml:"namespace"`
+	FilterByOwnerID   bool     `yaml:"filterByOwnerID"`
+	CodecEndpoint     string   `yaml:"codecEndpoint"`
+	OwnerID           string   `yaml:"-"`
 	CustomAliases     []string `yaml:"customAliases"`
 }, environment, username, tempDir, finalLogFileName string) error {
 	if !temporalConfig.Enabled {
@@ -3622,6 +3631,16 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	}
 	if numberOfWorkflows > 20 {
 		numberOfWorkflows = 20
+	}
+
+	// Codec endpoint for decoding zlib-compressed payloads (NGC 25.13.0+).
+	// Payload Compression is enabled by default for NGC Temporal Workflows, so
+	// without --codec-endpoint the `temporal workflow show` payloads appear as
+	// binary blobs. When set, the input/output/activity payloads are decoded.
+	codecFlag := ""
+	if temporalConfig.CodecEndpoint != "" {
+		codecFlag = fmt.Sprintf(" --codec-endpoint %s", temporalConfig.CodecEndpoint)
+		logger.Info("Using Temporal codec endpoint for payload decoding: %s", temporalConfig.CodecEndpoint)
 	}
 
 	// Create the Temporal output directory on the remote server inside the log collection directory
@@ -3665,14 +3684,24 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	// Step 2: List workflows
 	logger.Info("Listing workflows in namespace '%s'...", temporalNamespace)
 
+	// Optional ownerID filter — uses the temporal CLI visibility query:
+	//   temporal workflow list --query 'OwnerId="<ownerID>"'
+	ownerQueryFlag := ""
+	if temporalConfig.FilterByOwnerID && temporalConfig.OwnerID != "" {
+		ownerQueryFlag = fmt.Sprintf(` --query 'OwnerId=\"%s\"'`, temporalConfig.OwnerID)
+		logger.Info("Filtering workflows by ownerID: %s", temporalConfig.OwnerID)
+	} else if temporalConfig.FilterByOwnerID {
+		logger.Warn("filterByOwnerID is enabled but no ownerID was resolved — listing all workflows")
+	}
+
 	// First: get the plain text tabular listing (human-readable, used for parsing workflow IDs)
 	listSession, err := awsClient.NewSession()
 	if err != nil {
 		return fmt.Errorf("failed to create session for workflow listing: %v", err)
 	}
 
-	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s 2>/dev/null",
-		adminPod, temporalNamespace)
+	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s%s 2>/dev/null",
+		adminPod, temporalNamespace, ownerQueryFlag)
 	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
 	listSession.Close()
 	if err != nil {
@@ -3684,10 +3713,17 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		fmt.Sprintf("# Temporal Workflow List\n# Namespace: %s\n# Collected: %s\n# Filter: %s\n%s\n\n%s",
 			temporalNamespace, time.Now().Format("2006-01-02 15:04:05"),
 			func() string {
-				if temporalConfig.WorkflowIdPrefix != "" {
-					return "prefix=" + temporalConfig.WorkflowIdPrefix
+				var parts []string
+				if temporalConfig.FilterByOwnerID && temporalConfig.OwnerID != "" {
+					parts = append(parts, "ownerID="+temporalConfig.OwnerID)
 				}
-				return "none"
+				if temporalConfig.WorkflowIdPrefix != "" {
+					parts = append(parts, "prefix="+temporalConfig.WorkflowIdPrefix)
+				}
+				if len(parts) == 0 {
+					return "none"
+				}
+				return strings.Join(parts, ", ")
 			}(),
 			strings.Repeat("-", 60),
 			string(listOutput)))
@@ -3735,8 +3771,8 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString("  WORKFLOW INPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
-		inputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"'`,
-			adminPod, temporalNamespace, workflowID)
+		inputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"'`,
+			adminPod, temporalNamespace, workflowID, codecFlag)
 		inputOutput := executeTemporalCommand(awsClient, inputCmd)
 		wfContent.WriteString(inputOutput + "\n\n")
 
@@ -3746,8 +3782,8 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString("  WORKFLOW OUTPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
-		outputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"'`,
-			adminPod, temporalNamespace, workflowID)
+		outputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"'`,
+			adminPod, temporalNamespace, workflowID, codecFlag)
 		outputOutput := executeTemporalCommand(awsClient, outputCmd)
 		wfContent.WriteString(outputOutput + "\n\n")
 
@@ -3757,8 +3793,8 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString("  ACTIVITIES\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
-		activitiesCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""'`,
-			adminPod, temporalNamespace, workflowID)
+		activitiesCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""'`,
+			adminPod, temporalNamespace, workflowID, codecFlag)
 		activitiesOutput := executeTemporalCommand(awsClient, activitiesCmd)
 		wfContent.WriteString(activitiesOutput + "\n\n")
 
@@ -3775,8 +3811,8 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				wfContent.WriteString(fmt.Sprintf("  ACTIVITY INPUT: %s\n", activityName))
 				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
 
-				actInputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"%s\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity %s"'`,
-					adminPod, temporalNamespace, workflowID, activityName, activityName)
+				actInputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"%s\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity %s"'`,
+					adminPod, temporalNamespace, workflowID, codecFlag, activityName, activityName)
 				actInputOutput := executeTemporalCommand(awsClient, actInputCmd)
 				wfContent.WriteString(actInputOutput + "\n\n")
 
@@ -3785,9 +3821,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				wfContent.WriteString(fmt.Sprintf("  ACTIVITY OUTPUT: %s\n", activityName))
 				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
 
-				actOutputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity %s"; else echo "Activity %s not found"; fi'`,
-					adminPod, temporalNamespace, workflowID, activityName,
-					temporalNamespace, workflowID, activityName, activityName)
+				actOutputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity %s"; else echo "Activity %s not found"; fi'`,
+					adminPod, temporalNamespace, workflowID, codecFlag, activityName,
+					temporalNamespace, workflowID, codecFlag, activityName, activityName)
 				actOutputOutput := executeTemporalCommand(awsClient, actOutputCmd)
 				wfContent.WriteString(actOutputOutput + "\n\n")
 
@@ -3796,9 +3832,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				wfContent.WriteString(fmt.Sprintf("  ACTIVITY FAILURE: %s\n", activityName))
 				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
 
-				actFailureCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | jq . 2>/dev/null || echo "No failure data found for activity %s"; else echo "Activity %s not found"; fi'`,
-					adminPod, temporalNamespace, workflowID, activityName,
-					temporalNamespace, workflowID, activityName, activityName)
+				actFailureCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | jq . 2>/dev/null || echo "No failure data found for activity %s"; else echo "Activity %s not found"; fi'`,
+					adminPod, temporalNamespace, workflowID, codecFlag, activityName,
+					temporalNamespace, workflowID, codecFlag, activityName, activityName)
 				actFailureOutput := executeTemporalCommand(awsClient, actFailureCmd)
 				wfContent.WriteString(actFailureOutput + "\n\n")
 			}
@@ -3812,8 +3848,8 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 
 		// 4e: Detailed workflow event history (--detailed flag) — separate file
 		logger.Debug("  Collecting detailed workflow event history...")
-		detailedCmd := fmt.Sprintf(`kubectl exec %s -n common -- temporal workflow show --namespace %s --workflow-id "%s" --detailed`,
-			adminPod, temporalNamespace, workflowID)
+		detailedCmd := fmt.Sprintf(`kubectl exec %s -n common -- temporal workflow show --namespace %s --workflow-id "%s"%s --detailed`,
+			adminPod, temporalNamespace, workflowID, codecFlag)
 		detailedOutput := executeTemporalCommand(awsClient, detailedCmd)
 
 		var detailedContent strings.Builder
@@ -9995,8 +10031,15 @@ func main() {
 	// Standalone log analyzer flag
 	analyzeDir := flag.String("analyze", "", "Analyze local log files/directory for errors (no SSH required). Path to directory or file")
 
+	// AI analyzer flags
+	analyzeAIDir := flag.String("analyze-ai", "", "AI-powered log analysis (launches GUI AI Analysis page). Path to directory or file")
+
 	// Version display flag
 	showVersion := flag.Bool("v", false, "Show build version and exit")
+
+	// GUI mode flags
+	guiMode := flag.Bool("gui", false, "Launch web-based GUI control panel")
+	guiPort := flag.Int("gui-port", 9090, "Port for GUI web server (default: 9090)")
 
 	// Custom help message
 	flag.Usage = func() {
@@ -10009,7 +10052,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n")
 		fmt.Fprintf(os.Stderr, "  --device-logs      Collect only network device logs and diagnostics\n")
 		fmt.Fprintf(os.Stderr, "  --database         Collect only database query results\n")
-		fmt.Fprintf(os.Stderr, "  --analyze <path>   Analyze local log files/directory (no SSH required)\n\n")
+		fmt.Fprintf(os.Stderr, "  --analyze <path>   Analyze local log files/directory (no SSH required)\n")
+		fmt.Fprintf(os.Stderr, "  --analyze-ai <path> AI-powered root cause analysis (launches GUI)\n")
+		fmt.Fprintf(os.Stderr, "  --gui              Launch web-based GUI control panel\n\n")
 		fmt.Fprintf(os.Stderr, "General Options:\n")
 		flag.PrintDefaults()
 	}
@@ -10019,6 +10064,28 @@ func main() {
 	// Handle -v flag: print version and exit immediately
 	if *showVersion {
 		fmt.Printf("logcollector version %s (build %s) built on %s\n", appVersion, buildNumber, buildDate)
+		os.Exit(0)
+	}
+
+	// Handle --gui flag: launch web-based GUI and exit
+	if *guiMode {
+		if err := startGUIServer(*configFile, *guiPort); err != nil {
+			fmt.Fprintf(os.Stderr, "GUI server error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Handle --analyze-ai flag: launch GUI directly on AI Analysis page
+	if *analyzeAIDir != "" {
+		absPath, _ := filepath.Abs(*analyzeAIDir)
+		fmt.Printf("AI Analysis mode: %s\n", absPath)
+		fmt.Printf("Launching GUI with AI Analysis page...\n")
+		os.Setenv("LOGCOLLECTOR_AI_DIR", absPath)
+		if err := startGUIServer(*configFile, *guiPort); err != nil {
+			fmt.Fprintf(os.Stderr, "GUI server error: %v\n", err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -10902,6 +10969,10 @@ func main() {
 
 			// Start timing the entire log collection and archive creation process
 			overallStartTime := time.Now()
+
+			// Wire the resolved ownerID into temporal workflow collection so it can
+			// filter workflows via: temporal workflow list --query 'OwnerId="<ownerID>"'
+			config.LogCollection.TemporalWorkflowCollection.OwnerID = config.OwnerID
 
 			finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.SystemInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.DefaultEP1Logs,
 				struct {

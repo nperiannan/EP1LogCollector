@@ -38,6 +38,38 @@ LogCollector is a command-line tool that automates the collection of logs and di
 
 ## How It Works
 
+```mermaid
+flowchart LR
+    subgraph LOCAL["Your Machine"]
+        LC["logcollector CLI / GUI"]
+        OUT["Local output dir"]
+        AN["Analysis: pattern + AI"]
+    end
+    B["Bastion Host<br/>SSH gateway"]
+    subgraph AWS["AWS Console Server"]
+        K["kubectl logs / exec"]
+        P["psql queries (RDS)"]
+        T["Temporal workflows"]
+    end
+    PODS["Kubernetes Cluster<br/>Pod logs - App versions - System info"]
+    DEV["Network Devices<br/>EXOS / VOSS switches"]
+    JIRA["JIRA ticket"]
+
+    LC -->|SSH password/key| B
+    B -->|SSH key| K
+    B --> P
+    B --> T
+    K --> PODS
+    B -->|SCP/SFTP archive| OUT
+    LC -->|Direct SSH| DEV
+    DEV -->|SFTP/SCP| OUT
+    OUT --> AN
+    AN -->|optional attach| JIRA
+```
+
+<details>
+<summary>Text version of the diagram</summary>
+
 ```
                                                                     ┌──────────────────────┐
                                                                     │  Kubernetes Cluster  │
@@ -63,6 +95,8 @@ LogCollector is a command-line tool that automates the collection of logs and di
 │              │◄─── SFTP/SCP ────│  switches         │
 └──────────────┘   (downloads)    └───────────────────┘
 ```
+
+</details>
 
 **Config mode flow** (no arguments):
 1. Reads `config.yaml` to determine which collections are enabled
@@ -221,6 +255,16 @@ Launch a local web-based control panel to edit configuration, run collections, a
 ```
 
 The server runs at `http://127.0.0.1:<port>` and opens your browser automatically. Press `Ctrl+C` to stop it.
+
+#### Screenshots
+
+| Dashboard | Collection settings |
+|---|---|
+| ![Dashboard](docs/images/gui-dashboard.png) | ![Collection settings](docs/images/gui-collection.png) |
+
+| Database queries | AI Analysis |
+|---|---|
+| ![Database queries](docs/images/gui-database.png) | ![AI Analysis](docs/images/gui-aianalysis.png) |
 
 #### Windows launcher: `run-gui.ps1`
 

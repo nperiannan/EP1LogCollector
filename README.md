@@ -146,6 +146,7 @@ Reads `config.yaml` and runs whichever sections have `enabled: true`:
 | `--database` | Database queries only | Yes |
 | `--device-logs` | Network device logs only | **No** |
 | `--analyze <path>` | Analyze local log files/directory | **No** |
+| `--analyze-ai <path>` | AI root-cause analysis (launches GUI on the AI Analysis page) | **No** |
 | `--gui` | Launch web-based GUI control panel (use `--gui-port` for a custom port) | **No** |
 
 ### Common Flag Combinations
@@ -239,6 +240,27 @@ A PowerShell helper that wraps `--gui` with a custom-port option and an auto-bui
 - Resolves paths relative to the script, so it works from any working directory.
 - Pre-checks that the port is free (`Get-NetTCPConnection`) and exits with a clear message if it's taken.
 - Runs `logcollector.exe --gui --gui-port <Port> --config <Config>`. The binary serves on `http://127.0.0.1:<Port>` and opens the browser itself; `Ctrl+C` stops it.
+
+---
+
+### AI-Powered Log Analysis (`--analyze-ai`)
+
+Get LLM-driven root cause analysis of collected logs from the GUI's **AI Analysis** page. Launch straight into it with `--analyze-ai`, or open the GUI and pick **AI Analysis** from the sidebar.
+
+```bash
+# Launch the GUI directly on the AI Analysis page for a directory or file
+./logcollector --analyze-ai /path/to/collected-logs
+```
+
+**Features:**
+- Two providers:
+  - **Local Claude CLI** (default) — uses your existing Claude Code login, no API key required.
+  - **OpenAI-compatible API** — bring your own key, with a configurable endpoint and model (defaults: `https://api.openai.com/v1/chat/completions`, `gpt-4o-mini`).
+- Accepts log **files** (plain text, `.gz`, `.tar.gz`/`.tgz` — archives are decompressed/extracted) or pasted log text.
+- Optional **failure context** field to steer the analysis toward your specific issue.
+- Returns a structured root-cause summary with likely causes and next steps — complements the pattern-based `--analyze` report.
+
+> Tip: Run `--analyze` first for a fast deterministic pattern scan, then `--analyze-ai` on the same directory for a narrative root-cause explanation.
 
 ---
 

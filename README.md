@@ -67,8 +67,7 @@ flowchart LR
     AN -->|optional attach| JIRA
 ```
 
-<details>
-<summary>Text version of the diagram</summary>
+**Text version of the same architecture:**
 
 ```
                                                                     ┌──────────────────────┐
@@ -95,8 +94,6 @@ flowchart LR
 │              │◄─── SFTP/SCP ────│  switches         │
 └──────────────┘   (downloads)    └───────────────────┘
 ```
-
-</details>
 
 **Config mode flow** (no arguments):
 1. Reads `config.yaml` to determine which collections are enabled
@@ -258,13 +255,21 @@ The server runs at `http://127.0.0.1:<port>` and opens your browser automaticall
 
 #### Screenshots
 
-| Dashboard | Collection settings |
-|---|---|
-| ![Dashboard](docs/images/gui-dashboard.png) | ![Collection settings](docs/images/gui-collection.png) |
+**Dashboard** — environment overview, enabled sections, and quick actions
 
-| Database queries | AI Analysis |
-|---|---|
-| ![Database queries](docs/images/gui-database.png) | ![AI Analysis](docs/images/gui-aianalysis.png) |
+![Dashboard](docs/images/gui-dashboard.png)
+
+**Collection** — log collection settings, including the Temporal owner-ID filter and codec endpoint
+
+![Collection settings](docs/images/gui-collection.png)
+
+**Database** — query chain, including the conflict-resolution queries
+
+![Database queries](docs/images/gui-database.png)
+
+**AI Analysis** — LLM-driven root cause analysis
+
+![AI Analysis](docs/images/gui-aianalysis.png)
 
 #### Windows launcher: `run-gui.ps1`
 

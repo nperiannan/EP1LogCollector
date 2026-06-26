@@ -253,24 +253,6 @@ Launch a local web-based control panel to edit configuration, run collections, a
 
 The server runs at `http://127.0.0.1:<port>` and opens your browser automatically. Press `Ctrl+C` to stop it.
 
-#### Screenshots
-
-**Dashboard** — environment overview, enabled sections, and quick actions
-
-![Dashboard](docs/images/gui-dashboard.png)
-
-**Collection** — log collection settings, including the Temporal owner-ID filter and codec endpoint
-
-![Collection settings](docs/images/gui-collection.png)
-
-**Database** — query chain, including the conflict-resolution queries
-
-![Database queries](docs/images/gui-database.png)
-
-**AI Analysis** — LLM-driven root cause analysis
-
-![AI Analysis](docs/images/gui-aianalysis.png)
-
 #### Windows launcher: `run-gui.ps1`
 
 A PowerShell helper that wraps `--gui` with a custom-port option and an auto-build step.

@@ -42,16 +42,16 @@ var (
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
 
-// Temporal Cheat Sheet - Default bash aliases for debugging Temporal workflows
+// Temporal Cheat Sheet - Default POSIX sh aliases for debugging Temporal workflows
 // These can be supplemented with custom aliases from config.yaml
 const temporalCheatSheet = `# ============================================================================
 # Temporal Cheat Sheet
 # ============================================================================
-# These are bash aliases for debugging Temporal workflows when exec'd into
-# a Temporal admin pod. Copy and paste these commands into your bash session.
+# These are POSIX sh aliases for debugging Temporal workflows when exec'd into
+# a Temporal admin pod. Copy and paste these commands into your sh session.
 # 
 # Usage:
-#   1. kubectl exec -it <temporal-admin-pod> -n common -- bash
+#   1. kubectl exec -it <temporal-admin-pod> -n common -- sh
 #   2. Copy/paste the aliases below
 #   3. Use them: tc-list, tc-input <workflow-id>, tc-output <workflow-id>, etc.
 # ============================================================================
@@ -66,7 +66,7 @@ alias tc-input='f(){ temporal workflow show --namespace configuration --workflow
 alias tc-output='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"; }; f'
 
 # Show both input and output for a workflow
-alias tc-both='f(){ echo "=== INPUT ===" && tc-input "$1" && echo -e "\n=== OUTPUT ===" && tc-output "$1"; }; f'
+alias tc-both='f(){ echo "=== INPUT ===" && tc-input "$1" && printf "\n=== OUTPUT ===\n" && tc-output "$1"; }; f'
 
 # List all activities for a workflow with event IDs and types
 alias tc-activities='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""; }; f'
@@ -3771,7 +3771,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString("  WORKFLOW INPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
-		inputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"'`,
+		inputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"'`,
 			adminPod, temporalNamespace, workflowID, codecFlag)
 		inputOutput := executeTemporalCommand(awsClient, inputCmd)
 		wfContent.WriteString(inputOutput + "\n\n")
@@ -3782,7 +3782,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString("  WORKFLOW OUTPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
-		outputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"'`,
+		outputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"'`,
 			adminPod, temporalNamespace, workflowID, codecFlag)
 		outputOutput := executeTemporalCommand(awsClient, outputCmd)
 		wfContent.WriteString(outputOutput + "\n\n")
@@ -3793,7 +3793,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString("  ACTIVITIES\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
 
-		activitiesCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""'`,
+		activitiesCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""'`,
 			adminPod, temporalNamespace, workflowID, codecFlag)
 		activitiesOutput := executeTemporalCommand(awsClient, activitiesCmd)
 		wfContent.WriteString(activitiesOutput + "\n\n")
@@ -3811,7 +3811,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				wfContent.WriteString(fmt.Sprintf("  ACTIVITY INPUT: %s\n", activityName))
 				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
 
-				actInputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"%s\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity %s"'`,
+				actInputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"%s\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity %s"'`,
 					adminPod, temporalNamespace, workflowID, codecFlag, activityName, activityName)
 				actInputOutput := executeTemporalCommand(awsClient, actInputCmd)
 				wfContent.WriteString(actInputOutput + "\n\n")
@@ -3821,7 +3821,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				wfContent.WriteString(fmt.Sprintf("  ACTIVITY OUTPUT: %s\n", activityName))
 				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
 
-				actOutputCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity %s"; else echo "Activity %s not found"; fi'`,
+				actOutputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity %s"; else echo "Activity %s not found"; fi'`,
 					adminPod, temporalNamespace, workflowID, codecFlag, activityName,
 					temporalNamespace, workflowID, codecFlag, activityName, activityName)
 				actOutputOutput := executeTemporalCommand(awsClient, actOutputCmd)
@@ -3832,7 +3832,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				wfContent.WriteString(fmt.Sprintf("  ACTIVITY FAILURE: %s\n", activityName))
 				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
 
-				actFailureCmd := fmt.Sprintf(`kubectl exec %s -n common -- bash -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | jq . 2>/dev/null || echo "No failure data found for activity %s"; else echo "Activity %s not found"; fi'`,
+				actFailureCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | jq . 2>/dev/null || echo "No failure data found for activity %s"; else echo "Activity %s not found"; fi'`,
 					adminPod, temporalNamespace, workflowID, codecFlag, activityName,
 					temporalNamespace, workflowID, codecFlag, activityName, activityName)
 				actFailureOutput := executeTemporalCommand(awsClient, actFailureCmd)

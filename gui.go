@@ -2625,7 +2625,7 @@ function renderCollection() {
           <div class="field">
             <label>Custom Aliases</label>
             <input value="${esc((tw.customAliases || []).join(', '))}" placeholder="(none)" disabled>
-            <div class="hint">Custom bash aliases for temporal debugging</div>
+            <div class="hint">Custom sh aliases for temporal debugging</div>
           </div>
         </div>
         <div class="hint" style="margin-top:4px;color:var(--accent)">&#9998; Edit these fields in <a href="#" onclick="showPage('rawconfig');return false" style="color:var(--accent)">Raw Config</a> &gt; temporalWorkflowCollection</div>

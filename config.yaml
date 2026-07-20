@@ -188,7 +188,7 @@ logCollection:
     namespace: "configuration"
     filterByOwnerID: true                   # Filter workflows by resolved ownerID via: temporal workflow list --query 'OwnerId="<ownerID>"'
     codecEndpoint: "http://codec-server:9011"  # Decode zlib-compressed payloads (NGC 25.13.0+). Empty = raw binary blobs.
-    customAliases: []                       # Optional custom bash aliases
+    customAliases: []                       # Optional custom sh aliases
   
   # ┌─── Temporal Schedules - Collect schedule information ────────────────┐
   # Note: Controlled by defaultEP1Logs setting (above)

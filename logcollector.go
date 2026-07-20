@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.2.1"   // Semantic version (set via -ldflags)
+	appVersion  = "2.2.2"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -8990,6 +8990,29 @@ func queryDeviceInfoFromDB(awsClient *ssh.Client, ownerID string, dbc DatabaseCo
 	return devices, nil
 }
 
+// normalizeDeviceFamily maps the raw hm_device.device_family value from the
+// database into the internal device types recognized by the collector
+// ("exos" or "voss"). The database stores hardware/product family names
+// rather than always the literal type string — e.g. VOSS/Fabric Engine
+// switches (like the 5520 series) report as "vsp_series" (VSP = Virtual
+// Services Platform), not "voss". Pattern matching is used instead of an
+// exact lookup table so other VSP/EXOS family variants are still recognized.
+// Returns "" if the family is empty or doesn't match any known pattern.
+func normalizeDeviceFamily(family string) string {
+	f := strings.ToLower(strings.TrimSpace(family))
+	if f == "" {
+		return ""
+	}
+	switch {
+	case strings.Contains(f, "vsp"), strings.Contains(f, "voss"), strings.Contains(f, "fabric"):
+		return "voss"
+	case strings.Contains(f, "exos"):
+		return "exos"
+	default:
+		return ""
+	}
+}
+
 // buildNetworkDevicesFromDetected converts database-detected devices into NetworkDevice
 // slice suitable for device log collection, applying type-based defaults.
 // maxDevices limits how many devices to process (0 = no limit).
@@ -9007,11 +9030,13 @@ func buildNetworkDevicesFromDetected(detected []DetectedDevice, maxDevices int, 
 			continue
 		}
 
-		// Map device_family to device type
-		deviceType := strings.ToLower(d.DeviceFamily)
+		// Map device_family to device type. hm_device.device_family stores
+		// hardware/product family names, not always the literal "exos"/"voss"
+		// strings — e.g. VOSS/Fabric Engine switches report as "vsp_series".
+		deviceType := normalizeDeviceFamily(d.DeviceFamily)
 		if deviceType == "" {
 			deviceType = "exos" // Default to exos if unknown
-			logger.Warn("Device '%s' has unknown family, defaulting to EXOS", d.ConfiguredHostName)
+			logger.Warn("Device '%s' has unknown family '%s', defaulting to EXOS", d.ConfiguredHostName, d.DeviceFamily)
 		}
 
 		// Determine device name (use hostname if available, otherwise serial)

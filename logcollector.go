@@ -37,7 +37,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.1.6"   // Semantic version (set via -ldflags)
+	appVersion  = "2.2.1"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )

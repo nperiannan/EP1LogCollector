@@ -5,10 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -37,73 +39,10 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.2.2"   // Semantic version (set via -ldflags)
+	appVersion  = "2.3.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
-
-// Temporal Cheat Sheet - Default POSIX sh aliases for debugging Temporal workflows
-// These can be supplemented with custom aliases from config.yaml
-const temporalCheatSheet = `# ============================================================================
-# Temporal Cheat Sheet
-# ============================================================================
-# These are POSIX sh aliases for debugging Temporal workflows when exec'd into
-# a Temporal admin pod. Copy and paste these commands into your sh session.
-# 
-# Usage:
-#   1. kubectl exec -it <temporal-admin-pod> -n common -- sh
-#   2. Copy/paste the aliases below
-#   3. Use them: tc-list, tc-input <workflow-id>, tc-output <workflow-id>, etc.
-# ============================================================================
-
-# List all workflows in configuration namespace
-alias tc-list='temporal workflow list --namespace configuration'
-
-# Show workflow input (decoded from base64 and pretty-printed JSON)
-alias tc-input='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"; }; f'
-
-# Show workflow output (decoded from base64 and pretty-printed JSON)
-alias tc-output='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"; }; f'
-
-# Show both input and output for a workflow
-alias tc-both='f(){ echo "=== INPUT ===" && tc-input "$1" && printf "\n=== OUTPUT ===\n" && tc-output "$1"; }; f'
-
-# List all activities for a workflow with event IDs and types
-alias tc-activities='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""; }; f'
-
-# Show activity failure details for a specific activity by name
-alias tc-activity-failure='f(){
-  SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-    jq -r --arg activityName "$2" \
-      ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
-  if [ -n "$SCHED_ID" ]; then
-    temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-    jq -r --arg sid "$SCHED_ID" \
-      ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | \
-    jq . 2>/dev/null || echo "No failure data found for activity $2";
-  else
-    echo "Activity $2 not found";
-  fi
-}; f'
-
-# Show activity input by activity name
-alias tc-activity-input-by-name='f(){ temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"$2\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity $2"; }; f'
-
-# Show activity output by activity name
-alias tc-activity-output='f(){
-  SCHED_ID=$(temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-    jq -r --arg activityName "$2" \
-      ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId");
-  if [ -n "$SCHED_ID" ]; then
-    temporal workflow show --namespace configuration --workflow-id "$1" --output json 2>&1 | \
-    jq -r --arg sid "$SCHED_ID" \
-      ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | \
-    base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity $2";
-  else
-    echo "Activity $2 not found";
-  fi
-}; f'
-`
 
 // LogLevel represents different logging levels
 type LogLevel int
@@ -870,14 +809,14 @@ type Config struct {
 			Duration string `yaml:"duration"` // Duration like "15m", "1h", "30m"
 		} `yaml:"timeBasedCollection"`
 		TemporalWorkflowCollection struct {
-			Enabled           bool     `yaml:"enabled"`           // Enable temporal workflow data collection
-			WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`  // Filter by workflow ID prefix
-			NumberOfWorkflows int      `yaml:"numberOfWorkflows"` // Number of workflows to collect (1-20)
-			Namespace         string   `yaml:"namespace"`         // Temporal namespace (default: configuration)
-			FilterByOwnerID   bool     `yaml:"filterByOwnerID"`   // Filter workflows by resolved ownerID via temporal --query 'OwnerId="..."'
-			CodecEndpoint     string   `yaml:"codecEndpoint"`     // Codec server endpoint to decode zlib-compressed payloads (NGC 25.13.0+)
-			OwnerID           string   `yaml:"-"`                 // Resolved ownerID injected at runtime (not from yaml)
-			CustomAliases     []string `yaml:"customAliases"`     // Optional custom bash aliases to append to cheat sheet
+			Enabled              bool                `yaml:"enabled"`              // Enable temporal workflow data collection
+			WorkflowIdPrefix     string              `yaml:"workflowIdPrefix"`     // Filter by workflow ID prefix
+			NumberOfWorkflows    int                 `yaml:"numberOfWorkflows"`    // Number of workflows to collect (1-20)
+			Namespace            string              `yaml:"namespace"`            // Temporal namespace (default: configuration)
+			KubeNamespace        string              `yaml:"kubeNamespace"`        // Kubernetes namespace hosting the temporal-admintools pod (default: common)
+			FilterByOwnerID      bool                `yaml:"filterByOwnerID"`      // Filter workflows by resolved ownerID via temporal --query 'OwnerId="..."'
+			WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"` // Per-workflow-type activity lists keyed by workflow ID prefix (e.g. "deploy-site")
+			OwnerID              string              `yaml:"-"`                    // Resolved ownerID injected at runtime (not from yaml)
 		} `yaml:"temporalWorkflowCollection"`
 		TemporalScheduleCollection struct {
 			Enabled           bool   `yaml:"enabled"`           // Enable temporal schedule data collection
@@ -1427,14 +1366,14 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	} `yaml:"keyValueFilters"`
 	SpecificStrings []string `yaml:"specificStrings"`
 }, temporalConfig struct {
-	Enabled           bool     `yaml:"enabled"`
-	WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`
-	NumberOfWorkflows int      `yaml:"numberOfWorkflows"`
-	Namespace         string   `yaml:"namespace"`
-	FilterByOwnerID   bool     `yaml:"filterByOwnerID"`
-	CodecEndpoint     string   `yaml:"codecEndpoint"`
-	OwnerID           string   `yaml:"-"`
-	CustomAliases     []string `yaml:"customAliases"`
+	Enabled              bool                `yaml:"enabled"`
+	WorkflowIdPrefix     string              `yaml:"workflowIdPrefix"`
+	NumberOfWorkflows    int                 `yaml:"numberOfWorkflows"`
+	Namespace            string              `yaml:"namespace"`
+	KubeNamespace        string              `yaml:"kubeNamespace"`
+	FilterByOwnerID      bool                `yaml:"filterByOwnerID"`
+	WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"`
+	OwnerID              string              `yaml:"-"`
 }, temporalScheduleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
 	NumberOfSchedules int    `yaml:"numberOfSchedules"`
@@ -3601,14 +3540,14 @@ func collectSystemInfo(awsClient *ssh.Client, systemInfoConfig struct {
 
 // collectTemporalWorkflowInfo collects Temporal workflow debugging information from the admin pod
 func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
-	Enabled           bool     `yaml:"enabled"`
-	WorkflowIdPrefix  string   `yaml:"workflowIdPrefix"`
-	NumberOfWorkflows int      `yaml:"numberOfWorkflows"`
-	Namespace         string   `yaml:"namespace"`
-	FilterByOwnerID   bool     `yaml:"filterByOwnerID"`
-	CodecEndpoint     string   `yaml:"codecEndpoint"`
-	OwnerID           string   `yaml:"-"`
-	CustomAliases     []string `yaml:"customAliases"`
+	Enabled              bool                `yaml:"enabled"`
+	WorkflowIdPrefix     string              `yaml:"workflowIdPrefix"`
+	NumberOfWorkflows    int                 `yaml:"numberOfWorkflows"`
+	Namespace            string              `yaml:"namespace"`
+	KubeNamespace        string              `yaml:"kubeNamespace"`
+	FilterByOwnerID      bool                `yaml:"filterByOwnerID"`
+	WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"`
+	OwnerID              string              `yaml:"-"`
 }, environment, username, tempDir, finalLogFileName string) error {
 	if !temporalConfig.Enabled {
 		logger.Debug("Temporal workflow collection is disabled")
@@ -3633,14 +3572,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		numberOfWorkflows = 20
 	}
 
-	// Codec endpoint for decoding zlib-compressed payloads (NGC 25.13.0+).
-	// Payload Compression is enabled by default for NGC Temporal Workflows, so
-	// without --codec-endpoint the `temporal workflow show` payloads appear as
-	// binary blobs. When set, the input/output/activity payloads are decoded.
-	codecFlag := ""
-	if temporalConfig.CodecEndpoint != "" {
-		codecFlag = fmt.Sprintf(" --codec-endpoint %s", temporalConfig.CodecEndpoint)
-		logger.Info("Using Temporal codec endpoint for payload decoding: %s", temporalConfig.CodecEndpoint)
+	kubeNamespace := temporalConfig.KubeNamespace
+	if kubeNamespace == "" {
+		kubeNamespace = "common"
 	}
 
 	// Create the Temporal output directory on the remote server inside the log collection directory
@@ -3660,13 +3594,13 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	logger.Info("Created Temporal output directory: %s", temporalOutputDir)
 
 	// Step 1: Find the temporal admin pod
-	logger.Info("Discovering Temporal admin pod in 'common' namespace...")
+	logger.Info("Discovering Temporal admin pod in '%s' namespace...", kubeNamespace)
 	podSession, err := awsClient.NewSession()
 	if err != nil {
 		return fmt.Errorf("failed to create session for pod discovery: %v", err)
 	}
 
-	podCmd := "kubectl get pods -n common --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print \\$1}'"
+	podCmd := fmt.Sprintf("kubectl get pods -n %s --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print \\$1}'", kubeNamespace)
 	podOutput, err := podSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", podCmd))
 	podSession.Close()
 	if err != nil {
@@ -3677,7 +3611,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 
 	adminPod := strings.TrimSpace(string(podOutput))
 	if adminPod == "" {
-		return fmt.Errorf("no running temporal-admintools pod found in 'common' namespace")
+		return fmt.Errorf("no running temporal-admintools pod found in '%s' namespace", kubeNamespace)
 	}
 	logger.Info("Found Temporal admin pod: %s", adminPod)
 
@@ -3700,8 +3634,8 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		return fmt.Errorf("failed to create session for workflow listing: %v", err)
 	}
 
-	listCmd := fmt.Sprintf("kubectl exec %s -n common -- temporal workflow list --namespace %s%s 2>/dev/null",
-		adminPod, temporalNamespace, ownerQueryFlag)
+	listCmd := fmt.Sprintf("kubectl exec %s -n %s -- temporal workflow list --namespace %s%s 2>/dev/null",
+		adminPod, kubeNamespace, temporalNamespace, ownerQueryFlag)
 	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
 	listSession.Close()
 	if err != nil {
@@ -3750,13 +3684,35 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		logger.Info("  %d. %s", i+1, wfID)
 	}
 
-	// Step 4: For each workflow, collect detailed information
+	// Step 4: For each workflow, collect detailed information.
+	// Instead of issuing one remote `kubectl exec` per field (input/output/activities/etc,
+	// which was fragile due to nested shell quoting and repeated round-trips), we fetch the
+	// full event history JSON once and decode everything locally.
 	for i, workflowID := range workflowIDs {
 		logger.Info("Collecting data for workflow %d/%d: %s", i+1, len(workflowIDs), workflowID)
 
 		// Create a sanitized filename from workflow ID
 		safeWfID := sanitizeFilename(workflowID)
 		wfOutputFile := fmt.Sprintf("%s/%s.txt", temporalOutputDir, safeWfID)
+
+		logger.Debug("  Fetching workflow event history...")
+		historyCmd := fmt.Sprintf(`kubectl exec %s -n %s -- temporal workflow show --namespace %s --workflow-id "%s" --output json 2>&1`,
+			adminPod, kubeNamespace, temporalNamespace, workflowID)
+		historyOutput := executeTemporalCommand(awsClient, historyCmd)
+
+		var history struct {
+			Events []map[string]interface{} `json:"events"`
+		}
+		historyParsed := false
+		if trimmed := strings.TrimSpace(historyOutput); strings.HasPrefix(trimmed, "{") {
+			if jsonErr := json.Unmarshal([]byte(trimmed), &history); jsonErr == nil {
+				historyParsed = true
+			} else {
+				logger.Warn("  Failed to parse workflow history JSON for %s: %v", workflowID, jsonErr)
+			}
+		} else {
+			logger.Warn("  Workflow history output for %s was not valid JSON", workflowID)
+		}
 
 		var wfContent strings.Builder
 		wfContent.WriteString("# Temporal Workflow Details\n")
@@ -3765,91 +3721,165 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		wfContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 		wfContent.WriteString(fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60)))
 
+		if !historyParsed {
+			wfContent.WriteString("Failed to fetch or parse workflow event history.\n\n")
+			wfContent.WriteString(historyOutput + "\n")
+			writeFileToRemote(awsClient, wfOutputFile, wfContent.String())
+			logger.Warn("  Skipping activity collection for %s (history unavailable)", workflowID)
+			continue
+		}
+
 		// 4a: Workflow Input
-		logger.Debug("  Collecting workflow input...")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
 		wfContent.WriteString("  WORKFLOW INPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
-
-		inputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[0].workflowExecutionStartedEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found"'`,
-			adminPod, temporalNamespace, workflowID, codecFlag)
-		inputOutput := executeTemporalCommand(awsClient, inputCmd)
-		wfContent.WriteString(inputOutput + "\n\n")
+		wfContent.WriteString(extractWorkflowStartInput(history.Events) + "\n\n")
 
 		// 4b: Workflow Output
-		logger.Debug("  Collecting workflow output...")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
 		wfContent.WriteString("  WORKFLOW OUTPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
+		wfContent.WriteString(extractWorkflowCompletedOutput(history.Events) + "\n\n")
 
-		outputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType == \"EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\") | .workflowExecutionCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found or workflow still running"'`,
-			adminPod, temporalNamespace, workflowID, codecFlag)
-		outputOutput := executeTemporalCommand(awsClient, outputCmd)
-		wfContent.WriteString(outputOutput + "\n\n")
-
-		// 4c: List Activities
-		logger.Debug("  Collecting activity list...")
+		// 4c: List all activities discovered in the history (informational overview)
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
 		wfContent.WriteString("  ACTIVITIES\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
-
-		activitiesCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.eventType | contains(\"ACTIVITY\")) | \"\(.eventId)  \(.eventType)  \(.activityTaskScheduledEventAttributes.activityType.name // \"-\")\""'`,
-			adminPod, temporalNamespace, workflowID, codecFlag)
-		activitiesOutput := executeTemporalCommand(awsClient, activitiesCmd)
-		wfContent.WriteString(activitiesOutput + "\n\n")
-
-		// 4d: Extract unique activity names and collect per-activity details
-		activityNames := extractActivityNames(activitiesOutput)
-		if len(activityNames) > 0 {
-			logger.Info("  Found %d unique activities: %v", len(activityNames), activityNames)
-
-			for _, activityName := range activityNames {
-				logger.Debug("  Collecting details for activity: %s", activityName)
-
-				// Activity Input
-				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n")
-				wfContent.WriteString(fmt.Sprintf("  ACTIVITY INPUT: %s\n", activityName))
-				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
-
-				actInputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \"%s\") | .activityTaskScheduledEventAttributes.input.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No input data found for activity %s"'`,
-					adminPod, temporalNamespace, workflowID, codecFlag, activityName, activityName)
-				actInputOutput := executeTemporalCommand(awsClient, actInputCmd)
-				wfContent.WriteString(actInputOutput + "\n\n")
-
-				// Activity Output
-				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n")
-				wfContent.WriteString(fmt.Sprintf("  ACTIVITY OUTPUT: %s\n", activityName))
-				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
-
-				actOutputCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskCompletedEventAttributes.scheduledEventId == \$sid) | .activityTaskCompletedEventAttributes.result.payloads[0].data" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "No output data found for activity %s"; else echo "Activity %s not found"; fi'`,
-					adminPod, temporalNamespace, workflowID, codecFlag, activityName,
-					temporalNamespace, workflowID, codecFlag, activityName, activityName)
-				actOutputOutput := executeTemporalCommand(awsClient, actOutputCmd)
-				wfContent.WriteString(actOutputOutput + "\n\n")
-
-				// Activity Failure
-				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n")
-				wfContent.WriteString(fmt.Sprintf("  ACTIVITY FAILURE: %s\n", activityName))
-				wfContent.WriteString("-" + strings.Repeat("-", 79) + "\n\n")
-
-				actFailureCmd := fmt.Sprintf(`kubectl exec %s -n common -- sh -c 'SCHED_ID=$(temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg activityName "%s" ".events[] | select(.activityTaskScheduledEventAttributes.activityType.name == \$activityName) | .eventId"); if [ -n "$SCHED_ID" ]; then temporal workflow show --namespace %s --workflow-id "%s"%s --output json 2>&1 | jq -r --arg sid "$SCHED_ID" ".events[] | select(.activityTaskFailedEventAttributes.scheduledEventId == \$sid) | .activityTaskFailedEventAttributes.failure" | jq . 2>/dev/null || echo "No failure data found for activity %s"; else echo "Activity %s not found"; fi'`,
-					adminPod, temporalNamespace, workflowID, codecFlag, activityName,
-					temporalNamespace, workflowID, codecFlag, activityName, activityName)
-				actFailureOutput := executeTemporalCommand(awsClient, actFailureCmd)
-				wfContent.WriteString(actFailureOutput + "\n\n")
-			}
-		} else {
+		discoveredActivities := listScheduledActivities(history.Events)
+		if len(discoveredActivities) == 0 {
 			wfContent.WriteString("No activities found for this workflow.\n\n")
+		} else {
+			for _, a := range discoveredActivities {
+				wfContent.WriteString(fmt.Sprintf("%s  %s  %s\n", a.EventID, a.EventType, a.Name))
+			}
+			wfContent.WriteString("\n")
 		}
 
-		// Write the complete workflow file
+		// 4d: Resolve the activity set for this workflow from config.yaml's
+		// workflowActivitySets (matched by longest workflow ID prefix). For each
+		// configured activity, write separate {Activity}_input.txt / _output.txt / _status.txt files.
+		// A configured list containing "ALL" (case-insensitive) collects every activity
+		// discovered in the workflow's event history instead of naming each one.
+		activityNames, matchedKey := resolveActivitySetForWorkflow(workflowID, temporalConfig.WorkflowActivitySets)
+		usingAll := false
+		for _, n := range activityNames {
+			if strings.EqualFold(strings.TrimSpace(n), "ALL") {
+				usingAll = true
+				break
+			}
+		}
+		if usingAll {
+			activityNames = nil
+		}
+		if len(activityNames) == 0 {
+			// No configured activity set matched (or "ALL" was specified) — fall back to
+			// all activities discovered in the history
+			seen := make(map[string]bool)
+			for _, a := range discoveredActivities {
+				if a.Name != "" && !seen[a.Name] {
+					seen[a.Name] = true
+					activityNames = append(activityNames, a.Name)
+				}
+			}
+			if usingAll {
+				logger.Info("  workflowActivitySets['%s'] = ALL — collecting all %d discovered activities for workflow %s", matchedKey, len(activityNames), workflowID)
+			} else if len(activityNames) > 0 {
+				logger.Warn("  No workflowActivitySets entry matched workflow ID '%s' — falling back to %d discovered activities", workflowID, len(activityNames))
+			}
+		} else {
+			logger.Info("  Matched workflowActivitySets['%s'] (%d activities) for workflow %s", matchedKey, len(activityNames), workflowID)
+		}
+
+		if len(activityNames) > 0 {
+			activitiesDir := fmt.Sprintf("%s/%s_activities", temporalOutputDir, safeWfID)
+			if mkdirActSession, mkErr := awsClient.NewSession(); mkErr == nil {
+				executeCommandAsRoot(mkdirActSession, fmt.Sprintf("mkdir -p %s", activitiesDir))
+				mkdirActSession.Close()
+			}
+
+			var summaryLines []string
+			for _, activityName := range activityNames {
+				occurrences := findScheduledEventsByName(history.Events, activityName)
+				if len(occurrences) == 0 {
+					logger.Warn("  Activity '%s' not found in workflow %s history", activityName, workflowID)
+					summaryLines = append(summaryLines, fmt.Sprintf("%s | NOT_FOUND", activityName))
+					continue
+				}
+
+				for idx, schedEvent := range occurrences {
+					attempt := idx + 1
+					sid := asString(schedEvent["eventId"])
+
+					inputText := "No input data found"
+					if attrs, ok := schedEvent["activityTaskScheduledEventAttributes"].(map[string]interface{}); ok {
+						inputText = decodePayloadsField(attrs, "input")
+					}
+
+					outputText := "No output data found or workflow still running"
+					var eventTypes []string
+					var failureText string
+					for _, rev := range findEventsByScheduledID(history.Events, sid) {
+						et, _ := rev["eventType"].(string)
+						if et != "" {
+							eventTypes = append(eventTypes, et)
+						}
+						switch et {
+						case "EVENT_TYPE_ACTIVITY_TASK_COMPLETED":
+							if compAttrs, ok := rev["activityTaskCompletedEventAttributes"].(map[string]interface{}); ok {
+								outputText = decodePayloadsField(compAttrs, "result")
+							}
+						case "EVENT_TYPE_ACTIVITY_TASK_FAILED":
+							if failAttrs, ok := rev["activityTaskFailedEventAttributes"].(map[string]interface{}); ok {
+								if failure, ok := failAttrs["failure"]; ok {
+									if b, mErr := json.MarshalIndent(failure, "", "  "); mErr == nil {
+										failureText = string(b)
+									}
+								}
+							}
+						}
+					}
+
+					statusSummary := "SCHEDULED_ONLY_OR_NO_STATUS"
+					if len(eventTypes) > 0 {
+						statusSummary = strings.Join(eventTypes, ", ")
+					}
+
+					var statusBuilder strings.Builder
+					statusBuilder.WriteString(fmt.Sprintf("Activity: %s\n", activityName))
+					statusBuilder.WriteString(fmt.Sprintf("Scheduled Event ID: %s\n", sid))
+					statusBuilder.WriteString(fmt.Sprintf("Attempt: %d\n", attempt))
+					statusBuilder.WriteString(fmt.Sprintf("Status: %s\n", statusSummary))
+					if failureText != "" {
+						statusBuilder.WriteString("\nFailure Details:\n")
+						statusBuilder.WriteString(failureText + "\n")
+					}
+
+					base := sanitizeFilename(activityName)
+					suffix := ""
+					if len(occurrences) > 1 {
+						suffix = fmt.Sprintf("_attempt%d", attempt)
+					}
+
+					writeFileToRemote(awsClient, fmt.Sprintf("%s/%s%s_input.txt", activitiesDir, base, suffix), inputText)
+					writeFileToRemote(awsClient, fmt.Sprintf("%s/%s%s_output.txt", activitiesDir, base, suffix), outputText)
+					writeFileToRemote(awsClient, fmt.Sprintf("%s/%s%s_status.txt", activitiesDir, base, suffix), statusBuilder.String())
+
+					summaryLines = append(summaryLines, fmt.Sprintf("%s | sid=%s | attempt=%d | status=%s", activityName, sid, attempt, statusSummary))
+				}
+			}
+
+			writeFileToRemote(awsClient, fmt.Sprintf("%s/summary.txt", activitiesDir), strings.Join(summaryLines, "\n")+"\n")
+			logger.Info("  Saved %d activity file set(s) to: %s", len(summaryLines), activitiesDir)
+		}
+
+		// Write the complete workflow overview file
 		writeFileToRemote(awsClient, wfOutputFile, wfContent.String())
 		logger.Info("  Saved workflow data to: %s", wfOutputFile)
 
 		// 4e: Detailed workflow event history (--detailed flag) — separate file
 		logger.Debug("  Collecting detailed workflow event history...")
-		detailedCmd := fmt.Sprintf(`kubectl exec %s -n common -- temporal workflow show --namespace %s --workflow-id "%s"%s --detailed`,
-			adminPod, temporalNamespace, workflowID, codecFlag)
+		detailedCmd := fmt.Sprintf(`kubectl exec %s -n %s -- temporal workflow show --namespace %s --workflow-id "%s" --detailed`,
+			adminPod, kubeNamespace, temporalNamespace, workflowID)
 		detailedOutput := executeTemporalCommand(awsClient, detailedCmd)
 
 		var detailedContent strings.Builder
@@ -3867,24 +3897,6 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 
 	logger.Info("Temporal workflow collection completed: %d workflow(s) collected", len(workflowIDs))
 	logger.Info("Temporal data saved to remote directory: %s", temporalOutputDir)
-
-	// Write Temporal cheat sheet with custom aliases appended
-	logger.Info("Writing Temporal cheat sheet to output...")
-	cheatSheetContent := temporalCheatSheet
-
-	// Append custom aliases if provided
-	if len(temporalConfig.CustomAliases) > 0 {
-		cheatSheetContent += "\n# ============================================================================\n"
-		cheatSheetContent += "# CUSTOM ALIASES (from config.yaml)\n"
-		cheatSheetContent += "# ============================================================================\n\n"
-		for _, alias := range temporalConfig.CustomAliases {
-			cheatSheetContent += alias + "\n"
-		}
-	}
-
-	cheatSheetFile := fmt.Sprintf("%s/temporal_cheatsheet.sh", temporalOutputDir)
-	writeFileToRemote(awsClient, cheatSheetFile, cheatSheetContent)
-	logger.Info("Temporal cheat sheet saved to: %s", cheatSheetFile)
 
 	return nil
 }
@@ -3911,6 +3923,295 @@ func executeTemporalCommand(awsClient *ssh.Client, command string) string {
 		return fmt.Sprintf("ERROR: Command failed: %v", err)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+// ============================================================================
+// Temporal event history helpers — parse `temporal workflow show -o json`
+// output locally (no jq/python3 dependency on the remote host) and decode
+// Payload data (base64 + optional zlib compression + protobuf Payload wrapper).
+// ============================================================================
+
+// activityScheduledRef describes one activity scheduled event discovered in a workflow history
+type activityScheduledRef struct {
+	EventID   string
+	EventType string
+	Name      string
+}
+
+// asString normalizes a generic JSON value (string, float64, etc.) to its string form
+func asString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+// extractWorkflowStartInput returns the decoded input payload from the workflow start event
+func extractWorkflowStartInput(events []map[string]interface{}) string {
+	if len(events) == 0 {
+		return "No input data found"
+	}
+	attrs, ok := events[0]["workflowExecutionStartedEventAttributes"].(map[string]interface{})
+	if !ok {
+		return "No input data found"
+	}
+	return decodePayloadsField(attrs, "input")
+}
+
+// extractWorkflowCompletedOutput returns the decoded result payload from the workflow completed event, if any
+func extractWorkflowCompletedOutput(events []map[string]interface{}) string {
+	for _, ev := range events {
+		if et, _ := ev["eventType"].(string); et == "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED" {
+			if attrs, ok := ev["workflowExecutionCompletedEventAttributes"].(map[string]interface{}); ok {
+				return decodePayloadsField(attrs, "result")
+			}
+		}
+	}
+	return "No output data found or workflow still running"
+}
+
+// listScheduledActivities returns every activity scheduled event found in the history, in order
+func listScheduledActivities(events []map[string]interface{}) []activityScheduledRef {
+	var out []activityScheduledRef
+	for _, ev := range events {
+		attrs, ok := ev["activityTaskScheduledEventAttributes"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name := ""
+		if at, ok := attrs["activityType"].(map[string]interface{}); ok {
+			name, _ = at["name"].(string)
+		}
+		et, _ := ev["eventType"].(string)
+		out = append(out, activityScheduledRef{
+			EventID:   asString(ev["eventId"]),
+			EventType: et,
+			Name:      name,
+		})
+	}
+	return out
+}
+
+// findScheduledEventsByName returns all activityTaskScheduled events whose activity type name matches
+func findScheduledEventsByName(events []map[string]interface{}, activityName string) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, ev := range events {
+		attrs, ok := ev["activityTaskScheduledEventAttributes"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		at, ok := attrs["activityType"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := at["name"].(string)
+		if name == activityName {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// findEventsByScheduledID returns started/completed/failed/timedOut/cancelRequested events
+// whose scheduledEventId matches the given scheduled event id (sid)
+func findEventsByScheduledID(events []map[string]interface{}, sid string) []map[string]interface{} {
+	attrKeys := []string{
+		"activityTaskStartedEventAttributes",
+		"activityTaskCompletedEventAttributes",
+		"activityTaskFailedEventAttributes",
+		"activityTaskTimedOutEventAttributes",
+		"activityTaskCancelRequestedEventAttributes",
+	}
+	var out []map[string]interface{}
+	for _, ev := range events {
+		for _, key := range attrKeys {
+			attrs, ok := ev[key].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if v, ok := attrs["scheduledEventId"]; ok && asString(v) == sid {
+				out = append(out, ev)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// resolveActivitySetForWorkflow finds the workflowActivitySets entry whose key is the
+// longest prefix match of the workflow ID (e.g. key "deploy-site" matches
+// "deploy-site-CP1-20260720-054850-usr1007-f82a9e-batch-1"). Returns the matched
+// activity list and the matched key (empty if no match).
+func resolveActivitySetForWorkflow(workflowID string, sets map[string][]string) ([]string, string) {
+	bestKey := ""
+	for key := range sets {
+		if key == "" {
+			continue
+		}
+		if strings.HasPrefix(workflowID, key) && len(key) > len(bestKey) {
+			bestKey = key
+		}
+	}
+	if bestKey == "" {
+		return nil, ""
+	}
+	return sets[bestKey], bestKey
+}
+
+// decodePayloadsField decodes the first payload's data from a Temporal event attributes
+// field (e.g. attrs["input"] or attrs["result"]), mirroring `.input.payloads[0].data`
+func decodePayloadsField(container map[string]interface{}, field string) string {
+	fieldVal, ok := container[field].(map[string]interface{})
+	if !ok {
+		return "No payload found"
+	}
+	payloadsArr, ok := fieldVal["payloads"].([]interface{})
+	if !ok || len(payloadsArr) == 0 {
+		return "No payload found"
+	}
+	p0, ok := payloadsArr[0].(map[string]interface{})
+	if !ok {
+		return "No payload found"
+	}
+	data, _ := p0["data"].(string)
+	if data == "" {
+		return "No payload found"
+	}
+	return decodeTemporalPayloadData(data)
+}
+
+// decodeTemporalPayloadData decodes a base64-encoded Temporal Payload data blob.
+// Payloads may be zlib-compressed and wrapped in a protobuf "Payload" message
+// (field 2 = raw data bytes); this mirrors the decode logic used by the reference
+// temporal_log.sh script, implemented natively in Go (no python3/jq dependency).
+func decodeTemporalPayloadData(data string) string {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		if raw2, err2 := base64.URLEncoding.DecodeString(data); err2 == nil {
+			raw = raw2
+		} else {
+			return fmt.Sprintf("Base64 decode failed: %v", err)
+		}
+	}
+
+	// Repeatedly zlib-inflate while the zlib magic header is present
+	for len(raw) >= 2 && raw[0] == 0x78 && (raw[1] == 0x9c || raw[1] == 0x01 || raw[1] == 0xda || raw[1] == 0x5e) {
+		zr, zErr := zlib.NewReader(bytes.NewReader(raw))
+		if zErr != nil {
+			break
+		}
+		decompressed, readErr := io.ReadAll(zr)
+		zr.Close()
+		if readErr != nil {
+			break
+		}
+		raw = decompressed
+	}
+
+	// Try to locate a length-delimited protobuf field 2 (the wrapped raw data) and use that if present
+	if value, found := scanProtobufField2(raw); found {
+		if pretty, ok := tryPrettyJSON(value); ok {
+			return pretty
+		}
+		return truncateText(string(value), 2000)
+	}
+
+	if pretty, ok := tryPrettyJSON(raw); ok {
+		return pretty
+	}
+	return truncateText(string(raw), 2000)
+}
+
+// scanProtobufField2 does a minimal protobuf wire-format scan looking for a
+// length-delimited field number 2 (matches the python reference implementation)
+func scanProtobufField2(raw []byte) ([]byte, bool) {
+	pos := 0
+	for pos < len(raw) {
+		tag, newPos, ok := readVarint(raw, pos)
+		if !ok {
+			return nil, false
+		}
+		pos = newPos
+		field := tag >> 3
+		wire := tag & 7
+
+		switch wire {
+		case 2:
+			length, newPos2, ok := readVarint(raw, pos)
+			if !ok {
+				return nil, false
+			}
+			pos = newPos2
+			if int(length) < 0 || pos+int(length) > len(raw) {
+				return nil, false
+			}
+			value := raw[pos : pos+int(length)]
+			pos += int(length)
+			if field == 2 {
+				return value, true
+			}
+		case 0:
+			_, newPos3, ok := readVarint(raw, pos)
+			if !ok {
+				return nil, false
+			}
+			pos = newPos3
+		case 1:
+			pos += 8
+		case 5:
+			pos += 4
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// readVarint reads a protobuf varint starting at pos, returning the value and next position
+func readVarint(buf []byte, pos int) (uint64, int, bool) {
+	var result uint64
+	var shift uint
+	for pos < len(buf) {
+		b := buf[pos]
+		pos++
+		result |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			return result, pos, true
+		}
+		shift += 7
+		if shift > 63 {
+			return 0, 0, false
+		}
+	}
+	return 0, 0, false
+}
+
+// tryPrettyJSON attempts to parse b as JSON and returns an indented pretty-printed string
+func tryPrettyJSON(b []byte) (string, bool) {
+	var v interface{}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return "", false
+	}
+	pretty, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return "", false
+	}
+	return string(pretty), true
+}
+
+// truncateText truncates s to at most n bytes (used as a fallback when payload isn't JSON)
+func truncateText(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 // extractWorkflowIDs parses workflow listing output and extracts workflow IDs
@@ -4004,37 +4305,6 @@ func extractWorkflowIDs(listOutput string, prefixFilter string, maxCount int) []
 	}
 
 	return workflowIDs
-}
-
-// extractActivityNames parses the activities listing output and returns unique activity names
-func extractActivityNames(activitiesOutput string) []string {
-	seen := make(map[string]bool)
-	var names []string
-	lines := strings.Split(strings.TrimSpace(activitiesOutput), "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "ERROR") {
-			continue
-		}
-
-		// Format: "eventId  eventType  activityName"
-		// e.g., "5  EVENT_TYPE_ACTIVITY_TASK_SCHEDULED  GetConfigurationFeatures"
-		fields := strings.Fields(line)
-		if len(fields) >= 3 {
-			// The activity name is the last field, but only for SCHEDULED events
-			eventType := fields[1]
-			if strings.Contains(eventType, "SCHEDULED") {
-				activityName := fields[len(fields)-1]
-				if activityName != "-" && activityName != "" && !seen[activityName] {
-					seen[activityName] = true
-					names = append(names, activityName)
-				}
-			}
-		}
-	}
-
-	return names
 }
 
 // collectTemporalScheduleInfo collects Temporal schedule information from the admin pod

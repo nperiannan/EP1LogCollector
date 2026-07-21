@@ -185,16 +185,53 @@ logCollection:
     enabled: true
     workflowIdPrefix: ""                    # Filter by prefix or empty for all
     numberOfWorkflows: 3                    # 1-20 recent workflows
-    namespace: "configuration"
+    namespace: "configuration"              # Temporal namespace
+    kubeNamespace: "common"                 # Kubernetes namespace where the temporal-admintools pod runs
     filterByOwnerID: true                   # Filter workflows by resolved ownerID via: temporal workflow list --query 'OwnerId="<ownerID>"'
-    codecEndpoint: "http://codec-server:9011"  # Decode zlib-compressed payloads (NGC 25.13.0+). Empty = raw binary blobs.
-    customAliases: []                       # Optional custom sh aliases
+
+    # Per-workflow-type activity lists. The key is matched against the start of the
+    # workflow ID (longest match wins), e.g. "deploy-site" matches workflow ID
+    # "deploy-site-CP1-20260720-054850-usr1007-f82a9e-batch-1". For each activity
+    # listed, separate {Activity}_input.txt / {Activity}_output.txt / {Activity}_status.txt
+    # files are collected (if an activity ran more than once in the workflow — e.g. a
+    # retried/rolled-back ProvisionConfiguration — each occurrence gets its own file set
+    # suffixed "_attempt1", "_attempt2", ... using that occurrence's own scheduled event ID).
+    # If no key matches, all discovered activities are collected instead.
+    #
+    # Use "ALL" (case-insensitive) as the only entry to capture every activity discovered
+    # in the workflow's history instead of naming each one individually, e.g.:
+    #   deploy-device:
+    #     - ALL
+    #
+    # Reference — activity names observed on a sample deploy-device workflow
+    # (actual names depend on your NGC/EP1 version and workflow type):
+    #   ResetDeviceDeploymentSummary
+    #   GetDeviceType
+    #   BuildFeatureSchemaMap
+    #   GetConfiguration
+    #   ComputeDeviceConfigurationConflict
+    #   PersistDeviceConfigurationConflict
+    #   PrepareDeviceRecipe
+    #   ProvisionConfiguration            # may run multiple times (e.g. provision + rollback + re-provision)
+    #   ComputeRollbackRecipe
+    #   UpdateDeviceDeploymentStatus
+    #   UpdateSiteSummariesForBatch
+    workflowActivitySets:
+      deploy-site:
+        - GetConfiguration
+        - ProvisionConfiguration
+        - UpdateSiteSummariesForBatch
+
+      deploy-device:
+        - GetConfiguration
+        - ProvisionConfiguration
+        - UpdateDeviceDeploymentStatus
   
   # ┌─── Temporal Schedules - Collect schedule information ────────────────┐
   # Note: Controlled by defaultEP1Logs setting (above)
   temporalScheduleCollection:
     enabled: true
-    numberOfSchedules: 5
+    numberOfSchedules: 3
     namespace: "configuration"
   
   # ┌─── Pod File Collection - Collect Files from Inside Pods ─────────────┐

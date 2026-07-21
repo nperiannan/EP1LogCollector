@@ -1602,13 +1602,13 @@ func buildConfigResponse(cfg *Config, configPath string) map[string]interface{} 
 				"errorGroups":       errorGroups,
 			},
 			"temporalWorkflowCollection": map[string]interface{}{
-				"enabled":           cfg.LogCollection.TemporalWorkflowCollection.Enabled,
-				"workflowIdPrefix":  cfg.LogCollection.TemporalWorkflowCollection.WorkflowIdPrefix,
-				"numberOfWorkflows": cfg.LogCollection.TemporalWorkflowCollection.NumberOfWorkflows,
-				"namespace":         cfg.LogCollection.TemporalWorkflowCollection.Namespace,
-				"filterByOwnerID":   cfg.LogCollection.TemporalWorkflowCollection.FilterByOwnerID,
-				"codecEndpoint":     cfg.LogCollection.TemporalWorkflowCollection.CodecEndpoint,
-				"customAliases":     cfg.LogCollection.TemporalWorkflowCollection.CustomAliases,
+				"enabled":              cfg.LogCollection.TemporalWorkflowCollection.Enabled,
+				"workflowIdPrefix":     cfg.LogCollection.TemporalWorkflowCollection.WorkflowIdPrefix,
+				"numberOfWorkflows":    cfg.LogCollection.TemporalWorkflowCollection.NumberOfWorkflows,
+				"namespace":            cfg.LogCollection.TemporalWorkflowCollection.Namespace,
+				"kubeNamespace":        cfg.LogCollection.TemporalWorkflowCollection.KubeNamespace,
+				"filterByOwnerID":      cfg.LogCollection.TemporalWorkflowCollection.FilterByOwnerID,
+				"workflowActivitySets": cfg.LogCollection.TemporalWorkflowCollection.WorkflowActivitySets,
 			},
 			"temporalScheduleCollection": map[string]interface{}{
 				"enabled":           cfg.LogCollection.TemporalScheduleCollection.Enabled,
@@ -2611,21 +2611,21 @@ function renderCollection() {
             <input value="${esc(tw.namespace || 'configuration')}" disabled>
           </div>
           <div class="field">
-            <label>Filter by Owner ID</label>
-            <input value="${tw.filterByOwnerID ? 'Enabled' : 'Disabled'}" disabled>
-            <div class="hint">Query workflows by resolved ownerID (OwnerId="...")</div>
+            <label>Kube Namespace</label>
+            <input value="${esc(tw.kubeNamespace || 'common')}" disabled>
+            <div class="hint">Kubernetes namespace hosting the temporal-admintools pod</div>
           </div>
         </div>
         <div class="field-row">
           <div class="field">
-            <label>Codec Endpoint</label>
-            <input value="${esc(tw.codecEndpoint)}" placeholder="(none = raw binary payloads)" disabled>
-            <div class="hint">Decode zlib-compressed payloads (NGC 25.13.0+)</div>
+            <label>Filter by Owner ID</label>
+            <input value="${tw.filterByOwnerID ? 'Enabled' : 'Disabled'}" disabled>
+            <div class="hint">Query workflows by resolved ownerID (OwnerId="...")</div>
           </div>
           <div class="field">
-            <label>Custom Aliases</label>
-            <input value="${esc((tw.customAliases || []).join(', '))}" placeholder="(none)" disabled>
-            <div class="hint">Custom sh aliases for temporal debugging</div>
+            <label>Workflow Activity Sets</label>
+            <input value="${esc(Object.keys(tw.workflowActivitySets || {}).join(', ') || '(none)')}" disabled>
+            <div class="hint">Per-workflow-type activities to collect, keyed by workflow ID prefix</div>
           </div>
         </div>
         <div class="hint" style="margin-top:4px;color:var(--accent)">&#9998; Edit these fields in <a href="#" onclick="showPage('rawconfig');return false" style="color:var(--accent)">Raw Config</a> &gt; temporalWorkflowCollection</div>

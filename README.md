@@ -520,9 +520,29 @@ Automatic error detection and severity classification across collected logs. Gen
     enabled: true
     workflowIdPrefix: ""                    # Filter by prefix or empty for all
     numberOfWorkflows: 3                    # 1-20 recent workflows
-    namespace: "configuration"
-    customAliases: []                       # Optional custom bash aliases
+    namespace: "configuration"               # Temporal namespace
+    kubeNamespace: "common"                  # Kubernetes namespace hosting the temporal-admintools pod
+    filterByOwnerID: true                    # Filter workflows by resolved ownerID
+
+    # Per-workflow-type activity lists, keyed by workflow ID prefix (longest match wins).
+    # Each activity gets its own {Activity}_input.txt / {Activity}_output.txt / {Activity}_status.txt file.
+    workflowActivitySets:
+      deploy-site:
+        - GetConfiguration
+        - ProvisionConfiguration
+        - UpdateSiteSummariesForBatch
+      deploy-device:
+        - GetConfiguration
+        - ProvisionConfiguration
+        - UpdateDeviceDeploymentStatus
 ```
+
+**How it works:**
+- Workflows matching `workflowIdPrefix` are listed via `temporal workflow list` and saved to `workflow_list.txt`.
+- For each workflow, the full event history is fetched once (`temporal workflow show -o json`) and parsed locally — no `jq`/`python3`/codec-server dependency on the remote host.
+- The workflow ID is matched against the `workflowActivitySets` keys (longest prefix wins) to determine which activities to collect. If no key matches, all activities discovered in the history are collected instead.
+- Each matched activity produces `{Activity}_input.txt`, `{Activity}_output.txt`, and `{Activity}_status.txt` under `<workflowID>_activities/` (Payload data is base64-decoded and zlib-inflated automatically).
+- An overview file (`<workflowID>.txt`) and detailed event history (`<workflowID>_detailed.txt`) are also saved per workflow.
 
 ### Temporal Schedules
 

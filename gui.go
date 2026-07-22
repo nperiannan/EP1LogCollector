@@ -1608,6 +1608,7 @@ func buildConfigResponse(cfg *Config, configPath string) map[string]interface{} 
 				"namespace":            cfg.LogCollection.TemporalWorkflowCollection.Namespace,
 				"kubeNamespace":        cfg.LogCollection.TemporalWorkflowCollection.KubeNamespace,
 				"filterByOwnerID":      cfg.LogCollection.TemporalWorkflowCollection.FilterByOwnerID,
+				"workflowIdKeyword":    cfg.LogCollection.TemporalWorkflowCollection.WorkflowIdKeyword,
 				"workflowActivitySets": cfg.LogCollection.TemporalWorkflowCollection.WorkflowActivitySets,
 			},
 			"temporalScheduleCollection": map[string]interface{}{
@@ -2623,6 +2624,13 @@ function renderCollection() {
             <div class="hint">Query workflows by resolved ownerID (OwnerId="...")</div>
           </div>
           <div class="field">
+            <label>Workflow ID Keyword</label>
+            <input value="${esc(tw.workflowIdKeyword)}" placeholder="(empty = no filtering)" disabled>
+            <div class="hint">Only keep workflow IDs containing this substring (e.g. "batch")</div>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
             <label>Workflow Activity Sets</label>
             <input value="${esc(Object.keys(tw.workflowActivitySets || {}).join(', ') || '(none)')}" disabled>
             <div class="hint">Per-workflow-type activities to collect, keyed by workflow ID prefix</div>
@@ -3129,9 +3137,9 @@ function renderRun() {
             </select>
           </div>
           <div class="field">
-            <label>JIRA Issue (optional)</label>
-            <input id="f_runJira" placeholder="e.g. XCP-12345">
-            <div class="hint">${config.jira?.attachmentEnabled ? '\u2705 JIRA attachment enabled' : '\u26A0\uFE0F JIRA attachment disabled in config'}</div>
+            <label>JIRA Issue(s) (optional)</label>
+            <input id="f_runJira" placeholder="e.g. XCP-12345 or XCP-1234,XCP-2345,NVO-1234">
+            <div class="hint">${config.jira?.attachmentEnabled ? '\u2705 JIRA attachment enabled \u2014 comma-separate multiple issue keys to attach to all of them' : '\u26A0\uFE0F JIRA attachment disabled in config'}</div>
           </div>
         </div>
         <div class="field">

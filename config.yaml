@@ -184,10 +184,21 @@ logCollection:
   temporalWorkflowCollection:
     enabled: true
     workflowIdPrefix: ""                    # Filter by prefix or empty for all
-    numberOfWorkflows: 3                    # 1-20 recent workflows
+    numberOfWorkflows: 3                    # 1-20 recent workflows (applied AFTER workflowIdKeyword filtering below)
     namespace: "configuration"              # Temporal namespace
     kubeNamespace: "common"                 # Kubernetes namespace where the temporal-admintools pod runs
     filterByOwnerID: true                   # Filter workflows by resolved ownerID via: temporal workflow list --query 'OwnerId="<ownerID>"'
+
+    # Generic substring filter on the workflow ID (case-insensitive) — set this to whatever
+    # keyword distinguishes the workflows you care about; it does not have to be "batch".
+    # Example: batches of the same logical run often produce both a "parent" workflow ID
+    # and one or more "-batch-N" child workflow IDs, e.g.:
+    #   deploy-site-CP1-20260720-054850-usr1007-f82a9e            <- parent (excluded below)
+    #   deploy-site-CP1-20260720-054850-usr1007-f82a9e-batch-1    <- batch child (kept, contains "batch")
+    # By default only workflow IDs containing this keyword are kept; numberOfWorkflows
+    # above then picks the most recent N *matching* workflows. Set to "" to disable this
+    # filter and include every workflow (matching workflowIdPrefix/ownerID as before).
+    workflowIdKeyword: "batch"
 
     # Per-workflow-type activity lists. The key is matched against the start of the
     # workflow ID (longest match wins), e.g. "deploy-site" matches workflow ID

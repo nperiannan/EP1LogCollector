@@ -39,7 +39,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.3.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.4.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -246,10 +246,13 @@ func (l *Logger) Log(level LogLevel, format string, args ...interface{}) {
 	message := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] [%s] %s\n", timestamp, level.String(), message)
 
-	// Terminal output: truncate to 125 visible characters + " ..." (129 total)
+	// Terminal output: truncate to 125 visible characters + " ..." (129 total).
+	// ERROR-level lines are shown in full — truncating diagnostic detail (e.g. a
+	// JIRA API error body) makes failures impossible to understand at a glance
+	// and forces digging through the log file for the real reason.
 	const maxTerminalWidth = 125
 	lineNoNewline := strings.TrimRight(line, "\n")
-	if len(lineNoNewline) > maxTerminalWidth {
+	if level != ERROR && len(lineNoNewline) > maxTerminalWidth {
 		fmt.Println(lineNoNewline[:maxTerminalWidth] + " ...")
 	} else {
 		fmt.Print(line)
@@ -815,6 +818,7 @@ type Config struct {
 			Namespace            string              `yaml:"namespace"`            // Temporal namespace (default: configuration)
 			KubeNamespace        string              `yaml:"kubeNamespace"`        // Kubernetes namespace hosting the temporal-admintools pod (default: common)
 			FilterByOwnerID      bool                `yaml:"filterByOwnerID"`      // Filter workflows by resolved ownerID via temporal --query 'OwnerId="..."'
+			WorkflowIdKeyword    string              `yaml:"workflowIdKeyword"`    // Only keep workflow IDs containing this substring (e.g. "batch"); empty = no filtering
 			WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"` // Per-workflow-type activity lists keyed by workflow ID prefix (e.g. "deploy-site")
 			OwnerID              string              `yaml:"-"`                    // Resolved ownerID injected at runtime (not from yaml)
 		} `yaml:"temporalWorkflowCollection"`
@@ -1372,6 +1376,7 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	Namespace            string              `yaml:"namespace"`
 	KubeNamespace        string              `yaml:"kubeNamespace"`
 	FilterByOwnerID      bool                `yaml:"filterByOwnerID"`
+	WorkflowIdKeyword    string              `yaml:"workflowIdKeyword"`
 	WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"`
 	OwnerID              string              `yaml:"-"`
 }, temporalScheduleConfig struct {
@@ -3546,6 +3551,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	Namespace            string              `yaml:"namespace"`
 	KubeNamespace        string              `yaml:"kubeNamespace"`
 	FilterByOwnerID      bool                `yaml:"filterByOwnerID"`
+	WorkflowIdKeyword    string              `yaml:"workflowIdKeyword"`
 	WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"`
 	OwnerID              string              `yaml:"-"`
 }, environment, username, tempDir, finalLogFileName string) error {
@@ -3654,6 +3660,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 				if temporalConfig.WorkflowIdPrefix != "" {
 					parts = append(parts, "prefix="+temporalConfig.WorkflowIdPrefix)
 				}
+				if temporalConfig.WorkflowIdKeyword != "" {
+					parts = append(parts, "workflowIdKeyword="+temporalConfig.WorkflowIdKeyword)
+				}
 				if len(parts) == 0 {
 					return "none"
 				}
@@ -3670,12 +3679,15 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		}
 		return listOutputStr
 	}())
-	workflowIDs := extractWorkflowIDs(listOutputStr, temporalConfig.WorkflowIdPrefix, numberOfWorkflows)
+	if temporalConfig.WorkflowIdKeyword != "" {
+		logger.Info("Filtering workflows to those containing '%s' in their ID (workflowIdKeyword)", temporalConfig.WorkflowIdKeyword)
+	}
+	workflowIDs := extractWorkflowIDs(listOutputStr, temporalConfig.WorkflowIdPrefix, temporalConfig.WorkflowIdKeyword, numberOfWorkflows)
 	if len(workflowIDs) == 0 {
 		logger.Warn("No workflow IDs found matching the criteria")
 		writeFileToRemote(awsClient, fmt.Sprintf("%s/no_workflows_found.txt", temporalOutputDir),
-			fmt.Sprintf("No workflows found matching criteria.\nPrefix filter: '%s'\nNamespace: %s\nRaw listing output:\n%s\n",
-				temporalConfig.WorkflowIdPrefix, temporalNamespace, listOutputStr))
+			fmt.Sprintf("No workflows found matching criteria.\nPrefix filter: '%s'\nWorkflow ID keyword filter: '%s'\nNamespace: %s\nRaw listing output:\n%s\n",
+				temporalConfig.WorkflowIdPrefix, temporalConfig.WorkflowIdKeyword, temporalNamespace, listOutputStr))
 		return nil
 	}
 
@@ -4215,8 +4227,14 @@ func truncateText(s string, n int) string {
 }
 
 // extractWorkflowIDs parses workflow listing output and extracts workflow IDs
-// Supports both JSON output and plain text tabular output from `temporal workflow list`
-func extractWorkflowIDs(listOutput string, prefixFilter string, maxCount int) []string {
+// Supports both JSON output and plain text tabular output from `temporal workflow list`.
+// workflowIdKeyword (if non-empty) further restricts the result to workflow IDs containing
+// that arbitrary substring (case-insensitive) — e.g. "batch" to prefer batched instances like
+// "deploy-site-CP1-...-batch-1" over their non-batch parent "deploy-site-CP1-...", though any
+// keyword can be used depending on your workflow ID naming convention.
+// The filter is applied before the maxCount cutoff so the most recent N *matching*
+// workflows are returned (temporal workflow list returns newest-first).
+func extractWorkflowIDs(listOutput string, prefixFilter string, workflowIdKeyword string, maxCount int) []string {
 	var workflowIDs []string
 	trimmed := strings.TrimSpace(listOutput)
 
@@ -4297,6 +4315,20 @@ func extractWorkflowIDs(listOutput string, prefixFilter string, maxCount int) []
 				}
 			}
 		}
+	}
+
+	// Apply the workflow ID keyword filter (case-insensitive substring match) before the
+	// maxCount cutoff, so we keep the most recent N *matching* workflows rather than
+	// truncating first and filtering away entries that would have made the cut.
+	if workflowIdKeyword != "" {
+		lowerKeyword := strings.ToLower(workflowIdKeyword)
+		var filtered []string
+		for _, id := range workflowIDs {
+			if strings.Contains(strings.ToLower(id), lowerKeyword) {
+				filtered = append(filtered, id)
+			}
+		}
+		workflowIDs = filtered
 	}
 
 	// Limit to maxCount
@@ -7171,8 +7203,59 @@ func collectAppVersionsStandalone(awsClient *ssh.Client, config *Config, outputD
 //   - credentials_other.go (Linux/macOS stubs - use env vars or config)
 // ================================================================
 
+// splitJiraIssueKeys parses a comma-separated list of JIRA issue keys (e.g.
+// "XCP-1234, XCP-2345, NVO-1234"), trimming whitespace and dropping empty entries.
+func splitJiraIssueKeys(csv string) []string {
+	var keys []string
+	for _, part := range strings.Split(csv, ",") {
+		key := strings.TrimSpace(part)
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// attachFilesToMultipleJiraIssues attaches the given files to one or more JIRA issues.
+// issueIDsCSV accepts a single issue key ("XCP-1234") or a comma-separated list
+// ("XCP-1234, XCP-2345, NVO-1234"), attaching the same set of files to every issue listed.
+func attachFilesToMultipleJiraIssues(jiraConfig JiraConfig, issueIDsCSV string, filePaths []string, logger *Logger) error {
+	issueKeys := splitJiraIssueKeys(issueIDsCSV)
+	if len(issueKeys) == 0 {
+		return fmt.Errorf("no JIRA issue keys provided")
+	}
+
+	if len(issueKeys) == 1 {
+		return attachFilesToJira(jiraConfig, issueKeys[0], filePaths, logger)
+	}
+
+	logger.Info("Attaching files to %d JIRA issues: %s", len(issueKeys), strings.Join(issueKeys, ", "))
+
+	var failedIssues []string
+	for _, issueKey := range issueKeys {
+		if err := attachFilesToJira(jiraConfig, issueKey, filePaths, logger); err != nil {
+			logger.Error("Failed to attach files to JIRA issue %s: %v", issueKey, err)
+			failedIssues = append(failedIssues, issueKey)
+		}
+	}
+
+	if len(failedIssues) > 0 {
+		return fmt.Errorf("failed to attach files to %d/%d JIRA issue(s): %v", len(failedIssues), len(issueKeys), failedIssues)
+	}
+	return nil
+}
+
 // attachFilesToJira uploads files to a JIRA issue using the JIRA REST API
 func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []string, logger *Logger) error {
+	// Normalize config values defensively — a stray trailing slash on baseUrl (e.g.
+	// "https://foo.atlassian.net/") produces a double-slash API URL that Jira Cloud's
+	// edge redirects (301), which silently turns the POST upload into a GET and
+	// makes the "attach" appear to fail with no useful error. Likewise trim
+	// whitespace/newlines that can sneak in via YAML/env var copy-paste.
+	jiraConfig.Email = strings.TrimSpace(jiraConfig.Email)
+	jiraConfig.BaseURL = strings.TrimRight(strings.TrimSpace(jiraConfig.BaseURL), "/")
+	issueKey = strings.TrimSpace(issueKey)
+
 	// Validate basic configuration
 	if jiraConfig.Email == "" {
 		return fmt.Errorf("JIRA email not configured")
@@ -7180,6 +7263,10 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 
 	if jiraConfig.BaseURL == "" {
 		return fmt.Errorf("JIRA baseUrl not configured")
+	}
+
+	if !strings.HasPrefix(jiraConfig.BaseURL, "http://") && !strings.HasPrefix(jiraConfig.BaseURL, "https://") {
+		return fmt.Errorf("JIRA baseUrl %q is missing a scheme (expected e.g. \"https://yourcompany.atlassian.net\")", jiraConfig.BaseURL)
 	}
 
 	if issueKey == "" {
@@ -7191,6 +7278,7 @@ func attachFilesToJira(jiraConfig JiraConfig, issueKey string, filePaths []strin
 	if err != nil {
 		return fmt.Errorf("failed to retrieve JIRA API token: %v", err)
 	}
+	apiToken = strings.TrimSpace(apiToken)
 
 	// Filter out non-existent files
 	existingFiles := []string{}
@@ -7312,9 +7400,15 @@ func attachSingleFileToJira(jiraConfig JiraConfig, issueKey string, filePath str
 	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", jiraConfig.Email, apiToken)))
 	req.Header.Set("Authorization", fmt.Sprintf("Basic %s", auth))
 
-	// Send request with extended timeout for large file uploads
+	// Send request with extended timeout for large file uploads.
+	// CheckRedirect fails fast with a clear error instead of silently letting Go's
+	// http.Client turn a 301/302 redirect (e.g. from a misconfigured baseUrl) into a
+	// bodyless GET, which would otherwise look like an unexplained upload failure.
 	client := &http.Client{
 		Timeout: 10 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return fmt.Errorf("unexpected redirect to %s (check jira.baseUrl for typos/trailing slash)", req.URL)
+		},
 	}
 
 	resp, err := client.Do(req)
@@ -7333,14 +7427,77 @@ func attachSingleFileToJira(jiraConfig JiraConfig, issueKey string, filePath str
 	}
 
 	// Special handling for 401 errors on large files - may indicate token expiration
+	jiraMsg := extractJiraErrorMessage(respBody)
 	if resp.StatusCode == 401 {
 		fileInfo, _ := os.Stat(filePath)
 		if fileInfo != nil && fileInfo.Size() > 50*1024*1024 { // > 50MB
 			return fmt.Errorf("JIRA API authentication failed (401) for large file (%d MB) - API token may have expired during upload. Try splitting into smaller files or refresh credentials", fileInfo.Size()/(1024*1024))
 		}
+		return fmt.Errorf("JIRA API authentication failed (401) for issue %s: %s - the API token/email is invalid, revoked, or has insufficient permissions", issueKey, jiraMsg)
 	}
 
-	return fmt.Errorf("JIRA API request failed with status %d: %s", resp.StatusCode, string(respBody))
+	// 403: authenticated but not permitted (e.g. no "add attachments" permission on this project/issue)
+	if resp.StatusCode == 403 {
+		return fmt.Errorf("JIRA API request forbidden (403) for issue %s: %s - account %s likely lacks 'add attachments' permission on this project", issueKey, jiraMsg, jiraConfig.Email)
+	}
+
+	// 404: issue key doesn't exist, was moved/renamed, or isn't visible to this account.
+	// This is Jira's deliberately vague response for both "doesn't exist" and "no permission"
+	// (to avoid leaking issue existence), so it almost always means one of:
+	//   1. The issue key is mistyped, or belongs to a different Atlassian site than jira.baseUrl
+	//   2. The account tied to the API token lacks "Browse Projects" permission for this issue
+	if resp.StatusCode == 404 {
+		return fmt.Errorf("JIRA issue %s not found (404): %s - verify the issue key is correct, that it exists under %s (not a different Atlassian site), and that %s can view it in a browser", issueKey, jiraMsg, jiraConfig.BaseURL, jiraConfig.Email)
+	}
+
+	// 413: file exceeds the Jira instance's configured maximum attachment size
+	if resp.StatusCode == 413 {
+		fileInfo, _ := os.Stat(filePath)
+		sizeMB := int64(0)
+		if fileInfo != nil {
+			sizeMB = fileInfo.Size() / (1024 * 1024)
+		}
+		return fmt.Errorf("JIRA rejected %s as too large (413, %d MB) - this exceeds the Jira instance's maximum attachment size. Ask a JIRA admin to raise the limit, or split/compress the file further", fileName, sizeMB)
+	}
+
+	// 429: Atlassian Cloud rate limit hit, common when uploading several files in parallel
+	if resp.StatusCode == 429 {
+		retryAfter := resp.Header.Get("Retry-After")
+		return fmt.Errorf("JIRA API rate limit exceeded (429) while uploading %s (Retry-After=%s) - too many attachment requests in a short time", fileName, retryAfter)
+	}
+
+	return fmt.Errorf("JIRA API request failed with status %d: %s", resp.StatusCode, jiraMsg)
+}
+
+// extractJiraErrorMessage parses a Jira REST API error response body, which is
+// typically shaped like {"errorMessages":["..."],"errors":{"field":"..."}}, and
+// returns a short human-readable summary. Falls back to the raw (truncated) body
+// if it isn't in the expected shape, so nothing is silently dropped.
+func extractJiraErrorMessage(body []byte) string {
+	var parsed struct {
+		ErrorMessages []string          `json:"errorMessages"`
+		Errors        map[string]string `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		text := strings.TrimSpace(string(body))
+		if len(text) > 300 {
+			text = text[:300] + "..."
+		}
+		if text == "" {
+			return "(empty response body)"
+		}
+		return text
+	}
+
+	var parts []string
+	parts = append(parts, parsed.ErrorMessages...)
+	for field, msg := range parsed.Errors {
+		parts = append(parts, fmt.Sprintf("%s: %s", field, msg))
+	}
+	if len(parts) == 0 {
+		return "(no error details returned)"
+	}
+	return strings.Join(parts, "; ")
 }
 
 // ============================================================================
@@ -10321,7 +10478,7 @@ func main() {
 	timeDuration := flag.String("time-duration", "", "Collect logs from last X time (e.g., '15m', '30m', '1h', '2h'). Use '0' or 'disabled' to force full logs. Leave empty to use config setting")
 
 	// JIRA integration flag
-	jiraIssueID := flag.String("jira", "", "JIRA issue ID to attach files (e.g., XCP-17614). Requires jira config in config.yaml")
+	jiraIssueID := flag.String("jira", "", "JIRA issue ID(s) to attach files to (e.g., XCP-17614, or a comma-separated list like XCP-1234,XCP-2345,NVO-1234). Requires jira config in config.yaml")
 
 	// Standalone log analyzer flag
 	analyzeDir := flag.String("analyze", "", "Analyze local log files/directory for errors (no SSH required). Path to directory or file")
@@ -10842,7 +10999,7 @@ func main() {
 				} else {
 					logger.Info("Device logs compressed: %s", archivePath)
 					attachmentFiles := []string{archivePath}
-					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+					if err := attachFilesToMultipleJiraIssues(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 						logger.Error("Failed to attach device log files to JIRA issue %s: %v", *jiraIssueID, err)
 					} else {
 						// Clean up the compressed archive after successful JIRA upload
@@ -11118,7 +11275,7 @@ func main() {
 					logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
 				} else {
 					attachmentFiles := []string{versionFilePath}
-					if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+					if err := attachFilesToMultipleJiraIssues(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 						logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
 					}
 				}
@@ -11164,7 +11321,7 @@ func main() {
 					} else {
 						logger.Info("Database results compressed: %s", archivePath)
 						attachmentFiles := []string{archivePath}
-						if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						if err := attachFilesToMultipleJiraIssues(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 							logger.Error("Failed to attach database files to JIRA issue %s: %v", *jiraIssueID, err)
 						} else {
 							// Clean up the compressed archive after JIRA upload attempt
@@ -11219,7 +11376,7 @@ func main() {
 						logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
 					} else {
 						attachmentFiles := []string{versionFilePath}
-						if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						if err := attachFilesToMultipleJiraIssues(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 							logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
 						}
 					}
@@ -11617,6 +11774,11 @@ func main() {
 	}
 
 	// Attach files to JIRA issue if requested
+	if *jiraIssueID != "" && successCount == 0 {
+		// Previously this case fell through silently — the user would specify --jira
+		// but see nothing attached and no explanation why.
+		logger.Warn("Skipping JIRA attachment for %s: no log files were successfully downloaded (successCount=0)", *jiraIssueID)
+	}
 	if *jiraIssueID != "" && successCount > 0 {
 		logger.Info("")
 		logger.Info("%s", strings.Repeat("=", 70))
@@ -11720,7 +11882,7 @@ func main() {
 
 			// Attempt to attach files to JIRA
 			if len(attachmentFiles) > 0 {
-				if err := attachFilesToJira(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+				if err := attachFilesToMultipleJiraIssues(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
 					logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
 				}
 				// Clean up compressed archives after JIRA upload attempt (success or failure)

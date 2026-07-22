@@ -523,6 +523,7 @@ Automatic error detection and severity classification across collected logs. Gen
     namespace: "configuration"               # Temporal namespace
     kubeNamespace: "common"                  # Kubernetes namespace hosting the temporal-admintools pod
     filterByOwnerID: true                    # Filter workflows by resolved ownerID
+    workflowIdKeyword: "batch"               # Only keep workflow IDs containing this substring; "" = no filtering
 
     # Per-workflow-type activity lists, keyed by workflow ID prefix (longest match wins).
     # Each activity gets its own {Activity}_input.txt / {Activity}_output.txt / {Activity}_status.txt file.
@@ -539,6 +540,7 @@ Automatic error detection and severity classification across collected logs. Gen
 
 **How it works:**
 - Workflows matching `workflowIdPrefix` are listed via `temporal workflow list` and saved to `workflow_list.txt`.
+- If `workflowIdKeyword` is set (default `"batch"`), only workflow IDs containing that substring (case-insensitive) are kept — e.g. `deploy-site-CP1-...-batch-1` is kept while its non-batch parent `deploy-site-CP1-...` is excluded. This is a generic substring filter, not limited to the word "batch" — set it to whatever distinguishes the workflows you care about. This filter runs before `numberOfWorkflows` is applied, so you still get the most recent N *matching* workflows. Set `workflowIdKeyword: ""` to disable and include every workflow.
 - For each workflow, the full event history is fetched once (`temporal workflow show -o json`) and parsed locally — no `jq`/`python3`/codec-server dependency on the remote host.
 - The workflow ID is matched against the `workflowActivitySets` keys (longest prefix wins) to determine which activities to collect. If no key matches, all activities discovered in the history are collected instead.
 - Each matched activity produces `{Activity}_input.txt`, `{Activity}_output.txt`, and `{Activity}_status.txt` under `<workflowID>_activities/` (Payload data is base64-decoded and zlib-inflated automatically).
@@ -861,6 +863,9 @@ Attach collected logs and diagnostics directly to a JIRA ticket.
 ```bash
 # Collect everything and attach to JIRA
 ./logcollector --all --jira XCP-12345
+
+# Attach the same files to multiple JIRA issues at once (comma-separated, no spaces needed)
+./logcollector --all --jira XCP-1234,XCP-2345,NVO-1234
 
 # Collect specific data and attach to JIRA
 ./logcollector --logs-only --jira XCP-12345

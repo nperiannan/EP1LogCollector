@@ -39,7 +39,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.4.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.5.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -1676,7 +1676,7 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	// Collect Temporal workflow information before archiving (if enabled and defaultEP1Logs is true)
 	if defaultEP1Logs && temporalConfig.Enabled {
 		logger.Info("Starting Temporal workflow information collection...")
-		err = collectTemporalWorkflowInfo(awsClient, temporalConfig, environment, username, tempDir, finalLogFileName)
+		err = collectTemporalWorkflowInfo(awsClient, temporalConfig, false, environment, username, tempDir, finalLogFileName)
 		if err != nil {
 			logger.Warn("Temporal workflow collection failed: %v", err)
 			// Don't return here - continue with archive creation
@@ -2490,6 +2490,64 @@ func deleteArchiveFromAWS(awsClient *ssh.Client, archivePath, environment string
 
 	logger.Info("Successfully deleted source archive from %s", environment)
 	return nil
+}
+
+// archiveAndDownloadRemoteDir compresses a remote directory (tempDir/dirName) into a
+// tar.gz archive, moves it to remoteUser's home directory (root-owned tempDirs aren't
+// otherwise readable by the SSH login user), downloads it to localOutputDir, and cleans
+// up the remote temp files. Returns the local path to the downloaded archive. Mirrors the
+// archive/move/chmod/download/cleanup pattern used by the main log collection pipeline.
+func archiveAndDownloadRemoteDir(awsClient *ssh.Client, tempDir, dirName, remoteUser, localOutputDir string, autoRetry bool, numChunks int, downloadMethod string, connParams *ConnectionParams, logger *Logger) (string, error) {
+	archiveSession, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session for archive operation: %v", err)
+	}
+	defer archiveSession.Close()
+
+	archiveCmd := fmt.Sprintf("cd %s && tar -czf %s.tar.gz %s", tempDir, dirName, dirName)
+	if err := executeCommandAsRoot(archiveSession, archiveCmd); err != nil {
+		return "", fmt.Errorf("failed to create archive: %v", err)
+	}
+
+	moveSession, err := awsClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create session for move operation: %v", err)
+	}
+	defer moveSession.Close()
+	moveCmd := fmt.Sprintf("mv %s/%s.tar.gz /home/%s/", tempDir, dirName, remoteUser)
+	if err := executeCommandAsRoot(moveSession, moveCmd); err != nil {
+		return "", fmt.Errorf("failed to move archive: %v", err)
+	}
+
+	if chmodSession, chmodErr := awsClient.NewSession(); chmodErr == nil {
+		defer chmodSession.Close()
+		chmodCmd := fmt.Sprintf("chmod 644 /home/%s/%s.tar.gz", remoteUser, dirName)
+		if err := executeCommandAsRoot(chmodSession, chmodCmd); err != nil {
+			logger.Warn("Failed to set permissions for archive: %v (this may cause download issues)", err)
+		}
+	}
+
+	remotePath := fmt.Sprintf("/home/%s/%s.tar.gz", remoteUser, dirName)
+	if err := os.MkdirAll(localOutputDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create local output directory: %v", err)
+	}
+	localPath := filepath.Join(localOutputDir, dirName+".tar.gz")
+
+	logger.Info("Downloading archive to: %s", localPath)
+	if err := downloadFileFromAWS(awsClient, remotePath, localPath, autoRetry, numChunks, connParams, downloadMethod); err != nil {
+		return "", fmt.Errorf("failed to download archive: %v", err)
+	}
+
+	// Best-effort remote cleanup (archive + temp dir)
+	if cleanupSession, cleanupErr := awsClient.NewSession(); cleanupErr == nil {
+		defer cleanupSession.Close()
+		cleanupCmd := fmt.Sprintf("rm -f %s && rm -rf %s/%s", remotePath, tempDir, dirName)
+		if err := executeCommandAsRoot(cleanupSession, cleanupCmd); err != nil {
+			logger.Debug("Remote cleanup warning: %v", err)
+		}
+	}
+
+	return localPath, nil
 }
 
 // Download file from AWS to bastion using SFTP with parallel download
@@ -3554,7 +3612,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	WorkflowIdKeyword    string              `yaml:"workflowIdKeyword"`
 	WorkflowActivitySets map[string][]string `yaml:"workflowActivitySets"`
 	OwnerID              string              `yaml:"-"`
-}, environment, username, tempDir, finalLogFileName string) error {
+}, forceAllActivities bool, environment, username, tempDir, finalLogFileName string) error {
 	if !temporalConfig.Enabled {
 		logger.Debug("Temporal workflow collection is disabled")
 		return nil
@@ -3773,19 +3831,21 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		// A configured list containing "ALL" (case-insensitive) collects every activity
 		// discovered in the workflow's event history instead of naming each one.
 		activityNames, matchedKey := resolveActivitySetForWorkflow(workflowID, temporalConfig.WorkflowActivitySets)
-		usingAll := false
-		for _, n := range activityNames {
-			if strings.EqualFold(strings.TrimSpace(n), "ALL") {
-				usingAll = true
-				break
+		usingAll := forceAllActivities
+		if !usingAll {
+			for _, n := range activityNames {
+				if strings.EqualFold(strings.TrimSpace(n), "ALL") {
+					usingAll = true
+					break
+				}
 			}
 		}
 		if usingAll {
 			activityNames = nil
 		}
 		if len(activityNames) == 0 {
-			// No configured activity set matched (or "ALL" was specified) — fall back to
-			// all activities discovered in the history
+			// No configured activity set matched (or "ALL"/--temporal --all was specified) —
+			// fall back to all activities discovered in the history
 			seen := make(map[string]bool)
 			for _, a := range discoveredActivities {
 				if a.Name != "" && !seen[a.Name] {
@@ -3793,7 +3853,9 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 					activityNames = append(activityNames, a.Name)
 				}
 			}
-			if usingAll {
+			if forceAllActivities {
+				logger.Info("  --temporal --all: collecting all %d discovered activities for workflow %s", len(activityNames), workflowID)
+			} else if usingAll {
 				logger.Info("  workflowActivitySets['%s'] = ALL — collecting all %d discovered activities for workflow %s", matchedKey, len(activityNames), workflowID)
 			} else if len(activityNames) > 0 {
 				logger.Warn("  No workflowActivitySets entry matched workflow ID '%s' — falling back to %d discovered activities", workflowID, len(activityNames))
@@ -10471,6 +10533,7 @@ func main() {
 	modeVersion := flag.Bool("version", false, "Collect only application version information")
 	modeDeviceLogs := flag.Bool("device-logs", false, "Collect only network device logs and diagnostics")
 	modeDatabase := flag.Bool("database", false, "Collect only database query results")
+	modeTemporal := flag.Bool("temporal", false, "Collect only Temporal workflow + schedule data (nothing else). Combine with --all to force collecting ALL activities for every workflow (ignores workflowActivitySets matching); without --all, activities follow workflowActivitySets configured in config.yaml")
 
 	// Log collection configuration flags
 	logFileName := flag.String("log-name", "", "Name for the log collection (without extension)")
@@ -10504,6 +10567,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n")
 		fmt.Fprintf(os.Stderr, "  --device-logs      Collect only network device logs and diagnostics\n")
 		fmt.Fprintf(os.Stderr, "  --database         Collect only database query results\n")
+		fmt.Fprintf(os.Stderr, "  --temporal         Collect only Temporal workflow + schedule data (add --all for ALL activities)\n")
 		fmt.Fprintf(os.Stderr, "  --analyze <path>   Analyze local log files/directory (no SSH required)\n")
 		fmt.Fprintf(os.Stderr, "  --analyze-ai <path> AI-powered root cause analysis (launches GUI)\n")
 		fmt.Fprintf(os.Stderr, "  --gui              Launch web-based GUI control panel\n\n")
@@ -10543,7 +10607,9 @@ func main() {
 
 	// Determine operation mode
 	modeCount := 0
-	if *modeAll {
+	// --all combined with --temporal is a modifier ("collect ALL activities"), not a
+	// separate mode, so it doesn't count as a conflicting mode in that combination.
+	if *modeAll && !*modeTemporal {
 		modeCount++
 	}
 	if *modeLogs {
@@ -10564,10 +10630,13 @@ func main() {
 	if *analyzeDir != "" {
 		modeCount++
 	}
+	if *modeTemporal {
+		modeCount++
+	}
 
 	if modeCount > 1 {
 		fmt.Fprintln(os.Stderr, "Error: Only one operation mode can be specified at a time")
-		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs, --database, --analyze")
+		fmt.Fprintln(os.Stderr, "Choose one of: --all, --logs-only, --sys-info, --version, --device-logs, --database, --analyze, --temporal")
 		os.Exit(1)
 	}
 
@@ -10590,7 +10659,17 @@ func main() {
 	var collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase bool
 	var selectedMode string
 
-	if *modeAll {
+	if *modeTemporal {
+		// --temporal mode: collect only Temporal workflow + schedule data, nothing else.
+		// Checked before --all so "--temporal --all" means "collect ALL activities for
+		// every workflow" rather than triggering the full --all collection.
+		collectLogs = false
+		collectInfo = false
+		collectAppVersions = false
+		collectDeviceLogs = false
+		collectDatabase = false
+		selectedMode = "temporal"
+	} else if *modeAll {
 		// --all mode: override config and collect everything
 		collectLogs = true
 		collectInfo = true
@@ -11032,7 +11111,7 @@ func main() {
 	}
 
 	// Check if any operations are requested before attempting connections
-	hasOperations := collectLogs || collectInfo || collectAppVersions || collectDeviceLogs || collectDatabase || *listOnly
+	hasOperations := collectLogs || collectInfo || collectAppVersions || collectDeviceLogs || collectDatabase || *listOnly || selectedMode == "temporal"
 
 	if !hasOperations {
 		fmt.Println("No operations requested.")
@@ -11050,11 +11129,16 @@ func main() {
 		return
 	}
 
-	// Print pre-flight summary of what will be collected
-	hasWork := printCollectionSummary(selectedMode, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, *listOnly, config, logger)
-	if !hasWork {
-		// No actual work to do - exit without connecting
-		return
+	// Print pre-flight summary of what will be collected.
+	// --temporal mode doesn't map to any of the collectX booleans (it's not part of the
+	// normal log-collection pipeline), so it's exempted from this generic summary/gate —
+	// its own block below logs what it's about to do and validates config itself.
+	if selectedMode != "temporal" {
+		hasWork := printCollectionSummary(selectedMode, collectLogs, collectInfo, collectAppVersions, collectDeviceLogs, collectDatabase, *listOnly, config, logger)
+		if !hasWork {
+			// No actual work to do - exit without connecting
+			return
+		}
 	}
 
 	// Determine if bastion/AWS connection is needed
@@ -11062,7 +11146,7 @@ func main() {
 	// UNLESS dynamic device detection is enabled (needs DB query via AWS)
 	// or env_login_id is set (needs accountdb query to resolve ownerID)
 	// Note: --device-logs standalone mode always uses config.yaml devices (handled before this point)
-	needsAWSConnection := collectLogs || collectInfo || collectAppVersions || collectDatabase || *listOnly
+	needsAWSConnection := collectLogs || collectInfo || collectAppVersions || collectDatabase || *listOnly || selectedMode == "temporal"
 	if selectedMode != "device-logs" && collectDeviceLogs && config.LogCollection.DynamicDeviceDetection.Enabled && (config.OwnerID != "" || config.EnvLoginID != "") {
 		needsAWSConnection = true
 	}
@@ -11331,6 +11415,85 @@ func main() {
 								logger.Info("Deleted compressed archive after JIRA upload: %s", archivePath)
 							}
 						}
+					}
+				}
+			}
+			return
+		}
+
+		// --temporal mode: collect only Temporal workflow + schedule data, nothing else.
+		// --temporal --all forces collecting ALL activities for every workflow, ignoring
+		// workflowActivitySets matching; without --all, workflowActivitySets from
+		// config.yaml is used exactly as in the normal collection pipeline.
+		if selectedMode == "temporal" {
+			logger.Info("Running in temporal mode (Temporal workflow + schedule data only)...")
+
+			forceAllActivities := *modeAll
+			if forceAllActivities {
+				logger.Info("--all specified: collecting ALL activities for every workflow (ignoring workflowActivitySets)")
+			}
+
+			twConfig := config.LogCollection.TemporalWorkflowCollection
+			twConfig.OwnerID = config.OwnerID
+			tsConfig := config.LogCollection.TemporalScheduleCollection
+
+			if !twConfig.Enabled && !tsConfig.Enabled {
+				logger.Warn("Both temporalWorkflowCollection and temporalScheduleCollection are disabled in config.yaml")
+				logger.Info("Please enable at least one of them to use --temporal")
+				return
+			}
+
+			tempDir := "temporal_temp"
+			finalLogFileName := fmt.Sprintf("temporal_%s", config.archiveTimestamp)
+
+			if twConfig.Enabled {
+				if err := collectTemporalWorkflowInfo(awsClient, twConfig, forceAllActivities, config.Environment, config.Username, tempDir, finalLogFileName); err != nil {
+					logger.Error("Temporal workflow collection failed: %v", err)
+				}
+			} else {
+				logger.Warn("Temporal workflow collection is disabled in config.yaml (temporalWorkflowCollection.enabled: false)")
+			}
+
+			if tsConfig.Enabled {
+				if err := collectTemporalScheduleInfo(awsClient, tsConfig, config.Environment, config.Username, tempDir, finalLogFileName); err != nil {
+					logger.Error("Temporal schedule collection failed: %v", err)
+				}
+			} else {
+				logger.Warn("Temporal schedule collection is disabled in config.yaml (temporalScheduleCollection.enabled: false)")
+			}
+
+			connParams := &ConnectionParams{
+				BastionClient:     bastionClient,
+				BastionUsername:   *username,
+				BastionPassword:   *password,
+				BastionHost:       *bastionHost,
+				BastionPort:       *bastionPort,
+				AWSHost:           *awsHost,
+				KeyPath:           *keyPath,
+				PreferredUsername: *awsUsername,
+			}
+
+			temporalArchivePath, archErr := archiveAndDownloadRemoteDir(awsClient, tempDir, finalLogFileName, *userID, *outputDir, *autoRetry, *numChunks, downloadMethod, connParams, logger)
+			if archErr != nil {
+				logger.Error("Failed to download temporal data archive: %v", archErr)
+				return
+			}
+			logger.Info("Temporal data collection completed successfully!")
+			logger.Info("Archive saved to: %s", temporalArchivePath)
+
+			// Attach to JIRA if requested
+			if *jiraIssueID != "" && temporalArchivePath != "" {
+				logger.Info("")
+				if !config.Jira.AttachmentEnabled {
+					logger.Warn("JIRA attachment feature is disabled in config.yaml (jira.attachmentEnabled: false)")
+				} else if config.Jira.Email == "" {
+					logger.Warn("JIRA email not configured in config.yaml")
+					logger.Info("Please configure your JIRA email in config.yaml to use the attachment feature")
+					logger.Info("API token can be provided via: environment variable (JIRA_API_TOKEN), Windows Credential Manager, config.yaml, or interactive prompt")
+				} else {
+					attachmentFiles := []string{temporalArchivePath}
+					if err := attachFilesToMultipleJiraIssues(config.Jira, *jiraIssueID, attachmentFiles, logger); err != nil {
+						logger.Error("Failed to attach files to JIRA issue %s: %v", *jiraIssueID, err)
 					}
 				}
 			}

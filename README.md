@@ -176,6 +176,7 @@ Reads `config.yaml` and runs whichever sections have `enabled: true`:
 | `--version` | App version info only | Yes |
 | `--database` | Database queries only | Yes |
 | `--device-logs` | Network device logs only | **No** |
+| `--temporal` | Temporal workflow + schedule data only (nothing else). Workflow count/selection (`numberOfWorkflows`, `workflowIdKeyword`, `workflowIdPrefix`, `filterByOwnerID`) always comes from config.yaml, with or without `--all`. Add `--all` to force collecting ALL activities for every workflow, ignoring `workflowActivitySets`; without `--all`, activities follow `workflowActivitySets` from config.yaml | Yes |
 | `--analyze <path>` | Analyze local log files/directory | **No** |
 | `--analyze-ai <path>` | AI root-cause analysis (launches GUI on the AI Analysis page) | **No** |
 | `--gui` | Launch web-based GUI control panel (use `--gui-port` for a custom port) | **No** |
@@ -191,6 +192,12 @@ Reads `config.yaml` and runs whichever sections have `enabled: true`:
 
 # Database queries only
 ./logcollector --database
+
+# Temporal workflow + schedule data only, using workflowActivitySets from config.yaml
+./logcollector --temporal
+
+# Temporal only, but collect ALL activities for every workflow (ignores workflowActivitySets)
+./logcollector --temporal --all
 
 # Custom output directory
 ./logcollector --all --outdir C:\MyLogs
@@ -997,9 +1004,10 @@ export JIRA_API_TOKEN="atatt3xFfGF0abc123..."
 | `--version` | | Collect only app version info |
 | `--device-logs` | | Collect only network device logs |
 | `--database` | | Collect only database query results |
+| `--temporal` | | Collect only Temporal workflow + schedule data. Workflow count/selection always follows config.yaml (`numberOfWorkflows`, `workflowIdKeyword`, etc.) regardless of `--all`. Add `--all` to force ALL activities (ignores `workflowActivitySets`) |
 | `--analyze` | | Analyze local log files/directory (no SSH required) |
 | `--time-duration` | config | Time window for logs (`15m`, `1h`, `2h`, `0` to disable) |
-| `--jira` | | JIRA issue ID to attach results (e.g., `XCP-12345`) |
+| `--jira` | | JIRA issue ID(s) to attach results to (e.g., `XCP-12345` or `XCP-1234,XCP-2345`) |
 | `--outdir` | config | Override output directory |
 | `--list` | | List available log archives without downloading |
 | `--interactive` | | Interactive file selection mode |

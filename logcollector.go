@@ -39,7 +39,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.5.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.6.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -559,6 +559,22 @@ type PodFileCollection struct {
 	MatchPodName bool     `yaml:"matchPodName"` // Only collect files where filename starts with pod name
 }
 
+// ZtfOnboardWorkflowConfig configures collection of ZTF (Zero-Touch onboarding) Temporal workflows,
+// whose workflow IDs follow the shape: ztf-onboard-<serial>-<ownerID>-<hash>, e.g.
+// "ztf-onboard-JA142040G-00471-1029-2817cb" (serial "JA142040G-00471", ownerID "1029").
+// Note the serial number itself may contain dashes, so it cannot be split out positionally —
+// matching is done via a "-<serial>-" substring search instead (see filterWorkflowIDsBySerialNumbers).
+type ZtfOnboardWorkflowConfig struct {
+	Enabled           bool   `yaml:"enabled"`           // Enable ZTF onboarding workflow collection
+	WorkflowIdPrefix  string `yaml:"workflowIdPrefix"`  // Workflow ID prefix (default: "ztf-onboard-")
+	SerialNumbers     string `yaml:"serialNumbers"`     // Comma-separated device serial numbers to filter to; empty = use numberOfWorkflows fallback
+	NumberOfWorkflows int    `yaml:"numberOfWorkflows"` // Used only when serialNumbers is empty — collects the most recent N matching workflows (1-20)
+	Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
+	KubeNamespace     string `yaml:"kubeNamespace"`     // Kubernetes namespace hosting the temporal-admintools pod (default: common)
+	FilterByOwnerID   bool   `yaml:"filterByOwnerID"`   // Filter workflows by resolved ownerID via temporal --query 'OwnerId="..."'
+	OwnerID           string `yaml:"-"`                 // Resolved ownerID injected at runtime (not from yaml)
+}
+
 // Default log collection sources matching the shell script
 var defaultLogSources = []PodLogSource{
 	// NVO namespace logs
@@ -827,7 +843,8 @@ type Config struct {
 			NumberOfSchedules int    `yaml:"numberOfSchedules"` // Number of schedules to collect (1-20)
 			Namespace         string `yaml:"namespace"`         // Temporal namespace (default: configuration)
 		} `yaml:"temporalScheduleCollection"`
-		LogAnalysis struct {
+		ZtfOnboardWorkflowCollection ZtfOnboardWorkflowConfig `yaml:"ztfOnboardWorkflowCollection"` // ZTF onboarding workflow collection (ztf-onboard-<serial>-<ownerID>-<hash>)
+		LogAnalysis                  struct {
 			Enabled         bool     `yaml:"enabled"`         // Enable automatic log analysis
 			OutputFile      string   `yaml:"outputFile"`      // Output file name for analysis report
 			ErrorPatterns   []string `yaml:"errorPatterns"`   // Patterns to search for (case-insensitive)
@@ -1000,6 +1017,15 @@ func printCollectionSummary(mode string, collectLogs, collectInfo, collectAppVer
 		if config.LogCollection.DefaultEP1Logs && config.LogCollection.TemporalScheduleCollection.Enabled {
 			logger.Info("    - Temporal schedules: %d schedules",
 				config.LogCollection.TemporalScheduleCollection.NumberOfSchedules)
+		}
+		if config.LogCollection.DefaultEP1Logs && config.LogCollection.ZtfOnboardWorkflowCollection.Enabled {
+			if config.LogCollection.ZtfOnboardWorkflowCollection.SerialNumbers != "" {
+				logger.Info("    - ZTF onboarding workflows: serial number(s) %s",
+					config.LogCollection.ZtfOnboardWorkflowCollection.SerialNumbers)
+			} else {
+				logger.Info("    - ZTF onboarding workflows: most recent %d workflow(s)",
+					config.LogCollection.ZtfOnboardWorkflowCollection.NumberOfWorkflows)
+			}
 		}
 		// Pod file collection - show defaults when defaultEP1Logs=true
 		if config.LogCollection.PodFileCollection.Enabled {
@@ -1383,7 +1409,7 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 	Enabled           bool   `yaml:"enabled"`
 	NumberOfSchedules int    `yaml:"numberOfSchedules"`
 	Namespace         string `yaml:"namespace"`
-}, podFileCollectionConfig struct {
+}, ztfOnboardConfig ZtfOnboardWorkflowConfig, podFileCollectionConfig struct {
 	Enabled     bool                `yaml:"enabled"`
 	Collections []PodFileCollection `yaml:"collections"`
 }) (string, error) {
@@ -1683,6 +1709,17 @@ func collectKubernetesLogs(awsClient *ssh.Client, logFileName, userID, tempDir s
 		}
 	} else if !defaultEP1Logs && temporalConfig.Enabled {
 		logger.Info("Temporal workflow collection skipped (defaultEP1Logs=false)")
+	}
+
+	// Collect ZTF onboarding workflow information before archiving (if enabled and defaultEP1Logs is true)
+	if defaultEP1Logs && ztfOnboardConfig.Enabled {
+		err = collectZtfOnboardWorkflows(awsClient, ztfOnboardConfig, temporalConfig.WorkflowActivitySets, false, tempDir, finalLogFileName)
+		if err != nil {
+			logger.Warn("ZTF onboarding workflow collection failed: %v", err)
+			// Don't return here - continue with archive creation
+		}
+	} else if !defaultEP1Logs && ztfOnboardConfig.Enabled {
+		logger.Info("ZTF onboarding workflow collection skipped (defaultEP1Logs=false)")
 	}
 
 	// Collect Temporal schedule information before archiving (if enabled and defaultEP1Logs is true)
@@ -3755,9 +3792,23 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	}
 
 	// Step 4: For each workflow, collect detailed information.
-	// Instead of issuing one remote `kubectl exec` per field (input/output/activities/etc,
-	// which was fragile due to nested shell quoting and repeated round-trips), we fetch the
-	// full event history JSON once and decode everything locally.
+	if err := collectWorkflowDetails(awsClient, adminPod, kubeNamespace, temporalNamespace, workflowIDs, temporalConfig.WorkflowActivitySets, forceAllActivities, temporalOutputDir); err != nil {
+		return err
+	}
+
+	logger.Info("Temporal workflow collection completed: %d workflow(s) collected", len(workflowIDs))
+	logger.Info("Temporal data saved to remote directory: %s", temporalOutputDir)
+
+	return nil
+}
+
+// collectWorkflowDetails fetches and writes detailed information (input/output/activities/detailed
+// history) for each given workflow ID. Instead of issuing one remote `kubectl exec` per field
+// (input/output/activities/etc, which was fragile due to nested shell quoting and repeated
+// round-trips), it fetches the full event history JSON once per workflow and decodes everything
+// locally. Shared by collectTemporalWorkflowInfo (deploy-site/deploy-device style workflows) and
+// collectZtfOnboardWorkflows (ztf-onboard-<serial>-<ownerID>-<hash> workflows).
+func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temporalNamespace string, workflowIDs []string, workflowActivitySets map[string][]string, forceAllActivities bool, temporalOutputDir string) error {
 	for i, workflowID := range workflowIDs {
 		logger.Info("Collecting data for workflow %d/%d: %s", i+1, len(workflowIDs), workflowID)
 
@@ -3830,7 +3881,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		// configured activity, write separate {Activity}_input.txt / _output.txt / _status.txt files.
 		// A configured list containing "ALL" (case-insensitive) collects every activity
 		// discovered in the workflow's event history instead of naming each one.
-		activityNames, matchedKey := resolveActivitySetForWorkflow(workflowID, temporalConfig.WorkflowActivitySets)
+		activityNames, matchedKey := resolveActivitySetForWorkflow(workflowID, workflowActivitySets)
 		usingAll := forceAllActivities
 		if !usingAll {
 			for _, n := range activityNames {
@@ -3969,10 +4020,177 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 		logger.Info("  Saved detailed workflow history to: %s", detailedOutputFile)
 	}
 
-	logger.Info("Temporal workflow collection completed: %d workflow(s) collected", len(workflowIDs))
-	logger.Info("Temporal data saved to remote directory: %s", temporalOutputDir)
+	return nil
+}
+
+// collectZtfOnboardWorkflows collects Temporal ZTF (Zero-Touch onboarding) workflow data.
+// Workflow IDs follow the shape ztf-onboard-<serial>-<ownerID>-<hash>, e.g.
+// "ztf-onboard-JA142040G-00471-1029-2817cb". If ztfConfig.SerialNumbers is set (comma-separated),
+// only workflows for those specific serials are collected (multiple serials = multiple filters
+// applied, OR'd together). If empty, falls back to the most recent NumberOfWorkflows matching
+// workflows (newest-first, same convention as temporalWorkflowCollection.numberOfWorkflows).
+func collectZtfOnboardWorkflows(awsClient *ssh.Client, ztfConfig ZtfOnboardWorkflowConfig, workflowActivitySets map[string][]string, forceAllActivities bool, tempDir, finalLogFileName string) error {
+	if !ztfConfig.Enabled {
+		logger.Debug("ZTF onboarding workflow collection is disabled")
+		return nil
+	}
+
+	logger.Info("%s", strings.Repeat("=", 70))
+	logger.Info("  ZTF ONBOARDING WORKFLOWS - Collecting onboarding workflow data")
+	logger.Info("%s", strings.Repeat("=", 70))
+
+	workflowIdPrefix := ztfConfig.WorkflowIdPrefix
+	if workflowIdPrefix == "" {
+		workflowIdPrefix = "ztf-onboard-"
+	}
+
+	temporalNamespace := ztfConfig.Namespace
+	if temporalNamespace == "" {
+		temporalNamespace = "configuration"
+	}
+
+	kubeNamespace := ztfConfig.KubeNamespace
+	if kubeNamespace == "" {
+		kubeNamespace = "common"
+	}
+
+	numberOfWorkflows := ztfConfig.NumberOfWorkflows
+	if numberOfWorkflows <= 0 {
+		numberOfWorkflows = 3
+	}
+	if numberOfWorkflows > 20 {
+		numberOfWorkflows = 20
+	}
+
+	// Parse comma-separated serial numbers (trimmed, blanks dropped)
+	var serialNumbers []string
+	for _, s := range strings.Split(ztfConfig.SerialNumbers, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			serialNumbers = append(serialNumbers, s)
+		}
+	}
+
+	// Create the Temporal output directory on the remote server inside the log collection directory
+	logDir := fmt.Sprintf("%s/%s", tempDir, finalLogFileName)
+	temporalOutputDir := fmt.Sprintf("%s/Temporal", logDir)
+
+	dirSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for ztf onboard directory: %v", err)
+	}
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", temporalOutputDir)
+	mkdirErr := executeCommandAsRoot(dirSession, mkdirCmd)
+	dirSession.Close()
+	if mkdirErr != nil {
+		return fmt.Errorf("failed to create temporal directory: %v", mkdirErr)
+	}
+
+	// Discover the temporal-admintools pod
+	logger.Info("Discovering Temporal admin pod in '%s' namespace...", kubeNamespace)
+	podSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for pod discovery: %v", err)
+	}
+	podCmd := fmt.Sprintf("kubectl get pods -n %s --no-headers | grep temporal-admintools | grep Running | head -1 | awk '{print \\$1}'", kubeNamespace)
+	podOutput, err := podSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", podCmd))
+	podSession.Close()
+	if err != nil {
+		logger.Debug("Pod discovery command output: %s", strings.TrimSpace(string(podOutput)))
+		return fmt.Errorf("failed to discover temporal admin pod: %v", err)
+	}
+	adminPod := strings.TrimSpace(string(podOutput))
+	if adminPod == "" {
+		return fmt.Errorf("no running temporal-admintools pod found in '%s' namespace", kubeNamespace)
+	}
+	logger.Info("Found Temporal admin pod: %s", adminPod)
+
+	// Optional ownerID filter — same server-side query used by temporalWorkflowCollection
+	ownerQueryFlag := ""
+	if ztfConfig.FilterByOwnerID && ztfConfig.OwnerID != "" {
+		ownerQueryFlag = fmt.Sprintf(` --query 'OwnerId=\"%s\"'`, ztfConfig.OwnerID)
+		logger.Info("Filtering ZTF onboarding workflows by ownerID: %s", ztfConfig.OwnerID)
+	} else if ztfConfig.FilterByOwnerID {
+		logger.Warn("filterByOwnerID is enabled but no ownerID was resolved — listing all workflows")
+	}
+
+	listSession, err := awsClient.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session for ztf onboard workflow listing: %v", err)
+	}
+	listCmd := fmt.Sprintf("kubectl exec %s -n %s -- temporal workflow list --namespace %s%s 2>/dev/null",
+		adminPod, kubeNamespace, temporalNamespace, ownerQueryFlag)
+	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
+	listSession.Close()
+	if err != nil {
+		return fmt.Errorf("failed to list temporal workflows: %v\nOutput: %s", err, string(listOutput))
+	}
+	listOutputStr := string(listOutput)
+
+	// Extract all workflow IDs matching the ztf-onboard prefix first (no count cutoff yet —
+	// the cutoff/serial filtering below decides the final set).
+	allMatchingIDs := extractWorkflowIDs(listOutputStr, workflowIdPrefix, "", 1000)
+
+	var selectedIDs []string
+	var filterDescription string
+	if len(serialNumbers) > 0 {
+		logger.Info("Filtering ZTF onboarding workflows to serial number(s): %s", strings.Join(serialNumbers, ", "))
+		selectedIDs = filterWorkflowIDsBySerialNumbers(allMatchingIDs, serialNumbers)
+		filterDescription = "serialNumbers=" + strings.Join(serialNumbers, ",")
+	} else {
+		logger.Info("No serialNumbers configured — collecting the most recent %d ZTF onboarding workflow(s)", numberOfWorkflows)
+		if len(allMatchingIDs) > numberOfWorkflows {
+			selectedIDs = allMatchingIDs[:numberOfWorkflows]
+		} else {
+			selectedIDs = allMatchingIDs
+		}
+		filterDescription = fmt.Sprintf("most recent %d (no serialNumbers configured)", numberOfWorkflows)
+	}
+
+	writeFileToRemote(awsClient, fmt.Sprintf("%s/ztf_onboard_workflow_list.txt", temporalOutputDir),
+		fmt.Sprintf("# ZTF Onboarding Workflow List\n# Namespace: %s\n# Collected: %s\n# Prefix: %s\n# Filter: %s\n%s\n\n%s",
+			temporalNamespace, time.Now().Format("2006-01-02 15:04:05"), workflowIdPrefix, filterDescription,
+			strings.Repeat("-", 60), listOutputStr))
+
+	if len(selectedIDs) == 0 {
+		logger.Warn("No ZTF onboarding workflows found matching criteria")
+		writeFileToRemote(awsClient, fmt.Sprintf("%s/no_ztf_onboard_workflows_found.txt", temporalOutputDir),
+			fmt.Sprintf("No ZTF onboarding workflows found.\nPrefix: %s\nSerial numbers: %s\nNamespace: %s\n",
+				workflowIdPrefix, ztfConfig.SerialNumbers, temporalNamespace))
+		return nil
+	}
+
+	logger.Info("Found %d ZTF onboarding workflow(s) to collect information for", len(selectedIDs))
+	for i, wfID := range selectedIDs {
+		logger.Info("  %d. %s", i+1, wfID)
+	}
+
+	if err := collectWorkflowDetails(awsClient, adminPod, kubeNamespace, temporalNamespace, selectedIDs, workflowActivitySets, forceAllActivities, temporalOutputDir); err != nil {
+		return err
+	}
+
+	logger.Info("ZTF onboarding workflow collection completed: %d workflow(s) collected", len(selectedIDs))
+	logger.Info("ZTF onboarding data saved to remote directory: %s", temporalOutputDir)
 
 	return nil
+}
+
+// filterWorkflowIDsBySerialNumbers keeps workflow IDs containing "-<serial>-" (case-insensitive)
+// for ANY of the given serial numbers. Matching on the dash-bounded substring (rather than
+// positional splitting) correctly handles serial numbers that themselves contain dashes
+// (e.g. "JA142040G-00471" in "ztf-onboard-JA142040G-00471-1029-2817cb").
+func filterWorkflowIDsBySerialNumbers(workflowIDs []string, serialNumbers []string) []string {
+	var filtered []string
+	for _, id := range workflowIDs {
+		lowerID := strings.ToLower(id)
+		for _, serial := range serialNumbers {
+			needle := "-" + strings.ToLower(serial) + "-"
+			if strings.Contains(lowerID, needle) {
+				filtered = append(filtered, id)
+				break
+			}
+		}
+	}
+	return filtered
 }
 
 // executeTemporalCommand runs a command via SSH and returns the output string
@@ -11436,9 +11654,11 @@ func main() {
 			twConfig := config.LogCollection.TemporalWorkflowCollection
 			twConfig.OwnerID = config.OwnerID
 			tsConfig := config.LogCollection.TemporalScheduleCollection
+			ztfConfig := config.LogCollection.ZtfOnboardWorkflowCollection
+			ztfConfig.OwnerID = config.OwnerID
 
-			if !twConfig.Enabled && !tsConfig.Enabled {
-				logger.Warn("Both temporalWorkflowCollection and temporalScheduleCollection are disabled in config.yaml")
+			if !twConfig.Enabled && !tsConfig.Enabled && !ztfConfig.Enabled {
+				logger.Warn("temporalWorkflowCollection, temporalScheduleCollection, and ztfOnboardWorkflowCollection are all disabled in config.yaml")
 				logger.Info("Please enable at least one of them to use --temporal")
 				return
 			}
@@ -11460,6 +11680,14 @@ func main() {
 				}
 			} else {
 				logger.Warn("Temporal schedule collection is disabled in config.yaml (temporalScheduleCollection.enabled: false)")
+			}
+
+			if ztfConfig.Enabled {
+				if err := collectZtfOnboardWorkflows(awsClient, ztfConfig, twConfig.WorkflowActivitySets, forceAllActivities, tempDir, finalLogFileName); err != nil {
+					logger.Error("ZTF onboarding workflow collection failed: %v", err)
+				}
+			} else {
+				logger.Warn("ZTF onboarding workflow collection is disabled in config.yaml (ztfOnboardWorkflowCollection.enabled: false)")
 			}
 
 			connParams := &ConnectionParams{
@@ -11588,6 +11816,7 @@ func main() {
 			// Wire the resolved ownerID into temporal workflow collection so it can
 			// filter workflows via: temporal workflow list --query 'OwnerId="<ownerID>"'
 			config.LogCollection.TemporalWorkflowCollection.OwnerID = config.OwnerID
+			config.LogCollection.ZtfOnboardWorkflowCollection.OwnerID = config.OwnerID
 
 			finalArchiveName, err = collectKubernetesLogs(awsClient, *logFileName, *userID, config.LogCollection.TempDir, config.LogCollection.CustomSources, config.LogCollection.UseTimestamp, config.LogCollection.TimestampFormat, config.Environment, config.Username, collectInfo, config.SystemInfo, timeBasedEnabled, timeDurationStr, config.Options.MaxSSHSessions, config.LogCollection.AutoDeleteTempDir, config.LogCollection.DefaultEP1Logs,
 				struct {
@@ -11604,7 +11833,7 @@ func main() {
 					KeyValueFilters:      config.LogCollection.MessageFilter.KeyValueFilters,
 					SpecificStrings:      config.LogCollection.MessageFilter.SpecificStrings,
 				},
-				config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection, config.LogCollection.PodFileCollection)
+				config.LogCollection.TemporalWorkflowCollection, config.LogCollection.TemporalScheduleCollection, config.LogCollection.ZtfOnboardWorkflowCollection, config.LogCollection.PodFileCollection)
 			if err != nil {
 				logger.Error("Failed to collect logs: %v", err)
 				return

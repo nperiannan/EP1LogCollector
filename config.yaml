@@ -237,6 +237,9 @@ logCollection:
         - GetConfiguration
         - ProvisionConfiguration
         - UpdateDeviceDeploymentStatus
+
+      ztf-onboard:
+        - ALL
   
   # ┌─── Temporal Schedules - Collect schedule information ────────────────┐
   # Note: Controlled by defaultEP1Logs setting (above)
@@ -244,7 +247,28 @@ logCollection:
     enabled: true
     numberOfSchedules: 3
     namespace: "configuration"
-  
+
+  # ┌─── ZTF Onboarding Workflows - Collect zero-touch onboarding data ─────┐
+  # Note: Controlled by defaultEP1Logs setting (above)
+  # ZTF onboarding workflow IDs look like: ztf-onboard-<serial>-<ownerID>-<hash>, e.g.
+  #   ztf-onboard-JA142040G-00471-1029-2817cb
+  #               └────serial───┘ │   └hash
+  #                             ownerID
+  # Note the serial number itself may contain dashes, so matching is done on the
+  # dash-bounded substring "-<serial>-" rather than splitting the ID by position.
+  ztfOnboardWorkflowCollection:
+    enabled: true
+    workflowIdPrefix: "ztf-onboard-"     # Fixed prefix identifying these workflows
+    serialNumbers: ""                    # Comma-separated serials, e.g. "JA142040G-00471,JA142041A-00500"
+                                          # Empty = fall back to numberOfWorkflows below (most recent N)
+    numberOfWorkflows: 2                 # Used ONLY when serialNumbers is empty — collects the most
+                                          # recent N matching workflows (1-20)
+    namespace: "configuration"           # Temporal namespace
+    kubeNamespace: "common"              # Kubernetes namespace where the temporal-admintools pod runs
+    filterByOwnerID: true                # Filter workflows by resolved ownerID, same as temporalWorkflowCollection above
+    # Activities are collected via workflowActivitySets above (longest-prefix match on workflow
+    # ID) — see the "ztf-onboard: [ALL]" entry there, which collects every discovered activity.
+
   # ┌─── Pod File Collection - Collect Files from Inside Pods ─────────────┐
   # Note: Built-in collections (cs-configuration, nvo-orchestration-wired/wireless)
   #       are controlled by defaultEP1Logs setting (above)

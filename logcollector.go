@@ -39,7 +39,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.6.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.6.1"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -4104,21 +4104,24 @@ func collectZtfOnboardWorkflows(awsClient *ssh.Client, ztfConfig ZtfOnboardWorkf
 	}
 	logger.Info("Found Temporal admin pod: %s", adminPod)
 
-	// Optional ownerID filter — same server-side query used by temporalWorkflowCollection
-	ownerQueryFlag := ""
+	// ZTF workflows have no OwnerId search attribute in Temporal (unlike deploy workflows),
+	// so a server-side OwnerId query returns zero ZTF results. Filter client-side instead,
+	// using the numeric ownerID embedded as a dash-bounded token in the workflow ID string
+	// (e.g. "-1204-" in "ztf-onboard-JA062313G-00275-1204-ebc4b4").
+	numericOwnerID := ""
 	if ztfConfig.FilterByOwnerID && ztfConfig.OwnerID != "" {
-		ownerQueryFlag = fmt.Sprintf(` --query 'OwnerId=\"%s\"'`, ztfConfig.OwnerID)
-		logger.Info("Filtering ZTF onboarding workflows by ownerID: %s", ztfConfig.OwnerID)
+		numericOwnerID = ztfConfig.OwnerID
+		logger.Info("Filtering ZTF onboarding workflows by ownerID: %s", numericOwnerID)
 	} else if ztfConfig.FilterByOwnerID {
-		logger.Warn("filterByOwnerID is enabled but no ownerID was resolved — listing all workflows")
+		logger.Warn("filterByOwnerID is enabled but no ownerID was resolved — collecting all ZTF workflows")
 	}
 
 	listSession, err := awsClient.NewSession()
 	if err != nil {
 		return fmt.Errorf("failed to create session for ztf onboard workflow listing: %v", err)
 	}
-	listCmd := fmt.Sprintf("kubectl exec %s -n %s -- temporal workflow list --namespace %s%s 2>/dev/null",
-		adminPod, kubeNamespace, temporalNamespace, ownerQueryFlag)
+	listCmd := fmt.Sprintf("kubectl exec %s -n %s -- temporal workflow list --namespace %s 2>/dev/null",
+		adminPod, kubeNamespace, temporalNamespace)
 	listOutput, err := listSession.CombinedOutput(fmt.Sprintf("sudo su - -c \"%s\"", listCmd))
 	listSession.Close()
 	if err != nil {
@@ -4129,6 +4132,17 @@ func collectZtfOnboardWorkflows(awsClient *ssh.Client, ztfConfig ZtfOnboardWorkf
 	// Extract all workflow IDs matching the ztf-onboard prefix first (no count cutoff yet —
 	// the cutoff/serial filtering below decides the final set).
 	allMatchingIDs := extractWorkflowIDs(listOutputStr, workflowIdPrefix, "", 1000)
+	if numericOwnerID != "" {
+		ownerToken := "-" + numericOwnerID + "-"
+		var filtered []string
+		for _, id := range allMatchingIDs {
+			if strings.Contains(id, ownerToken) {
+				filtered = append(filtered, id)
+			}
+		}
+		logger.Info("Owner ID filter (%s): %d of %d ZTF workflow(s) match", numericOwnerID, len(filtered), len(allMatchingIDs))
+		allMatchingIDs = filtered
+	}
 
 	var selectedIDs []string
 	var filterDescription string

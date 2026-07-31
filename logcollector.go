@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"io/ioutil"
 	"mime/multipart"
@@ -39,7 +40,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.6.1"   // Semantic version (set via -ldflags)
+	appVersion  = "2.7.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -861,6 +862,7 @@ type Config struct {
 				Patterns []string `yaml:"patterns"` // Patterns belonging to this group
 				Severity string   `yaml:"severity"` // Severity for this group
 			} `yaml:"errorGroups"` // Semantic error grouping
+			TemporalAnalysis TemporalAnalysisConfig `yaml:"temporalAnalysis"` // Temporal activity output status validation
 		} `yaml:"logAnalysis"`
 		MessageFilter struct {
 			Enabled              bool `yaml:"enabled"`              // Enable/disable post-download message filtering
@@ -3792,7 +3794,7 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 	}
 
 	// Step 4: For each workflow, collect detailed information.
-	if err := collectWorkflowDetails(awsClient, adminPod, kubeNamespace, temporalNamespace, workflowIDs, temporalConfig.WorkflowActivitySets, forceAllActivities, temporalOutputDir); err != nil {
+	if err := collectWorkflowDetails(awsClient, adminPod, kubeNamespace, temporalNamespace, workflowIDs, temporalConfig.WorkflowActivitySets, forceAllActivities, temporalOutputDir, "deploy_workflows"); err != nil {
 		return err
 	}
 
@@ -3808,7 +3810,13 @@ func collectTemporalWorkflowInfo(awsClient *ssh.Client, temporalConfig struct {
 // round-trips), it fetches the full event history JSON once per workflow and decodes everything
 // locally. Shared by collectTemporalWorkflowInfo (deploy-site/deploy-device style workflows) and
 // collectZtfOnboardWorkflows (ztf-onboard-<serial>-<ownerID>-<hash> workflows).
-func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temporalNamespace string, workflowIDs []string, workflowActivitySets map[string][]string, forceAllActivities bool, temporalOutputDir string) error {
+func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temporalNamespace string, workflowIDs []string, workflowActivitySets map[string][]string, forceAllActivities bool, temporalOutputDir, reportLabel string) error {
+	var flaggedActivities []TemporalActivityIssue
+	var missingActivities []TemporalMissingActivity
+	statusesChecked := 0
+	// Same success set the analytics report uses, so the two reports cannot disagree.
+	successStatuses := globalTemporalAnalysisConfig.successStatusSet()
+
 	for i, workflowID := range workflowIDs {
 		logger.Info("Collecting data for workflow %d/%d: %s", i+1, len(workflowIDs), workflowID)
 
@@ -3860,7 +3868,15 @@ func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temp
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
 		wfContent.WriteString("  WORKFLOW OUTPUT\n")
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
-		wfContent.WriteString(extractWorkflowCompletedOutput(history.Events) + "\n\n")
+		workflowOutput := extractWorkflowCompletedOutput(history.Events)
+		wfContent.WriteString(workflowOutput + "\n\n")
+
+		resultIssues, resultChecked := extractWorkflowResultFailures(workflowOutput, successStatuses)
+		statusesChecked += resultChecked
+		for i := range resultIssues {
+			resultIssues[i].WorkflowID = workflowID
+		}
+		flaggedActivities = append(flaggedActivities, resultIssues...)
 
 		// 4c: List all activities discovered in the history (informational overview)
 		wfContent.WriteString("=" + strings.Repeat("=", 79) + "\n")
@@ -3928,6 +3944,7 @@ func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temp
 				if len(occurrences) == 0 {
 					logger.Warn("  Activity '%s' not found in workflow %s history", activityName, workflowID)
 					summaryLines = append(summaryLines, fmt.Sprintf("%s | NOT_FOUND", activityName))
+					missingActivities = append(missingActivities, TemporalMissingActivity{WorkflowID: workflowID, Activity: activityName})
 					continue
 				}
 
@@ -3969,11 +3986,30 @@ func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temp
 						statusSummary = strings.Join(eventTypes, ", ")
 					}
 
+					// Flag activity outputs reporting a non-success status (e.g. ProvisionConfiguration
+					// returning anything other than COMPLETED_SUCCESS).
+					payloadIssues, checked := extractActivityStatusFailures(outputText, successStatuses)
+					statusesChecked += checked
+					for i := range payloadIssues {
+						payloadIssues[i].WorkflowID = workflowID
+						payloadIssues[i].Activity = activityName
+						payloadIssues[i].ScheduledID = sid
+						payloadIssues[i].Attempt = attempt
+						logger.Warn("  [FLAGGED] %s", formatTemporalActivityIssue(payloadIssues[i]))
+					}
+					flaggedActivities = append(flaggedActivities, payloadIssues...)
+
 					var statusBuilder strings.Builder
 					statusBuilder.WriteString(fmt.Sprintf("Activity: %s\n", activityName))
 					statusBuilder.WriteString(fmt.Sprintf("Scheduled Event ID: %s\n", sid))
 					statusBuilder.WriteString(fmt.Sprintf("Attempt: %d\n", attempt))
 					statusBuilder.WriteString(fmt.Sprintf("Status: %s\n", statusSummary))
+					for _, pi := range payloadIssues {
+						statusBuilder.WriteString(fmt.Sprintf("Output Status: FLAGGED (%s)\n", pi.Status))
+						if pi.StatusMessage != "" {
+							statusBuilder.WriteString(fmt.Sprintf("Output Status Message: %s\n", pi.StatusMessage))
+						}
+					}
 					if failureText != "" {
 						statusBuilder.WriteString("\nFailure Details:\n")
 						statusBuilder.WriteString(failureText + "\n")
@@ -3989,7 +4025,11 @@ func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temp
 					writeFileToRemote(awsClient, fmt.Sprintf("%s/%s%s_output.txt", activitiesDir, base, suffix), outputText)
 					writeFileToRemote(awsClient, fmt.Sprintf("%s/%s%s_status.txt", activitiesDir, base, suffix), statusBuilder.String())
 
-					summaryLines = append(summaryLines, fmt.Sprintf("%s | sid=%s | attempt=%d | status=%s", activityName, sid, attempt, statusSummary))
+					summaryLine := fmt.Sprintf("%s | sid=%s | attempt=%d | status=%s", activityName, sid, attempt, statusSummary)
+					for _, pi := range payloadIssues {
+						summaryLine += fmt.Sprintf(" | FLAGGED output status=%s", pi.Status)
+					}
+					summaryLines = append(summaryLines, summaryLine)
 				}
 			}
 
@@ -4013,14 +4053,72 @@ func collectWorkflowDetails(awsClient *ssh.Client, adminPod, kubeNamespace, temp
 		detailedContent.WriteString(fmt.Sprintf("# Namespace: %s\n", temporalNamespace))
 		detailedContent.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 		detailedContent.WriteString(fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60)))
-		detailedContent.WriteString(detailedOutput + "\n")
+		detailedContent.WriteString(decodeDetailedHistoryPayloads(detailedOutput) + "\n")
 
 		detailedOutputFile := fmt.Sprintf("%s/%s_detailed.txt", temporalOutputDir, safeWfID)
 		writeFileToRemote(awsClient, detailedOutputFile, detailedContent.String())
 		logger.Info("  Saved detailed workflow history to: %s", detailedOutputFile)
 	}
 
+	writeTemporalActivityStatusReport(awsClient, temporalOutputDir, reportLabel, workflowIDs, flaggedActivities, missingActivities, statusesChecked)
+
 	return nil
+}
+
+// writeTemporalActivityStatusReport prints the flagged-activity verdict to the console and saves
+// the same summary alongside the collected workflow data so it travels with the archive.
+// statusesChecked and missing distinguish a genuine all-clear from "nothing was actually validated".
+func writeTemporalActivityStatusReport(awsClient *ssh.Client, temporalOutputDir, reportLabel string, workflowIDs []string, flagged []TemporalActivityIssue, missing []TemporalMissingActivity, statusesChecked int) {
+	var report strings.Builder
+	report.WriteString("# Temporal Workflow Activity Status Validation\n")
+	report.WriteString(fmt.Sprintf("# Scope: %s\n", reportLabel))
+	report.WriteString(fmt.Sprintf("# Collected: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	report.WriteString(fmt.Sprintf("# Workflows checked: %d\n", len(workflowIDs)))
+	report.WriteString(fmt.Sprintf("# Activity outputs validated: %d\n", statusesChecked))
+	report.WriteString(fmt.Sprintf("# Activities flagged: %d\n", len(flagged)))
+	report.WriteString(fmt.Sprintf("# Activities that never ran: %d\n", len(missing)))
+	report.WriteString(fmt.Sprintf("#%s\n\n", strings.Repeat("-", 60)))
+
+	logger.Info("%s", strings.Repeat("-", 70))
+	switch {
+	case len(flagged) > 0:
+		logger.Warn("  TEMPORAL ANALYSIS (%s): %d of %d checked status value(s) were non-success", reportLabel, len(flagged), statusesChecked)
+		report.WriteString("FLAGGED ACTIVITIES:\n")
+		for _, issue := range flagged {
+			logger.Warn("    - %s", formatTemporalActivityIssue(issue))
+			report.WriteString("  " + formatTemporalActivityIssue(issue) + "\n")
+			report.WriteString(fmt.Sprintf("    scheduledEventId=%s attempt=%d deviceId=%s\n", issue.ScheduledID, issue.Attempt, issue.DeviceID))
+		}
+	case statusesChecked == 0:
+		logger.Warn("  TEMPORAL ANALYSIS (%s): NOT VALIDATED - no collected activity output contained a status field", reportLabel)
+		report.WriteString("NOT VALIDATED: no collected activity output contained a status field.\n")
+		report.WriteString("This is not an all-clear.\n")
+	default:
+		logger.Info("  TEMPORAL ANALYSIS (%s): all %d checked status value(s) were successful", reportLabel, statusesChecked)
+		report.WriteString(fmt.Sprintf("All %d checked status value(s) (activity outputs + workflow results) were successful.\n", statusesChecked))
+	}
+
+	if len(missing) > 0 {
+		order, byActivity := groupMissingByActivity(missing)
+		logger.Warn("  MISSING ACTIVITIES (%s): expected to run, but never started. Their status could NOT be checked.", reportLabel)
+		report.WriteString("\nMISSING ACTIVITIES\n")
+		report.WriteString("These activities were expected to run but never started, so no status was\n")
+		report.WriteString("available to validate. This is NOT the same as a successful activity.\n\n")
+		for _, activity := range order {
+			wfs := byActivity[activity]
+			logger.Warn("    '%s' never ran in %d of %d workflow(s):", activity, len(wfs), len(workflowIDs))
+			report.WriteString(fmt.Sprintf("  '%s' never ran in %d of %d workflow(s):\n", activity, len(wfs), len(workflowIDs)))
+			for i, wf := range wfs {
+				logger.Warn("        %d. %s", i+1, wf)
+				report.WriteString(fmt.Sprintf("      %d. %s\n", i+1, wf))
+			}
+			report.WriteString("\n")
+		}
+	}
+	logger.Info("%s", strings.Repeat("-", 70))
+
+	fileLabel := sanitizeFilename(reportLabel)
+	writeFileToRemote(awsClient, fmt.Sprintf("%s/temporal_activity_status_report_%s.txt", temporalOutputDir, fileLabel), report.String())
 }
 
 // collectZtfOnboardWorkflows collects Temporal ZTF (Zero-Touch onboarding) workflow data.
@@ -4178,7 +4276,7 @@ func collectZtfOnboardWorkflows(awsClient *ssh.Client, ztfConfig ZtfOnboardWorkf
 		logger.Info("  %d. %s", i+1, wfID)
 	}
 
-	if err := collectWorkflowDetails(awsClient, adminPod, kubeNamespace, temporalNamespace, selectedIDs, workflowActivitySets, forceAllActivities, temporalOutputDir); err != nil {
+	if err := collectWorkflowDetails(awsClient, adminPod, kubeNamespace, temporalNamespace, selectedIDs, workflowActivitySets, forceAllActivities, temporalOutputDir, "ztf_onboard"); err != nil {
 		return err
 	}
 
@@ -4242,6 +4340,1220 @@ type activityScheduledRef struct {
 	EventID   string
 	EventType string
 	Name      string
+}
+
+// TemporalActivityIssue flags a Temporal workflow activity whose output payload reported a
+// non-success status (e.g. ProvisionConfiguration returning anything but COMPLETED_SUCCESS).
+type TemporalActivityIssue struct {
+	WorkflowID    string
+	Activity      string
+	ScheduledID   string
+	Attempt       int
+	Status        string
+	StatusMessage string
+	DeviceSerial  string
+	DeviceID      string
+	Source        string // relative file path, populated by the analytics scan
+}
+
+// TemporalAnalysisConfig controls validation of Temporal workflow activity output statuses.
+// Pointer fields distinguish "absent from YAML" (nil, treated as enabled) from an explicit false,
+// so configs written before this block existed keep working unchanged.
+type TemporalAnalysisConfig struct {
+	Enabled                 *bool    `yaml:"enabled"`
+	SuccessStatuses         []string `yaml:"successStatuses"`
+	ReportMissingActivities *bool    `yaml:"reportMissingActivities"`
+	HTMLReport              *bool    `yaml:"htmlReport"`
+	HTMLMaxPayloadKB        int      `yaml:"htmlMaxPayloadKB"`
+}
+
+func (c TemporalAnalysisConfig) isEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+func (c TemporalAnalysisConfig) shouldReportMissing() bool {
+	return c.ReportMissingActivities == nil || *c.ReportMissingActivities
+}
+
+func (c TemporalAnalysisConfig) wantsHTMLReport() bool {
+	return c.HTMLReport == nil || *c.HTMLReport
+}
+
+// htmlPayloadLimitBytes caps how much of each activity payload is embedded in the HTML report.
+func (c TemporalAnalysisConfig) htmlPayloadLimitBytes() int {
+	if c.HTMLMaxPayloadKB > 0 {
+		return c.HTMLMaxPayloadKB * 1024
+	}
+	return 64 * 1024
+}
+
+// globalTemporalAnalysisConfig lets the collection-time status report honour the same
+// successStatuses as the analytics report. It is set once from main() after the config loads;
+// collectWorkflowDetails is reached through collectKubernetesLogs' 20-parameter signature, so
+// threading it positionally would be far more invasive than this. The zero value falls back to
+// the built-in defaults, so an unset value behaves exactly as before.
+var globalTemporalAnalysisConfig TemporalAnalysisConfig
+
+// successStatusSet returns the configured success values lowercased, falling back to the strict
+// default of COMPLETED_SUCCESS only.
+func (c TemporalAnalysisConfig) successStatusSet() map[string]bool {
+	set := make(map[string]bool)
+	for _, s := range c.SuccessStatuses {
+		if t := strings.ToLower(strings.TrimSpace(s)); t != "" {
+			set[t] = true
+		}
+	}
+	if len(set) == 0 {
+		return defaultTemporalSuccessStatuses()
+	}
+	return set
+}
+
+// TemporalAnalysisResult carries activity status validation output to the report writers.
+type TemporalAnalysisResult struct {
+	Enabled         bool
+	Issues          []TemporalActivityIssue
+	Missing         []TemporalMissingActivity
+	StatusesChecked int
+	Flows           []TemporalWorkflowFlow
+}
+
+// TemporalFlowStep is one activity occurrence in a workflow's execution sequence.
+type TemporalFlowStep struct {
+	ScheduledID  int
+	Activity     string
+	Attempt      int
+	EventStatus  string
+	OutputStatus string
+	Flagged      bool
+	NeverRan     bool
+
+	// Why the step was flagged, lifted out of the output payload so the reader does not have to
+	// dig through it. Set by applyIssueFlagsToFlows.
+	StatusMessage string
+	DeviceSerial  string
+
+	// Populated only when the HTML report is enabled, for the hover/copy panels.
+	Input  string
+	Output string
+	Detail string
+}
+
+// TemporalWorkflowFlow is a single workflow's ordered execution sequence, rendered as a flow so
+// it is obvious where execution actually stopped — including activities that never started.
+type TemporalWorkflowFlow struct {
+	WorkflowID string
+	Steps      []TemporalFlowStep
+	Result     string
+	ResultOK   bool
+	HasResult  bool
+}
+
+// parseWorkflowFlowSummary reads an activities summary.txt into ordered flow steps. Lines look
+// like "GetConfiguration | sid=23 | attempt=1 | status=EVENT_TYPE_..." or "Name | NOT_FOUND".
+func parseWorkflowFlowSummary(content string) []TemporalFlowStep {
+	var steps []TemporalFlowStep
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Split(strings.TrimSpace(line), "|")
+		step := TemporalFlowStep{Activity: strings.TrimSpace(fields[0])}
+		if step.Activity == "" {
+			continue
+		}
+		for _, f := range fields[1:] {
+			f = strings.TrimSpace(f)
+			switch {
+			case f == "NOT_FOUND":
+				step.NeverRan = true
+			case strings.HasPrefix(f, "sid="):
+				step.ScheduledID, _ = strconv.Atoi(strings.TrimPrefix(f, "sid="))
+			case strings.HasPrefix(f, "attempt="):
+				step.Attempt, _ = strconv.Atoi(strings.TrimPrefix(f, "attempt="))
+			case strings.HasPrefix(f, "FLAGGED output status="):
+				step.OutputStatus = strings.TrimPrefix(f, "FLAGGED output status=")
+				step.Flagged = true
+			case strings.HasPrefix(f, "status="):
+				step.EventStatus = strings.TrimPrefix(f, "status=")
+			}
+		}
+		steps = append(steps, step)
+	}
+	sort.SliceStable(steps, func(i, j int) bool { return steps[i].ScheduledID < steps[j].ScheduledID })
+	return steps
+}
+
+// summarizeEventStatus reduces the recorded event-type chain to its terminal state, since events
+// are appended in execution order (SCHEDULED, STARTED, COMPLETED).
+func summarizeEventStatus(raw string) string {
+	switch {
+	case raw == "":
+		return "UNKNOWN"
+	case raw == "SCHEDULED_ONLY_OR_NO_STATUS":
+		return "SCHEDULED (never completed)"
+	}
+	parts := strings.Split(raw, ",")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	return strings.TrimPrefix(last, "EVENT_TYPE_ACTIVITY_TASK_")
+}
+
+// renderTemporalWorkflowFlow draws one workflow as an ASCII execution flow. ASCII only, so it
+// survives the Windows console, Jira monospace blocks, and plain-text mail alike.
+func renderTemporalWorkflowFlow(w io.Writer, flow TemporalWorkflowFlow) {
+	fmt.Fprintf(w, "  %s\n", flow.WorkflowID)
+	fmt.Fprintln(w, "    START")
+
+	width := 0
+	for _, s := range flow.Steps {
+		if len(s.Activity) > width {
+			width = len(s.Activity)
+		}
+	}
+
+	ran := 0
+	for _, s := range flow.Steps {
+		if s.NeverRan {
+			continue
+		}
+		// One connector per group, not per activity, so the sequence reads as a solid block.
+		if ran == 0 {
+			fmt.Fprintln(w, "      |")
+		}
+		ran++
+		status := summarizeEventStatus(s.EventStatus)
+		marker := "+->"
+		if s.Flagged || status == "FAILED" || status == "TIMED_OUT" {
+			marker = "!->"
+		}
+		line := fmt.Sprintf("      %s [%3d] %-*s  %s", marker, s.ScheduledID, width, s.Activity, status)
+		if s.Attempt > 1 {
+			line += fmt.Sprintf(" (attempt %d)", s.Attempt)
+		}
+		if s.Flagged {
+			line += fmt.Sprintf("  <== output status=%s", s.OutputStatus)
+		}
+		fmt.Fprintln(w, line)
+	}
+	if ran == 0 {
+		fmt.Fprintln(w, "      |")
+		fmt.Fprintln(w, "      (no activities recorded)")
+	}
+
+	skipped := 0
+	for _, s := range flow.Steps {
+		if !s.NeverRan {
+			continue
+		}
+		if skipped == 0 {
+			fmt.Fprintln(w, "      |")
+		}
+		skipped++
+		fmt.Fprintf(w, "      XXX [  -] %-*s  NEVER SCHEDULED\n", width, s.Activity)
+	}
+
+	fmt.Fprintln(w, "      |")
+	switch {
+	case !flow.HasResult:
+		fmt.Fprintln(w, "    END   (no workflow result recorded)")
+	case flow.ResultOK:
+		fmt.Fprintf(w, "    END   %s\n", flow.Result)
+	default:
+		fmt.Fprintf(w, "    END   %s  <== FAILURE\n", flow.Result)
+	}
+	fmt.Fprintln(w)
+}
+
+// loadFlowStepPayloads attaches each step's collected input/output/status text so the HTML report
+// can show it on hover and copy it on click. Only called when the HTML report is enabled, since
+// activity payloads can be hundreds of KB each.
+func loadFlowStepPayloads(activitiesDir string, steps []TemporalFlowStep, limit int) {
+	read := func(activity, attempt, suffix string) string {
+		name := activity + suffix
+		if attempt != "" {
+			name = activity + "_attempt" + attempt + suffix
+		}
+		b, err := ioutil.ReadFile(filepath.Join(activitiesDir, name))
+		if err != nil {
+			return ""
+		}
+		text := strings.TrimSpace(string(b))
+		if len(text) > limit {
+			text = text[:limit] + fmt.Sprintf("\n\n... [truncated, %d more bytes - see %s]", len(text)-limit, name)
+		}
+		return text
+	}
+	// Files are written either bare or with an _attemptN infix depending on retries.
+	pick := func(activity, attempt, suffix string) string {
+		if v := read(activity, "", suffix); v != "" {
+			return v
+		}
+		return read(activity, attempt, suffix)
+	}
+
+	for i := range steps {
+		s := &steps[i]
+		if s.NeverRan {
+			continue
+		}
+		attempt := strconv.Itoa(s.Attempt)
+		s.Input = pick(s.Activity, attempt, "_input.txt")
+		s.Output = pick(s.Activity, attempt, "_output.txt")
+		s.Detail = pick(s.Activity, attempt, "_status.txt")
+	}
+}
+
+// flowHTMLBlock is one rendered node in the HTML flow diagram.
+type flowHTMLBlock struct {
+	Activity string
+	SID      string
+	Attempt  int
+	Status   string
+	State    string // ok | fail | skip
+	Reason   string
+	Device   string
+	Input    string
+	Output   string
+	Detail   string
+}
+
+type flowHTMLWorkflow struct {
+	ID   string
+	Kind string
+	// OK is the overall verdict (also false for a skipped activity); ResultOK is only about the
+	// workflow's own result payload. Keeping them apart avoids labelling a COMPLETED_SUCCESS
+	// result as a FAILURE.
+	OK        bool
+	ResultOK  bool
+	HasResult bool
+	Result    string
+	RanCount  int
+	SkipCount int
+	Blocks    []flowHTMLBlock
+}
+
+type flowHTMLData struct {
+	Generated       string
+	Source          string
+	Version         string
+	StatusesChecked int
+	FlaggedCount    int
+	MissingCount    int
+	FailedCount     int
+	// The most repeated fault reason, so the header can name one root cause instead of making
+	// the reader diff every block.
+	PrimaryFailure      string
+	PrimaryFailureCount int
+	Workflows           []flowHTMLWorkflow
+}
+
+// buildFlowHTMLData converts the analysis result into the view model used by the HTML template.
+func buildFlowHTMLData(temporal TemporalAnalysisResult, source, version string) flowHTMLData {
+	data := flowHTMLData{
+		Generated:       time.Now().Format("2006-01-02 15:04:05"),
+		Source:          source,
+		Version:         version,
+		StatusesChecked: temporal.StatusesChecked,
+		FlaggedCount:    len(temporal.Issues),
+		MissingCount:    len(temporal.Missing),
+	}
+
+	for _, flow := range temporal.Flows {
+		wf := flowHTMLWorkflow{
+			ID:        flow.WorkflowID,
+			Kind:      workflowKindLabel(flow.WorkflowID),
+			OK:        !flow.HasResult || flow.ResultOK,
+			ResultOK:  !flow.HasResult || flow.ResultOK,
+			HasResult: flow.HasResult,
+			Result:    flow.Result,
+		}
+
+		for _, s := range flow.Steps {
+			if s.NeverRan {
+				continue
+			}
+			block := flowHTMLBlock{
+				Activity: s.Activity,
+				Attempt:  s.Attempt,
+				SID:      strconv.Itoa(s.ScheduledID),
+				Status:   summarizeEventStatus(s.EventStatus),
+				Reason:   s.StatusMessage,
+				Device:   s.DeviceSerial,
+				Input:    s.Input,
+				Output:   s.Output,
+				Detail:   s.Detail,
+			}
+			if s.Flagged {
+				block.State = "fail"
+				block.Status = s.OutputStatus
+			} else if block.Status == "FAILED" || block.Status == "TIMED_OUT" {
+				block.State = "fail"
+			} else {
+				block.State = "ok"
+			}
+			wf.RanCount++
+			wf.Blocks = append(wf.Blocks, block)
+		}
+
+		// Never-scheduled activities carry no scheduled ID, so they sort to the front of Steps.
+		// Append them after the executed chain to match the text report's ordering.
+		for _, s := range flow.Steps {
+			if !s.NeverRan {
+				continue
+			}
+			wf.SkipCount++
+			wf.Blocks = append(wf.Blocks, flowHTMLBlock{
+				Activity: s.Activity,
+				SID:      "-",
+				Status:   "NEVER SCHEDULED",
+				State:    "skip",
+			})
+		}
+
+		// A workflow with a skipped activity is not clean even when every recorded status passed.
+		if wf.SkipCount > 0 {
+			wf.OK = false
+		}
+		if !wf.OK {
+			data.FailedCount++
+		}
+		data.Workflows = append(data.Workflows, wf)
+	}
+	data.PrimaryFailure, data.PrimaryFailureCount = dominantFailure(data.Workflows)
+	return data
+}
+
+// dominantFailure returns the most repeated step fault reason across every workflow.
+func dominantFailure(workflows []flowHTMLWorkflow) (string, int) {
+	counts := map[string]int{}
+	for _, wf := range workflows {
+		for _, b := range wf.Blocks {
+			if reason := strings.TrimSpace(b.Reason); reason != "" {
+				counts[reason]++
+			}
+		}
+	}
+	var best string
+	bestN := 0
+	for reason, n := range counts {
+		// Ties break on text so map iteration order cannot change the header between runs.
+		if n > bestN || (n == bestN && reason < best) {
+			best, bestN = reason, n
+		}
+	}
+	return best, bestN
+}
+
+// workflowKindLabel derives a short badge from the workflow ID prefix.
+func workflowKindLabel(id string) string {
+	switch {
+	case strings.HasPrefix(id, "deploy-site-"):
+		return "deploy-site"
+	case strings.HasPrefix(id, "deploy-device-"):
+		return "deploy-device"
+	case strings.HasPrefix(id, "ztf-onboard-"):
+		return "ztf-onboard"
+	}
+	if idx := strings.Index(id, "-"); idx > 0 {
+		return id[:idx]
+	}
+	return "workflow"
+}
+
+// writeTemporalFlowHTML renders the interactive flow report. Payload text is emitted into hidden
+// elements as ordinary escaped HTML text (never into script literals), so cluster-supplied values
+// cannot break out into markup or JS.
+func writeTemporalFlowHTML(path string, data flowHTMLData) error {
+	tmpl, err := template.New("flow").Parse(temporalFlowHTMLTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse HTML template: %v", err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("failed to create HTML report: %v", err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+	return tmpl.Execute(w, data)
+}
+
+// temporalFlowHTMLTemplate is a fully self-contained report: no external CSS/JS/fonts, so it can
+// be attached to a ticket and opened offline. Payloads are emitted as escaped text inside hidden
+// <pre> nodes and read back via textContent, never interpolated into script source.
+const temporalFlowHTMLTemplate = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temporal Flow Analysis</title>
+<style>
+  :root {
+    --void:#04060b; --deep:#070c14; --panel:#0b131e; --edge:#16283a;
+    --txt:#c6dae6; --dim:#5f7789;
+    --ok:#22e0b1; --fail:#e0566d; --warn:#ffb02e; --beam:#35d6ff;
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--void); color:var(--txt); font:13px/1.55 var(--mono);
+         overflow-x:hidden; -webkit-font-smoothing:antialiased; }
+  .bg { position:fixed; inset:0; z-index:0; pointer-events:none;
+        background-image:linear-gradient(rgba(53,214,255,.05) 1px, transparent 1px),
+                         linear-gradient(90deg, rgba(53,214,255,.05) 1px, transparent 1px);
+        background-size:44px 44px;
+        -webkit-mask-image:radial-gradient(ellipse 90% 60% at 50% 0%, #000 10%, transparent 75%);
+        mask-image:radial-gradient(ellipse 90% 60% at 50% 0%, #000 10%, transparent 75%); }
+  .vignette { position:fixed; inset:0; z-index:0; pointer-events:none;
+        background:radial-gradient(ellipse 120% 80% at 50% -10%, rgba(53,214,255,.07), transparent 60%); }
+  .hud,.cmdbar,.shell,.signature { position:relative; z-index:1; }
+
+  .hud { display:flex; gap:20px; align-items:center; flex-wrap:wrap; justify-content:space-between;
+         padding:18px 26px; border-bottom:1px solid var(--edge);
+         background:linear-gradient(180deg, rgba(53,214,255,.06), transparent); }
+  .brand { display:flex; gap:14px; align-items:center; }
+  .hud h1 { margin:0; font-size:15px; letter-spacing:.28em; font-weight:600; }
+  .sub { margin:5px 0 0; font-size:10px; letter-spacing:.1em; color:var(--dim); overflow-wrap:anywhere; }
+  .sigil { width:38px; height:38px; border-radius:50%; position:relative; flex:0 0 auto;
+           border:1px solid rgba(53,214,255,.35); display:grid; place-items:center; }
+  .sigil::before { content:""; position:absolute; inset:-4px; border-radius:50%;
+           border:1px solid rgba(53,214,255,.14); border-top-color:var(--beam);
+           animation:spin 4s linear infinite; }
+  .sigil i { width:9px; height:9px; border-radius:50%; background:var(--beam);
+           box-shadow:0 0 14px var(--beam); }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  .gauges { display:flex; gap:8px; flex-wrap:wrap; }
+  .g { min-width:98px; padding:8px 13px; border:1px solid var(--edge); border-radius:3px;
+       background:linear-gradient(180deg, rgba(53,214,255,.05), transparent); }
+  .g b { display:block; font-size:23px; line-height:1.1; }
+  .g span { display:block; font-size:9.5px; color:var(--dim); letter-spacing:.16em; margin-top:2px; }
+  .g.bad { border-color:rgba(224,86,109,.32); background:linear-gradient(180deg, rgba(224,86,109,.07), transparent); }
+  .g.bad b { color:var(--fail); text-shadow:0 0 9px rgba(224,86,109,.35); }
+  .g.warn { border-color:rgba(255,176,46,.4); }
+  .g.warn b { color:var(--warn); }
+  .g.good b { color:var(--ok); text-shadow:0 0 16px rgba(34,224,177,.4); }
+
+  .signature { padding:13px 26px; border-bottom:1px solid rgba(224,86,109,.22);
+       background:linear-gradient(90deg, rgba(224,86,109,.08), transparent 70%); }
+  .sigl { font-size:9.5px; letter-spacing:.2em; color:var(--fail); margin-bottom:5px; }
+  .sigt { font-size:12.5px; color:#dcb3ba; overflow-wrap:anywhere; white-space:pre-wrap; }
+
+  .cmdbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+            padding:11px 26px; border-bottom:1px solid var(--edge);
+            background:var(--deep); position:sticky; top:0; z-index:6; }
+  .field { display:flex; align-items:center; gap:7px; border:1px solid var(--edge);
+           border-radius:2px; padding:5px 10px; background:var(--void); }
+  .field:focus-within { border-color:var(--beam); box-shadow:0 0 0 1px rgba(53,214,255,.25); }
+  .pfx { color:var(--beam); }
+  #q { background:transparent; border:0; outline:none; color:var(--txt); font:inherit; min-width:230px; }
+  .btn { background:var(--void); border:1px solid var(--edge); color:var(--txt); font:inherit;
+         font-size:11px; letter-spacing:.1em; padding:6px 13px; border-radius:2px; cursor:pointer; }
+  .btn:hover { border-color:var(--beam); color:var(--beam); }
+  .btn.danger { border-color:rgba(224,86,109,.35); color:var(--fail); }
+  .btn.danger:hover { background:rgba(224,86,109,.09); }
+  .tgl { display:flex; align-items:center; gap:6px; font-size:11px; letter-spacing:.08em;
+         color:var(--dim); cursor:pointer; user-select:none; }
+  .keys { margin-left:auto; font-size:9.5px; letter-spacing:.12em; color:var(--dim); }
+
+  .shell { display:grid; grid-template-columns:304px 1fr; align-items:start; }
+  .roster { position:sticky; top:47px; max-height:calc(100vh - 47px); overflow:auto;
+            padding:14px 12px 40px; border-right:1px solid var(--edge);
+            display:flex; flex-direction:column; gap:7px; }
+  .slot { display:flex; gap:10px; text-align:left; width:100%; padding:10px 11px; cursor:pointer;
+          background:var(--panel); border:1px solid var(--edge); border-radius:3px; color:var(--txt);
+          font:inherit; transition:border-color .15s, background .15s; }
+  .slot:hover { border-color:var(--beam); }
+  .slot.on { border-color:var(--beam); background:linear-gradient(90deg, rgba(53,214,255,.13), var(--panel)); }
+  .led { width:8px; height:8px; border-radius:50%; margin-top:5px; flex:0 0 auto;
+         background:var(--ok); box-shadow:0 0 10px var(--ok); }
+  .slot.bad .led { background:var(--fail); box-shadow:0 0 7px var(--fail);
+         animation:beat 1.6s ease-in-out infinite; }
+  .slotbody { min-width:0; flex:1 1 auto; }
+  .wfref { display:block; font-size:11.5px; overflow-wrap:anywhere; line-height:1.35; }
+  .slotmeta { display:block; font-size:9.5px; letter-spacing:.1em; color:var(--dim); margin-top:3px; }
+  .strip { display:flex; gap:2px; margin-top:7px; }
+  .strip i { height:3px; flex:1 1 auto; border-radius:1px; background:var(--ok); }
+  .strip i.fail { background:var(--fail); }
+  .strip i.skip { background:var(--warn); }
+
+  .stage { padding:0 26px 90px; min-width:0; }
+  /* Pinned under the command bar so a long chain never leaves you guessing whose it is. */
+  .wfbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:16px;
+           position:sticky; top:47px; z-index:4; background:var(--void);
+           padding:16px 0 12px; border-bottom:1px solid var(--edge); }
+  .wfbar h2 { margin:0; font-size:14px; font-weight:600; overflow-wrap:anywhere; flex:1 1 auto; }
+  .verdict { font-size:10px; letter-spacing:.2em; padding:5px 12px; border-radius:2px; }
+  .verdict.ok { color:var(--ok); border:1px solid rgba(34,224,177,.4); }
+  .verdict.bad { color:var(--fail); border:1px solid rgba(224,86,109,.4); background:rgba(224,86,109,.07); }
+  .tag { font-size:9.5px; letter-spacing:.14em; color:var(--dim); border:1px solid var(--edge);
+         padding:3px 9px; border-radius:2px; }
+
+  .chain { padding:4px 0 10px; }
+  .cap { display:inline-flex; align-items:center; padding:5px 14px; border-radius:2px;
+         font-size:10px; letter-spacing:.2em; color:var(--dim);
+         border:1px dashed var(--edge); background:var(--deep); }
+  .cap.ok { color:var(--ok); border-color:rgba(34,224,177,.4); border-style:solid; }
+  .cap.bad { color:var(--fail); border-color:rgba(224,86,109,.4); border-style:solid;
+             background:rgba(224,86,109,.06); }
+  .link { width:1px; height:16px; margin-left:26px;
+          background:linear-gradient(180deg, rgba(53,214,255,.55), rgba(53,214,255,.15)); }
+  .link.dead { background:repeating-linear-gradient(180deg, rgba(224,86,109,.5) 0 3px, transparent 3px 7px); }
+  .cell { display:flex; align-items:center; gap:13px; padding:11px 15px; cursor:pointer;
+          border:1px solid var(--edge); border-radius:3px; background:var(--panel);
+          position:relative; transition:border-color .15s, transform .15s, box-shadow .15s; }
+  .cell::before { content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:var(--dim); }
+  .cell:hover,.cell:focus { outline:none; border-color:var(--beam); transform:translateX(3px);
+          box-shadow:-6px 0 22px rgba(53,214,255,.13); }
+  .cell.ok::before { background:var(--ok); box-shadow:0 0 12px rgba(34,224,177,.6); }
+  .cell.fail::before { background:var(--fail); box-shadow:0 0 9px rgba(224,86,109,.45); }
+  .cell.skip::before { background:var(--warn); }
+  .cell.fail { border-color:rgba(224,86,109,.3);
+               background:linear-gradient(90deg, rgba(224,86,109,.08), var(--panel) 55%); }
+  .cell.skip { border-style:dashed; opacity:.9; }
+  .idx { min-width:30px; text-align:right; font-size:10.5px; color:var(--dim); }
+  .cbody { flex:1 1 auto; display:flex; align-items:center; gap:9px; min-width:0; flex-wrap:wrap; }
+  .nm { font-weight:600; font-size:13.5px; overflow-wrap:anywhere; }
+  .retry { font-size:9.5px; letter-spacing:.12em; color:var(--warn);
+           border:1px solid rgba(255,176,46,.35); border-radius:2px; padding:1px 6px; }
+  .stat { font-size:10px; letter-spacing:.13em; white-space:nowrap; color:var(--dim); }
+  .cell.ok .stat { color:var(--ok); }
+  .cell.fail .stat { color:var(--fail); }
+  .cell.skip .stat { color:var(--warn); }
+  .pulse { position:absolute; right:-1px; top:-1px; bottom:-1px; width:3px; border-radius:0 3px 3px 0; }
+  .cell.fail .pulse { background:var(--fail); animation:beat 1.9s ease-in-out infinite; }
+  @keyframes beat { 0%,100%{opacity:.35} 50%{opacity:.85} }
+
+  .fault { margin:7px 0 0 26px; padding:10px 13px; border-left:2px solid var(--fail);
+           background:linear-gradient(90deg, rgba(224,86,109,.07), transparent);
+           font-size:12px; line-height:1.5; color:#dcb3ba;
+           white-space:pre-wrap; overflow-wrap:anywhere; }
+  .fault .dev { display:inline-block; font-size:9.5px; letter-spacing:.14em; color:var(--warn);
+           border:1px solid rgba(255,176,46,.35); border-radius:2px; padding:1px 7px; margin-bottom:6px; }
+  .fault .msg { display:block; }
+
+  .drawer { position:fixed; top:0; right:0; width:min(680px, 94vw); height:100%; z-index:40;
+            background:linear-gradient(180deg,#060b13,#040709); border-left:1px solid var(--beam);
+            box-shadow:-24px 0 60px rgba(0,0,0,.7); display:flex; flex-direction:column;
+            transform:translateX(100%); transition:transform .22s ease; pointer-events:none; }
+  .drawer.open { transform:translateX(0); pointer-events:auto; }
+  .dhead { display:flex; gap:12px; align-items:flex-start; padding:16px 18px 12px;
+           border-bottom:1px solid var(--edge); }
+  .dhead > div { min-width:0; flex:1 1 auto; }
+  .dtitle { font-size:14px; font-weight:600; overflow-wrap:anywhere; }
+  .dsub { font-size:10px; letter-spacing:.14em; color:var(--dim); margin-top:4px; overflow-wrap:anywhere; }
+  .dtabs { display:flex; gap:6px; padding:11px 18px; border-bottom:1px solid var(--edge); }
+  .tab { background:transparent; border:1px solid var(--edge); color:var(--dim); font:inherit;
+         font-size:10px; letter-spacing:.14em; padding:5px 13px; border-radius:2px; cursor:pointer; }
+  .tab.on { color:var(--beam); border-color:var(--beam); background:rgba(53,214,255,.1); }
+  .dtabs .btn { margin-left:auto; }
+  .dbody { flex:1 1 auto; margin:0; padding:16px 18px 40px; overflow:auto; font-size:11.5px;
+           line-height:1.55; white-space:pre-wrap; overflow-wrap:anywhere; color:#b9d2e0; }
+
+  .tip { position:fixed; z-index:50; max-width:600px; display:none; pointer-events:none;
+         background:#03060a; border:1px solid rgba(53,214,255,.5); border-radius:3px;
+         padding:10px 12px; box-shadow:0 12px 40px rgba(0,0,0,.75); }
+  .tip .tth { font-size:9.5px; letter-spacing:.16em; color:var(--beam); margin-bottom:6px; }
+  .tip pre { margin:0; font-size:11px; max-height:240px; overflow:hidden; white-space:pre-wrap;
+             overflow-wrap:anywhere; color:var(--txt); }
+  .toast { position:fixed; bottom:26px; left:50%; transform:translateX(-50%); z-index:60;
+           display:none; padding:9px 20px; border-radius:2px; font-size:11px; letter-spacing:.12em;
+           background:var(--ok); color:#02120d; font-weight:700; }
+  .void { color:var(--dim); letter-spacing:.16em; font-size:11px; }
+  .vault { display:none; }
+  .hidden { display:none !important; }
+  @media (prefers-reduced-motion: reduce) {
+    *,*::before,*::after { animation:none !important; transition:none !important; }
+  }
+  @media (max-width: 980px) {
+    .shell { grid-template-columns:1fr; }
+    .roster { position:static; max-height:none; border-right:0; border-bottom:1px solid var(--edge); }
+  }
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<div class="vignette"></div>
+
+<header class="hud">
+  <div class="brand">
+    <div class="sigil"><i></i></div>
+    <div>
+      <h1>TEMPORAL FLOW ANALYSIS</h1>
+      <p class="sub">{{.Source}} &nbsp;/&nbsp; {{.Generated}} &nbsp;/&nbsp; LOGCOLLECTOR {{.Version}}</p>
+    </div>
+  </div>
+  <div class="gauges">
+    <div class="g"><b>{{len .Workflows}}</b><span>WORKFLOWS</span></div>
+    <div class="g {{if .FailedCount}}bad{{else}}good{{end}}"><b>{{.FailedCount}}</b><span>FAULTED</span></div>
+    <div class="g"><b>{{.StatusesChecked}}</b><span>CHECKS</span></div>
+    <div class="g {{if .FlaggedCount}}bad{{end}}"><b>{{.FlaggedCount}}</b><span>FLAGGED</span></div>
+    <div class="g {{if .MissingCount}}warn{{end}}"><b>{{.MissingCount}}</b><span>NEVER RAN</span></div>
+  </div>
+</header>
+
+{{if .PrimaryFailure}}
+<section class="signature">
+  <div class="sigl">DOMINANT FAULT SIGNATURE &nbsp;/&nbsp; {{.PrimaryFailureCount}} OCCURRENCE(S)</div>
+  <div class="sigt">{{.PrimaryFailure}}</div>
+</section>
+{{end}}
+
+<div class="cmdbar">
+  <div class="field"><span class="pfx">&gt;</span><input type="search" id="q" placeholder="filter workflow or activity" autocomplete="off"></div>
+  <label class="tgl"><input type="checkbox" id="onlybad"><span>faults only</span></label>
+  <button class="btn danger" type="button" id="jump">jump to fault</button>
+  <span class="keys">/ SEARCH &nbsp; &uarr;&darr; MOVE &nbsp; ENTER INSPECT &nbsp; ESC CLOSE</span>
+</div>
+
+<div class="shell">
+  <nav class="roster" id="roster" aria-label="Workflow roster">
+    {{range $i, $w := .Workflows}}
+    <button class="slot {{if $w.OK}}ok{{else}}bad{{end}}" type="button" data-idx="{{$i}}" data-ok="{{$w.OK}}">
+      <span class="led"></span>
+      <span class="slotbody">
+        <span class="wfref">{{$w.ID}}</span>
+        <span class="slotmeta">{{$w.Kind}} &nbsp;/&nbsp; {{$w.RanCount}} RAN{{if $w.SkipCount}} &nbsp;/&nbsp; {{$w.SkipCount}} SKIPPED{{end}}</span>
+        <span class="strip">{{range $w.Blocks}}<i class="{{.State}}"></i>{{end}}</span>
+      </span>
+    </button>
+    {{end}}
+  </nav>
+
+  <main class="stage" id="stage">
+    {{if not .Workflows}}<p class="void">NO TEMPORAL WORKFLOWS FOUND IN THIS COLLECTION</p>{{end}}
+    {{range $i, $w := .Workflows}}
+    <section class="wf" data-idx="{{$i}}" data-ok="{{$w.OK}}" hidden>
+      <div class="wfbar">
+        <span class="verdict {{if $w.OK}}ok{{else}}bad{{end}}">{{if $w.OK}}NOMINAL{{else}}FAULT{{end}}</span>
+        <h2>{{$w.ID}}</h2>
+        <span class="tag">{{$w.Kind}}</span>
+      </div>
+      <div class="chain">
+        <div class="cap">INITIATE</div>
+        {{range $w.Blocks}}
+        <div class="link"></div>
+        <article class="cell {{.State}}" tabindex="0" data-activity="{{.Activity}}" data-status="{{.Status}}">
+          <span class="idx">{{.SID}}</span>
+          <span class="cbody">
+            <span class="nm">{{.Activity}}</span>
+            {{if gt .Attempt 1}}<span class="retry">RETRY {{.Attempt}}</span>{{end}}
+          </span>
+          <span class="stat">{{.Status}}</span>
+          <span class="pulse"></span>
+        </article>
+        {{if .Reason}}
+        <div class="fault">
+          {{if .Device}}<span class="dev">{{.Device}}</span>{{end}}
+          <span class="msg">{{.Reason}}</span>
+        </div>
+        {{end}}
+        <div class="vault" hidden>
+          <pre data-k="detail">{{.Detail}}</pre>
+          <pre data-k="input">{{.Input}}</pre>
+          <pre data-k="output">{{.Output}}</pre>
+        </div>
+        {{end}}
+        <div class="link {{if not $w.ResultOK}}dead{{end}}"></div>
+        <div class="cap {{if $w.ResultOK}}ok{{else}}bad{{end}}">{{if $w.HasResult}}{{$w.Result}}{{else}}NO WORKFLOW RESULT RECORDED{{end}}</div>
+      </div>
+    </section>
+    {{end}}
+  </main>
+</div>
+
+<aside class="drawer" id="drawer">
+  <div class="dhead">
+    <div>
+      <div class="dtitle" id="dtitle"></div>
+      <div class="dsub" id="dsub"></div>
+    </div>
+    <button class="btn" type="button" id="dclose">close</button>
+  </div>
+  <div class="dtabs">
+    <button class="tab on" type="button" data-k="output">OUTPUT</button>
+    <button class="tab" type="button" data-k="input">INPUT</button>
+    <button class="tab" type="button" data-k="detail">EVENTS</button>
+    <button class="btn" type="button" id="dcopy">copy</button>
+  </div>
+  <pre class="dbody" id="dbody"></pre>
+</aside>
+
+<div class="tip" id="tip"><div class="tth"></div><pre></pre></div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  var stage = document.getElementById("stage");
+  var roster = document.getElementById("roster");
+  var drawer = document.getElementById("drawer");
+  var dtitle = document.getElementById("dtitle");
+  var dsub = document.getElementById("dsub");
+  var dbody = document.getElementById("dbody");
+  var tip = document.getElementById("tip");
+  var tipHead = tip.querySelector(".tth");
+  var tipBody = tip.querySelector("pre");
+  var toast = document.getElementById("toast");
+  var q = document.getElementById("q");
+  var onlybad = document.getElementById("onlybad");
+  var slots = Array.prototype.slice.call(document.querySelectorAll(".slot"));
+  var views = Array.prototype.slice.call(document.querySelectorAll(".wf"));
+  var toastTimer = null;
+  var current = -1;
+  var activeCell = null;
+  var activeKind = "output";
+
+  function flash(msg) {
+    toast.textContent = msg;
+    toast.style.display = "block";
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toast.style.display = "none"; }, 1500);
+  }
+
+  // Each cell is followed by an optional .fault line and then its .vault, so walk forward
+  // instead of assuming a fixed sibling position.
+  function payload(cell, kind) {
+    var el = cell.nextElementSibling;
+    while (el && !el.classList.contains("vault")) {
+      if (el.classList.contains("cell")) { return ""; }
+      el = el.nextElementSibling;
+    }
+    if (!el) { return ""; }
+    var pre = el.querySelector("[data-k=" + kind + "]");
+    return pre ? pre.textContent : "";
+  }
+
+  function best(cell) {
+    return payload(cell, "output") || payload(cell, "input") || payload(cell, "detail");
+  }
+
+  // file:// is a secure context in Chrome/Edge/Firefox, so the async Clipboard API works from a
+  // user gesture. If it is refused, select the visible text instead of shipping a hidden-input shim.
+  function copyText(text) {
+    if (!text) { flash("NOTHING TO COPY"); return; }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(
+        function () { flash("COPIED " + text.length + " CHARS"); },
+        selectBody
+      );
+    } else {
+      selectBody();
+    }
+  }
+
+  function selectBody() {
+    if (!dbody.textContent) { flash("CLIPBOARD BLOCKED"); return; }
+    var sel = window.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(dbody);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    flash("SELECTED - PRESS CTRL+C");
+  }
+
+  // Break the spine after the first fault so the eye lands on where execution stopped being sound.
+  function markDeadLinks(view) {
+    var broken = false;
+    Array.prototype.forEach.call(view.querySelectorAll(".chain > *"), function (el) {
+      if (broken && el.classList.contains("link")) { el.classList.add("dead"); }
+      if (el.classList.contains("cell") &&
+          (el.classList.contains("fail") || el.classList.contains("skip"))) { broken = true; }
+    });
+  }
+
+  function select(idx) {
+    if (idx === current || !views[idx]) { return; }
+    current = idx;
+    views.forEach(function (v, i) { v.hidden = (i !== idx); });
+    slots.forEach(function (s, i) { s.classList.toggle("on", i === idx); });
+    closeDrawer();
+  }
+
+  function setTab(kind) {
+    activeKind = kind;
+    Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
+      t.classList.toggle("on", t.getAttribute("data-k") === kind);
+    });
+    var text = activeCell ? payload(activeCell, kind) : "";
+    dbody.textContent = text || "NOT COLLECTED";
+  }
+
+  function openDrawer(cell) {
+    activeCell = cell;
+    dtitle.textContent = cell.getAttribute("data-activity");
+    dsub.textContent = "SID " + cell.querySelector(".idx").textContent.trim() +
+                       "  /  " + cell.getAttribute("data-status");
+    setTab(activeKind);
+    // The drawer supersedes the preview, and the click's own mouseover would otherwise leave
+    // the tooltip parked on top of it.
+    tip.style.display = "none";
+    drawer.classList.add("open");
+  }
+
+  function closeDrawer() { drawer.classList.remove("open"); }
+
+  roster.addEventListener("click", function (e) {
+    var slot = e.target.closest(".slot");
+    if (slot) { select(+slot.getAttribute("data-idx")); }
+  });
+
+  stage.addEventListener("click", function (e) {
+    var cell = e.target.closest(".cell");
+    if (cell) { openDrawer(cell); }
+  });
+
+  drawer.addEventListener("click", function (e) {
+    var tab = e.target.closest(".tab");
+    if (tab) { setTab(tab.getAttribute("data-k")); return; }
+    if (e.target.closest("#dcopy")) {
+      var text = dbody.textContent === "NOT COLLECTED" ? "" : dbody.textContent;
+      copyText(text);
+      return;
+    }
+    if (e.target.closest("#dclose")) { closeDrawer(); }
+  });
+
+  stage.addEventListener("mouseover", function (e) {
+    var cell = e.target.closest(".cell");
+    if (!cell || drawer.classList.contains("open")) { return; }
+    var text = best(cell);
+    tipHead.textContent = cell.getAttribute("data-activity") + "  /  " + cell.getAttribute("data-status");
+    tipBody.textContent = text ? text.slice(0, 1200) : "NO PAYLOAD COLLECTED FOR THIS ACTIVITY";
+    tip.style.display = "block";
+  });
+
+  stage.addEventListener("mouseout", function (e) {
+    if (e.target.closest(".cell")) { tip.style.display = "none"; }
+  });
+
+  document.addEventListener("mousemove", function (e) {
+    if (tip.style.display !== "block") { return; }
+    var pad = 18;
+    var r = tip.getBoundingClientRect();
+    var x = e.clientX + pad;
+    var y = e.clientY + pad;
+    if (x + r.width > window.innerWidth) { x = e.clientX - r.width - pad; }
+    if (y + r.height > window.innerHeight) { y = window.innerHeight - r.height - pad; }
+    tip.style.left = Math.max(pad, x) + "px";
+    tip.style.top = Math.max(pad, y) + "px";
+  });
+
+  // Precomputed per workflow and deliberately excluding .vault, so typing does not rescan
+  // megabytes of payload text on every keystroke.
+  var haystacks = views.map(function (v) {
+    var parts = [];
+    Array.prototype.forEach.call(v.querySelectorAll(".wfbar, .cell, .fault, .cap"), function (n) {
+      parts.push(n.textContent);
+    });
+    return parts.join(" ").toLowerCase();
+  });
+
+  function applyFilter() {
+    var term = q.value.trim().toLowerCase();
+    var badOnly = onlybad.checked;
+    var firstVisible = -1;
+    slots.forEach(function (s, i) {
+      var isBad = s.getAttribute("data-ok") === "false";
+      var show = (!badOnly || isBad) && (!term || haystacks[i].indexOf(term) >= 0);
+      s.classList.toggle("hidden", !show);
+      if (show && firstVisible < 0) { firstVisible = i; }
+    });
+    if (firstVisible >= 0 && slots[current] && slots[current].classList.contains("hidden")) {
+      select(firstVisible);
+    }
+  }
+
+  q.addEventListener("input", applyFilter);
+  onlybad.addEventListener("change", applyFilter);
+
+  document.getElementById("jump").addEventListener("click", function () {
+    var cell = views[current] ? views[current].querySelector(".cell.fail, .cell.skip") : null;
+    if (!cell) {
+      for (var i = 0; i < views.length; i++) {
+        if (views[i].getAttribute("data-ok") === "false") {
+          select(i);
+          cell = views[i].querySelector(".cell.fail, .cell.skip");
+          break;
+        }
+      }
+    }
+    if (!cell) { flash("NO FAULTS DETECTED"); return; }
+    cell.scrollIntoView({ block: "center", behavior: "smooth" });
+    cell.focus({ preventScroll: true });
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { closeDrawer(); tip.style.display = "none"; return; }
+    if (e.key === "/" && document.activeElement !== q) { e.preventDefault(); q.focus(); return; }
+    if (document.activeElement === q || !views[current]) { return; }
+    var cells = Array.prototype.slice.call(views[current].querySelectorAll(".cell"));
+    var pos = cells.indexOf(document.activeElement);
+    if (e.key === "ArrowDown" || e.key === "j") {
+      e.preventDefault();
+      var next = cells[pos < 0 ? 0 : Math.min(cells.length - 1, pos + 1)];
+      if (next) { next.focus(); next.scrollIntoView({ block: "nearest" }); }
+    } else if (e.key === "ArrowUp" || e.key === "k") {
+      e.preventDefault();
+      var prev = cells[pos < 0 ? 0 : Math.max(0, pos - 1)];
+      if (prev) { prev.focus(); prev.scrollIntoView({ block: "nearest" }); }
+    } else if (e.key === "Enter" && pos >= 0) {
+      e.preventDefault();
+      openDrawer(cells[pos]);
+    }
+  });
+
+  views.forEach(markDeadLinks);
+
+  // Open on the first faulted workflow: the reason the report was generated.
+  var start = 0;
+  for (var i = 0; i < views.length; i++) {
+    if (views[i].getAttribute("data-ok") === "false") { start = i; break; }
+  }
+  select(start);
+})();
+</script>
+</body>
+</html>
+`
+
+// writeTemporalFlowHTMLReport emits the interactive flow report next to the text report. Failure
+// to write it is logged but never fails the run, since the text report already carries the data.
+func writeTemporalFlowHTMLReport(reportPath, source string, temporal TemporalAnalysisResult, taCfg TemporalAnalysisConfig) {
+	if !temporal.Enabled || !taCfg.wantsHTMLReport() || len(temporal.Flows) == 0 {
+		return
+	}
+	htmlPath := strings.TrimSuffix(reportPath, filepath.Ext(reportPath)) + "_temporal_flow.html"
+	data := buildFlowHTMLData(temporal, filepath.Base(source), appVersion)
+	if err := writeTemporalFlowHTML(htmlPath, data); err != nil {
+		logger.Warn("Failed to write Temporal flow HTML report: %v", err)
+		return
+	}
+	logger.Info("Temporal flow HTML report generated: %s", htmlPath)
+}
+
+// TemporalMissingActivity records a configured activity that never appeared in a workflow's
+// event history. A missing activity is not an all-clear — it means nothing was validated.
+type TemporalMissingActivity struct {
+	WorkflowID string
+	Activity   string
+}
+
+// groupMissingByActivity collapses the flat missing list into "activity -> workflows it is
+// missing from", which reads far better than one line per workflow/activity combination.
+func groupMissingByActivity(missing []TemporalMissingActivity) ([]string, map[string][]string) {
+	order := []string{}
+	byActivity := make(map[string][]string)
+	for _, m := range missing {
+		if _, seen := byActivity[m.Activity]; !seen {
+			order = append(order, m.Activity)
+		}
+		byActivity[m.Activity] = append(byActivity[m.Activity], m.WorkflowID)
+	}
+	return order, byActivity
+}
+
+// temporalSuccessStatuses lists activity output "status" values treated as successful.
+// Anything else found in an activity output payload is flagged.
+func defaultTemporalSuccessStatuses() map[string]bool {
+	return map[string]bool{"completed_success": true}
+}
+
+// extractJSONObjects returns every top-level {...} block found in text, tolerating surrounding
+// prose, multiple concatenated objects, and JSON arrays of objects.
+func extractJSONObjects(text string) []string {
+	var objects []string
+	depth, start := 0, -1
+	inString, escaped := false, false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 {
+					objects = append(objects, text[start:i+1])
+					start = -1
+				}
+			}
+		}
+	}
+	return objects
+}
+
+// extractActivityStatusFailures parses an activity output payload and returns one issue per JSON
+// object whose "status" field is not a recognized success value, plus the number of status fields
+// actually inspected. A zero count means the payload carried nothing to validate — which is not
+// the same as a clean result.
+func extractActivityStatusFailures(outputText string, successStatuses map[string]bool) (issues []TemporalActivityIssue, statusesChecked int) {
+	for _, raw := range extractJSONObjects(outputText) {
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			continue
+		}
+		status, isString := obj["status"].(string)
+		if !isString {
+			continue
+		}
+		status = strings.TrimSpace(status)
+		if status == "" {
+			continue
+		}
+		statusesChecked++
+		if successStatuses[strings.ToLower(status)] {
+			continue
+		}
+		issues = append(issues, TemporalActivityIssue{
+			Status:        status,
+			StatusMessage: strings.TrimSpace(asString(obj["status_message"])),
+			DeviceSerial:  asString(obj["device_serial_number"]),
+			DeviceID:      asString(obj["device_id"]),
+		})
+	}
+	return issues, statusesChecked
+}
+
+// jsonStatusField is a status-like key found anywhere in a decoded workflow result payload.
+type jsonStatusField struct {
+	Key   string
+	Value string
+	Owner map[string]interface{}
+}
+
+// collectStatusFields walks a decoded JSON value and returns every status-like key carrying a
+// non-empty string value. Workflow results nest the real verdict under varying names and depths
+// (e.g. "Status" at the top level, or "BatchExec.batch_status"), so a fixed top-level "status"
+// lookup misses them. Map keys are visited in sorted order to keep reporting deterministic.
+func collectStatusFields(v interface{}, out *[]jsonStatusField) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			val := t[k]
+			lk := strings.ToLower(k)
+			if lk == "status" || strings.HasSuffix(lk, "_status") {
+				if s, ok := val.(string); ok {
+					if s = strings.TrimSpace(s); s != "" {
+						*out = append(*out, jsonStatusField{Key: k, Value: s, Owner: t})
+					}
+				}
+			}
+			collectStatusFields(val, out)
+		}
+	case []interface{}:
+		for _, item := range t {
+			collectStatusFields(item, out)
+		}
+	}
+}
+
+// workflowResultStatuses returns every status-like field found in a workflow result payload.
+func workflowResultStatuses(outputText string) []jsonStatusField {
+	var fields []jsonStatusField
+	for _, raw := range extractJSONObjects(outputText) {
+		var obj interface{}
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			continue
+		}
+		collectStatusFields(obj, &fields)
+	}
+	return fields
+}
+
+// extractWorkflowResultFailures validates the workflow-level result payload. Temporal can report
+// a workflow as COMPLETED while the business result inside says otherwise (e.g. batch_status
+// COMPLETED_FAILURE), so this is checked independently of the per-activity outputs.
+func extractWorkflowResultFailures(outputText string, successStatuses map[string]bool) (issues []TemporalActivityIssue, statusesChecked int) {
+	for _, f := range workflowResultStatuses(outputText) {
+		statusesChecked++
+		if successStatuses[strings.ToLower(f.Value)] {
+			continue
+		}
+		issues = append(issues, TemporalActivityIssue{
+			Activity:      fmt.Sprintf("(workflow result: %s)", f.Key),
+			Status:        f.Value,
+			StatusMessage: workflowResultMessage(f.Owner),
+			DeviceSerial:  asString(f.Owner["device_serial_number"]),
+			DeviceID:      asString(f.Owner["device_id"]),
+		})
+	}
+	return issues, statusesChecked
+}
+
+// summarizeWorkflowResult renders a workflow result as "key=value" text plus whether every status
+// in it was successful.
+func summarizeWorkflowResult(outputText string, successStatuses map[string]bool) (string, bool, bool) {
+	fields := workflowResultStatuses(outputText)
+	if len(fields) == 0 {
+		return "", false, false
+	}
+	parts := make([]string, 0, len(fields))
+	allOK := true
+	for _, f := range fields {
+		parts = append(parts, fmt.Sprintf("%s=%s", f.Key, f.Value))
+		if !successStatuses[strings.ToLower(f.Value)] {
+			allOK = false
+		}
+	}
+	return strings.Join(parts, ", "), allOK, true
+}
+
+// workflowResultMessage picks the most useful explanatory text sitting alongside a status field.
+func workflowResultMessage(owner map[string]interface{}) string {
+	for _, key := range []string{"status_message", "statusMessage", "message", "Message", "error", "Error", "reason"} {
+		if msg := strings.TrimSpace(asString(owner[key])); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+// extractWorkflowOutputSection returns the WORKFLOW OUTPUT block of a collected workflow overview
+// file, i.e. the text between that banner and the next one.
+func extractWorkflowOutputSection(content string) (string, bool) {
+	const banner = "  WORKFLOW OUTPUT\n"
+	idx := strings.Index(content, banner)
+	if idx < 0 {
+		return "", false
+	}
+	rest := content[idx+len(banner):]
+	if nl := strings.Index(rest, "\n"); nl >= 0 {
+		rest = rest[nl+1:] // drop the banner's closing ==== rule
+	}
+	if end := strings.Index(rest, "\n===="); end >= 0 {
+		rest = rest[:end]
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// formatTemporalActivityIssue renders a flagged activity as a single console/report line.
+func formatTemporalActivityIssue(issue TemporalActivityIssue) string {
+	line := fmt.Sprintf("workflow=%s | activity=%s | status=%s", issue.WorkflowID, issue.Activity, issue.Status)
+	if issue.DeviceSerial != "" {
+		line += fmt.Sprintf(" | serial=%s", issue.DeviceSerial)
+	}
+	if issue.StatusMessage != "" {
+		line += fmt.Sprintf(" | message=%s", issue.StatusMessage)
+	}
+	return line
 }
 
 // asString normalizes a generic JSON value (string, float64, etc.) to its string form
@@ -4518,6 +5830,96 @@ func truncateText(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// maxDetailedPayloadChars caps each decoded payload rendered into a _detailed.txt history.
+// Full-fidelity payloads are already saved per activity in <Activity>_input.txt/_output.txt,
+// so a single 700KB config blob does not need to be inlined here as well.
+const maxDetailedPayloadChars = 4000
+
+// decodeDetailedHistoryPayloads rewrites `temporal workflow show --detailed` output so the
+// base64/zlib "payloads[N].data" blobs read as JSON. Unrecognized lines pass through unchanged.
+func decodeDetailedHistoryPayloads(text string) string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		clean := strings.TrimRight(line, "\r")
+		indent := clean[:len(clean)-len(strings.TrimLeft(clean, " \t"))]
+
+		// Temporal's trailing "Results:" block renders the payload as inline JSON
+		// ({"metadata":{"encoding":"..."},"data":"..."}) instead of a dotted key path.
+		if idx := strings.Index(clean, `{"metadata"`); idx >= 0 {
+			if decoded, ok := decodeInlinePayloadJSON(clean[idx:]); ok {
+				out = append(out, strings.TrimRight(clean[:idx], " \t")+" (decoded)")
+				out = append(out, indentLines(renderDecodedPayload(decoded), indent+"    ")...)
+				continue
+			}
+		}
+
+		key, value, found := strings.Cut(clean, ":")
+		trimmedKey := strings.TrimSpace(key)
+		if !found || !strings.Contains(trimmedKey, "payloads[") {
+			out = append(out, line)
+			continue
+		}
+		value = strings.TrimSpace(value)
+
+		switch {
+		case strings.HasSuffix(trimmedKey, ".data") && value != "":
+			out = append(out, indent+trimmedKey+": (decoded)")
+			out = append(out, indentLines(renderDecodedPayload(decodeTemporalPayloadData(value)), indent+"    ")...)
+		case strings.HasSuffix(trimmedKey, ".metadata.encoding") && value != "":
+			// Short mime-type marker such as base64("binary/zlib")
+			if b, err := base64.StdEncoding.DecodeString(value); err == nil && isPrintableASCII(b) {
+				out = append(out, indent+trimmedKey+": "+string(b))
+			} else {
+				out = append(out, line)
+			}
+		default:
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// decodeInlinePayloadJSON decodes a Temporal Payload serialized inline as JSON.
+func decodeInlinePayloadJSON(s string) (string, bool) {
+	var p struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &p); err != nil || p.Data == "" {
+		return "", false
+	}
+	return decodeTemporalPayloadData(p.Data), true
+}
+
+// renderDecodedPayload caps a decoded payload so one large config blob cannot dominate the file.
+func renderDecodedPayload(decoded string) string {
+	if len(decoded) <= maxDetailedPayloadChars {
+		return decoded
+	}
+	return decoded[:maxDetailedPayloadChars] +
+		fmt.Sprintf("\n... [truncated %d chars - full payload in the matching _activities file]",
+			len(decoded)-maxDetailedPayloadChars)
+}
+
+func indentLines(s, indent string) []string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = indent + l
+	}
+	return lines
+}
+
+func isPrintableASCII(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < 0x20 || c > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 // extractWorkflowIDs parses workflow listing output and extracts workflow IDs
@@ -5235,6 +6637,177 @@ func isAgeLessThanDays(age string, days int) bool {
 	return totalHours < thresholdHours
 }
 
+// analyzeTemporalActivities scans collected Temporal files and reports activity outputs and
+// workflow results carrying a non-success status, activities that never ran, how many status
+// values were actually checked (zero means nothing was validated), and each workflow's execution
+// flow.
+func analyzeTemporalActivities(logFiles []string, baseDir string, taCfg TemporalAnalysisConfig) TemporalAnalysisResult {
+	successStatuses := taCfg.successStatusSet()
+	reportMissing := taCfg.shouldReportMissing()
+	result := TemporalAnalysisResult{Enabled: true}
+	flows := map[string]*TemporalWorkflowFlow{}
+	flowFor := func(id string) *TemporalWorkflowFlow {
+		if f, ok := flows[id]; ok {
+			return f
+		}
+		f := &TemporalWorkflowFlow{WorkflowID: id}
+		flows[id] = f
+		return f
+	}
+
+	for _, path := range logFiles {
+		relPath, err := filepath.Rel(baseDir, path)
+		if err != nil {
+			relPath = path
+		}
+		relPath = strings.ReplaceAll(relPath, "\\", "/")
+		isActivityFile := strings.Contains(relPath, "_activities/")
+		// Workflow overview files live beside the _activities dirs; the banner check below is what
+		// actually identifies them, this just avoids reading unrelated pod logs.
+		maybeOverview := strings.HasSuffix(strings.ToLower(relPath), ".txt") && strings.Contains(strings.ToLower(relPath), "temporal")
+		if !isActivityFile && !maybeOverview {
+			continue
+		}
+
+		content, err := ioutil.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		if !isActivityFile {
+			section, isOverview := extractWorkflowOutputSection(string(content))
+			if !isOverview {
+				continue
+			}
+			wfID := strings.TrimSuffix(filepath.Base(relPath), ".txt")
+			resultIssues, checked := extractWorkflowResultFailures(section, successStatuses)
+			result.StatusesChecked += checked
+			for i := range resultIssues {
+				resultIssues[i].WorkflowID = wfID
+				resultIssues[i].Source = relPath
+			}
+			result.Issues = append(result.Issues, resultIssues...)
+
+			f := flowFor(wfID)
+			f.Result, f.ResultOK, f.HasResult = summarizeWorkflowResult(section, successStatuses)
+			continue
+		}
+
+		// summary.txt carries the execution sequence, including NOT_FOUND for activities that
+		// were configured but never appeared in the workflow history.
+		if strings.HasSuffix(relPath, "/summary.txt") {
+			workflowID, _ := parseActivityOutputPath(relPath)
+			steps := parseWorkflowFlowSummary(string(content))
+			if taCfg.wantsHTMLReport() {
+				loadFlowStepPayloads(filepath.Dir(path), steps, taCfg.htmlPayloadLimitBytes())
+			}
+			flowFor(workflowID).Steps = steps
+			if reportMissing {
+				for _, s := range steps {
+					if s.NeverRan {
+						result.Missing = append(result.Missing, TemporalMissingActivity{WorkflowID: workflowID, Activity: s.Activity})
+					}
+				}
+			}
+			continue
+		}
+
+		if !strings.HasSuffix(relPath, "_output.txt") {
+			continue
+		}
+		found, checked := extractActivityStatusFailures(string(content), successStatuses)
+		result.StatusesChecked += checked
+
+		if len(found) == 0 {
+			continue
+		}
+
+		workflowID, activity := parseActivityOutputPath(relPath)
+		for i := range found {
+			found[i].WorkflowID = workflowID
+			found[i].Activity = activity
+			found[i].Source = relPath
+		}
+		result.Issues = append(result.Issues, found...)
+	}
+
+	// summary.txt's FLAGGED marker is written at collection time, so it is absent in older
+	// archives and stale whenever successStatuses changed since collection. Re-apply the flags
+	// this run computed so the flow view can never contradict the issue list above it.
+	applyIssueFlagsToFlows(flows, result.Issues)
+
+	for _, f := range flows {
+		result.Flows = append(result.Flows, *f)
+	}
+	sort.Slice(result.Flows, func(i, j int) bool { return result.Flows[i].WorkflowID < result.Flows[j].WorkflowID })
+	return result
+}
+
+// applyIssueFlagsToFlows marks the flow steps that this analysis run flagged, matching on
+// workflow + activity + attempt.
+func applyIssueFlagsToFlows(flows map[string]*TemporalWorkflowFlow, issues []TemporalActivityIssue) {
+	for _, issue := range issues {
+		// Workflow-level results have no step of their own; they render on the END line.
+		if !strings.Contains(issue.Source, "_activities/") {
+			continue
+		}
+		flow, ok := flows[issue.WorkflowID]
+		if !ok {
+			continue
+		}
+		attempt := attemptFromActivityPath(issue.Source)
+		for i := range flow.Steps {
+			step := &flow.Steps[i]
+			if step.NeverRan || step.Activity != issue.Activity {
+				continue
+			}
+			// An unnumbered path means "only one attempt was collected", so flag every match.
+			if attempt > 0 && step.Attempt != attempt {
+				continue
+			}
+			step.Flagged = true
+			step.OutputStatus = issue.Status
+			if msg := strings.TrimSpace(issue.StatusMessage); msg != "" {
+				step.StatusMessage = msg
+			}
+			if issue.DeviceSerial != "" {
+				step.DeviceSerial = issue.DeviceSerial
+			}
+		}
+	}
+}
+
+// attemptFromActivityPath returns the N in <Activity>_attemptN_output.txt, or 0 when absent.
+func attemptFromActivityPath(relPath string) int {
+	base := relPath[strings.LastIndex(relPath, "/")+1:]
+	base = strings.TrimSuffix(base, "_output.txt")
+	idx := strings.LastIndex(base, "_attempt")
+	if idx < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(base[idx+len("_attempt"):])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// parseActivityOutputPath derives the workflow ID and activity name from a collected activity
+// output path of the form <workflowID>_activities/<Activity>[_attemptN]_output.txt.
+func parseActivityOutputPath(relPath string) (workflowID, activity string) {
+	parts := strings.Split(relPath, "/")
+	activity = strings.TrimSuffix(parts[len(parts)-1], "_output.txt")
+	if idx := strings.LastIndex(activity, "_attempt"); idx > 0 {
+		if _, err := strconv.Atoi(activity[idx+len("_attempt"):]); err == nil {
+			activity = activity[:idx]
+		}
+	}
+	if len(parts) >= 2 {
+		workflowID = strings.TrimSuffix(parts[len(parts)-2], "_activities")
+	}
+	return workflowID, activity
+}
+
 // analyzePodStatus parses kubectl get pods output and identifies problematic pods
 func analyzePodStatus(logFiles []string, extractDir string) []PodStatusIssue {
 	var issues []PodStatusIssue
@@ -5370,6 +6943,7 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 		Patterns []string `yaml:"patterns"`
 		Severity string   `yaml:"severity"`
 	} `yaml:"errorGroups"`
+	TemporalAnalysis TemporalAnalysisConfig `yaml:"temporalAnalysis"`
 }) error {
 	if !logAnalysisConfig.Enabled {
 		logger.Debug("Log analysis is disabled")
@@ -5540,6 +7114,21 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 		logger.Info("No pod status issues detected")
 	}
 
+	// Step 3c: Validate Temporal workflow activity output statuses
+	temporal := TemporalAnalysisResult{Enabled: logAnalysisConfig.TemporalAnalysis.isEnabled()}
+	if temporal.Enabled {
+		temporal = analyzeTemporalActivities(logFiles, extractDir, logAnalysisConfig.TemporalAnalysis)
+		if len(temporal.Issues) > 0 {
+			logger.Warn("Found %d non-success Temporal status value(s)", len(temporal.Issues))
+		}
+		if len(temporal.Missing) > 0 {
+			order, _ := groupMissingByActivity(temporal.Missing)
+			logger.Warn("Expected Temporal activity/activities never ran: %s", strings.Join(order, ", "))
+		}
+	} else {
+		logger.Debug("Temporal activity status validation is disabled")
+	}
+
 	// Step 4: Correlate errors across files
 	correlatedIssues := correlateErrors(allSummaries, globalPatternCounts, patternFileMap)
 
@@ -5572,15 +7161,16 @@ func analyzeDownloadedLogs(archivePath, outputDir string, logAnalysisConfig stru
 	}
 	reportPath := filepath.Join(outputDir, reportFileName)
 	err = generateAnalyticsReport(reportPath, allSummaries, correlatedIssues,
-		globalPatternCounts, logAnalysisConfig, totalMatchesFound, archivePath, correlationIDIssues, podStatusIssues)
+		globalPatternCounts, logAnalysisConfig, totalMatchesFound, archivePath, correlationIDIssues, podStatusIssues, temporal)
 	if err != nil {
 		return fmt.Errorf("failed to generate analytics report: %v", err)
 	}
 
 	logger.Info("Log analytics report generated: %s", reportPath)
+	writeTemporalFlowHTMLReport(reportPath, archivePath, temporal, logAnalysisConfig.TemporalAnalysis)
 
 	// Print a summary to the console
-	printAnalyticsSummary(allSummaries, correlatedIssues, totalMatchesFound)
+	printAnalyticsSummary(allSummaries, correlatedIssues, totalMatchesFound, temporal)
 
 	return nil
 }
@@ -5606,6 +7196,7 @@ func analyzeLocalDirectory(targetPath string, reportOutputDir string, logAnalysi
 		Patterns []string `yaml:"patterns"`
 		Severity string   `yaml:"severity"`
 	} `yaml:"errorGroups"`
+	TemporalAnalysis TemporalAnalysisConfig `yaml:"temporalAnalysis"`
 }) error {
 	logger.Info("%s", strings.Repeat("=", 70))
 	logger.Info("  LOG ANALYZER — Standalone Local Log Analysis")
@@ -5832,6 +7423,21 @@ func analyzeLocalDirectory(targetPath string, reportOutputDir string, logAnalysi
 		logger.Warn("Found %d problematic pod(s) with status issues", len(podStatusIssues))
 	}
 
+	// Temporal workflow activity output status validation
+	temporal := TemporalAnalysisResult{Enabled: logAnalysisConfig.TemporalAnalysis.isEnabled()}
+	if temporal.Enabled {
+		temporal = analyzeTemporalActivities(logFiles, baseDir, logAnalysisConfig.TemporalAnalysis)
+		if len(temporal.Issues) > 0 {
+			logger.Warn("Found %d non-success Temporal status value(s)", len(temporal.Issues))
+		}
+		if len(temporal.Missing) > 0 {
+			order, _ := groupMissingByActivity(temporal.Missing)
+			logger.Warn("Expected Temporal activity/activities never ran: %s", strings.Join(order, ", "))
+		}
+	} else {
+		logger.Debug("Temporal activity status validation is disabled")
+	}
+
 	// Correlate errors across files
 	correlatedIssues := correlateErrors(allSummaries, globalPatternCounts, patternFileMap)
 
@@ -5856,16 +7462,17 @@ func analyzeLocalDirectory(targetPath string, reportOutputDir string, logAnalysi
 
 	reportPath := filepath.Join(reportOutputDir, reportFileName)
 	err = generateAnalyticsReport(reportPath, allSummaries, correlatedIssues,
-		globalPatternCounts, logAnalysisConfig, totalMatchesFound, targetPath, correlationIDIssues, podStatusIssues)
+		globalPatternCounts, logAnalysisConfig, totalMatchesFound, targetPath, correlationIDIssues, podStatusIssues, temporal)
 	if err != nil {
 		return fmt.Errorf("failed to generate analytics report: %v", err)
 	}
 
 	logger.Info("")
 	logger.Info("Log analytics report generated: %s", reportPath)
+	writeTemporalFlowHTMLReport(reportPath, targetPath, temporal, logAnalysisConfig.TemporalAnalysis)
 
 	// Print console summary
-	printAnalyticsSummary(allSummaries, correlatedIssues, totalMatchesFound)
+	printAnalyticsSummary(allSummaries, correlatedIssues, totalMatchesFound, temporal)
 
 	return nil
 }
@@ -6341,7 +7948,8 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 			Patterns []string `yaml:"patterns"`
 			Severity string   `yaml:"severity"`
 		} `yaml:"errorGroups"`
-	}, totalMatches int, archivePath string, correlationIDIssues []CorrelationIDIssue, podStatusIssues []PodStatusIssue) error {
+		TemporalAnalysis TemporalAnalysisConfig `yaml:"temporalAnalysis"`
+	}, totalMatches int, archivePath string, correlationIDIssues []CorrelationIDIssue, podStatusIssues []PodStatusIssue, temporal TemporalAnalysisResult) error {
 
 	file, err := os.Create(reportPath)
 	if err != nil {
@@ -6368,6 +7976,13 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 	fmt.Fprintf(w, "  Total Matches: %d\n", totalMatches)
 	if len(podStatusIssues) > 0 {
 		fmt.Fprintf(w, "  Pod Status Issues: %d problematic pods detected\n", len(podStatusIssues))
+	}
+	if len(temporal.Issues) > 0 {
+		fmt.Fprintf(w, "  Temporal Status Issues: %d non-success status value(s)\n", len(temporal.Issues))
+	}
+	if len(temporal.Missing) > 0 {
+		missingOrder, _ := groupMissingByActivity(temporal.Missing)
+		fmt.Fprintf(w, "  Temporal Activities That Never Ran: %s\n", strings.Join(missingOrder, ", "))
 	}
 	fmt.Fprintln(w, strings.Repeat("=", 80))
 	fmt.Fprintln(w)
@@ -6432,6 +8047,89 @@ func generateAnalyticsReport(reportPath string, summaries []FileAnalysisSummary,
 
 		fmt.Fprintln(w, "  "+strings.Repeat("=", 76))
 		fmt.Fprintln(w)
+	}
+
+	// ---- SECTION 0A: TEMPORAL ANALYSIS ----
+	if temporal.Enabled {
+		fmt.Fprintln(w, strings.Repeat("*", 80))
+		fmt.Fprintln(w, "  SECTION 0A: TEMPORAL ANALYSIS (Activity Output + Workflow Result Status)")
+		fmt.Fprintln(w, strings.Repeat("*", 80))
+		fmt.Fprintln(w)
+
+		if len(temporal.Issues) == 0 {
+			if temporal.StatusesChecked == 0 {
+				fmt.Fprintln(w, "  NOT VALIDATED: no collected activity output contained a status field.")
+				fmt.Fprintln(w, "  This is not an all-clear.")
+			} else {
+				fmt.Fprintf(w, "  All %d checked status value(s) were successful.\n", temporal.StatusesChecked)
+			}
+			fmt.Fprintln(w)
+		} else {
+			fmt.Fprintf(w, "  %d of %d checked status value(s) were non-success:\n", len(temporal.Issues), temporal.StatusesChecked)
+			fmt.Fprintln(w)
+
+			// Group flagged activities by workflow so a failing deployment reads as one block
+			workflowOrder := []string{}
+			byWorkflow := map[string][]TemporalActivityIssue{}
+			for _, issue := range temporal.Issues {
+				if _, seen := byWorkflow[issue.WorkflowID]; !seen {
+					workflowOrder = append(workflowOrder, issue.WorkflowID)
+				}
+				byWorkflow[issue.WorkflowID] = append(byWorkflow[issue.WorkflowID], issue)
+			}
+
+			for _, workflowID := range workflowOrder {
+				fmt.Fprintf(w, "  Workflow: %s\n", workflowID)
+				fmt.Fprintln(w, "  "+strings.Repeat("-", 76))
+				for _, issue := range byWorkflow[workflowID] {
+					fmt.Fprintf(w, "    • Activity: %s | Status: %s\n", issue.Activity, issue.Status)
+					if issue.DeviceSerial != "" || issue.DeviceID != "" {
+						fmt.Fprintf(w, "      Device: serial=%s id=%s\n", issue.DeviceSerial, issue.DeviceID)
+					}
+					if issue.StatusMessage != "" {
+						fmt.Fprintf(w, "      Status Message: %s\n", issue.StatusMessage)
+					}
+					if issue.Source != "" {
+						fmt.Fprintf(w, "      Source: %s\n", issue.Source)
+					}
+				}
+				fmt.Fprintln(w)
+			}
+
+			fmt.Fprintln(w, "  "+strings.Repeat("=", 76))
+			fmt.Fprintln(w)
+		}
+
+		if len(temporal.Missing) > 0 {
+			order, byActivity := groupMissingByActivity(temporal.Missing)
+			fmt.Fprintf(w, "  ACTIVITIES THAT NEVER RAN (%d)\n", len(temporal.Missing))
+			fmt.Fprintln(w, "  These activities were expected to run but never started, so no status was")
+			fmt.Fprintln(w, "  available to validate. This is NOT the same as a successful activity.")
+			fmt.Fprintln(w, "  "+strings.Repeat("-", 76))
+			for _, activity := range order {
+				wfs := byActivity[activity]
+				fmt.Fprintf(w, "    '%s' never ran in %d workflow(s):\n", activity, len(wfs))
+				for i, wf := range wfs {
+					fmt.Fprintf(w, "        %d. %s\n", i+1, wf)
+				}
+				fmt.Fprintln(w)
+			}
+			fmt.Fprintln(w, "  "+strings.Repeat("=", 76))
+			fmt.Fprintln(w)
+		}
+
+		if len(temporal.Flows) > 0 {
+			fmt.Fprintf(w, "  WORKFLOW EXECUTION FLOW (%d workflow(s))\n", len(temporal.Flows))
+			fmt.Fprintln(w, "  Each workflow in execution order, so it is visible where it stopped.")
+			fmt.Fprintln(w, "  Legend:  +-> ran   !-> failed/flagged   XXX never scheduled")
+			fmt.Fprintln(w, "  "+strings.Repeat("-", 76))
+			fmt.Fprintln(w)
+			for _, flow := range temporal.Flows {
+				renderTemporalWorkflowFlow(w, flow)
+			}
+			fmt.Fprintln(w, "  "+strings.Repeat("=", 76))
+			fmt.Fprintln(w)
+		}
 	}
 
 	// ---- SECTION 1: EXECUTIVE SUMMARY ----
@@ -6715,10 +8413,36 @@ func truncateLine(line string, maxLen int) string {
 }
 
 // printAnalyticsSummary outputs a concise summary to the console
-func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []CorrelatedIssue, totalMatches int) {
+func printAnalyticsSummary(summaries []FileAnalysisSummary, correlatedIssues []CorrelatedIssue, totalMatches int, temporal TemporalAnalysisResult) {
 	logger.Info("%s", "="+strings.Repeat("=", 50))
 	logger.Info("  LOG ANALYTICS SUMMARY")
 	logger.Info("%s", "="+strings.Repeat("=", 50))
+
+	if temporal.Enabled {
+		logger.Info("  TEMPORAL ANALYSIS:")
+		switch {
+		case len(temporal.Issues) > 0:
+			logger.Warn("    %d of %d checked status value(s) were non-success:", len(temporal.Issues), temporal.StatusesChecked)
+			for _, issue := range temporal.Issues {
+				logger.Warn("      - %s", formatTemporalActivityIssue(issue))
+			}
+		case temporal.StatusesChecked == 0:
+			logger.Warn("    NOT VALIDATED - no collected activity output contained a status field")
+		default:
+			logger.Info("    All %d checked status value(s) were successful", temporal.StatusesChecked)
+		}
+		if len(temporal.Missing) > 0 {
+			order, byActivity := groupMissingByActivity(temporal.Missing)
+			logger.Warn("    MISSING ACTIVITIES: expected to run, but never started. Their status could NOT be checked.")
+			for _, activity := range order {
+				wfs := byActivity[activity]
+				logger.Warn("      '%s' never ran in %d workflow(s):", activity, len(wfs))
+				for i, wf := range wfs {
+					logger.Warn("          %d. %s", i+1, wf)
+				}
+			}
+		}
+	}
 
 	if totalMatches == 0 {
 		logger.Info("  No issues found - all logs appear clean!")
@@ -10965,6 +12689,7 @@ func main() {
 		fmt.Printf("Warning: Failed to load config file %s: %v\n", *configFile, err)
 		config = &Config{} // Use empty config if loading fails
 	}
+	globalTemporalAnalysisConfig = config.LogCollection.LogAnalysis.TemporalAnalysis
 
 	// If using config mode, read settings from config.yaml
 	if selectedMode == "config" {

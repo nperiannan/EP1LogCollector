@@ -8,23 +8,24 @@
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  ESSENTIALS - Change these values                                       │
 # └─────────────────────────────────────────────────────────────────────────┘
+configVersion: "2.7.0"  # LogCollector release this config was written/tested against (see appVersion in logcollector.go). Informational only - not validated at runtime.
 username: nperiannan  # Enter your corp username (e.g. "nperiannan") ( Mandatory )
 environment: dl2r1                              # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.) ( Mandatory )
 env_login_id: "{username}@extremenetworks.com"  # XIQ login email — auto-resolves ownerID from accountdb (overrides static ownerID)
 ownerID: ""                                     # Tenant/Owner ID — auto-resolved from env_login_id, or set manually if email unavailable
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │  SSH CONNECTION                                                         │
+# │  SSH CONNECTION                                                         │not
 # └─────────────────────────────────────────────────────────────────────────┘
 bastion:
-  host: usnc-awsgtwy-02.extremenetworks.com  # Bastion host ip or hostname
+  host: 134.141.85.210   # Bastion host ip or hostname "usnh-awsgtwy-02.extremenetworks.com" or "usnc-awsgtwy-02.extremenetworks.com"
   port: 22
   keyPath: "C:\\Users\\{username}\\.ssh\\id_ed25519_bastion" # Path to SSH private key for bastion access ( Optional )
   password: ""                              # Leave empty - Auto-uses Windows Credential Manager if empty
 
 aws:
   host: "{environment}-console.qa.xcloudiq.com"
-  keyPath: ~/.ssh/id_ed25519_26Q1  # Path to SSH public key on bastion host for AWS access ( Mandatory )
+  keyPath: ~/.ssh/id_rsa_26Q3  # Path to SSH public key on bastion host for AWS access ( Mandatory )
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  JIRA INTEGRATION - Attach logs to Jira tickets                         │
@@ -123,6 +124,7 @@ logCollection:
       - "\"level\":\"debug\""
       - "error_count=0"
       - "errors=0"
+      - "is_supplemental_cli_only_failure"  # field name always contains "failure"; real status is checked by Temporal Analysis
     maxMatches: 99
     contextLines: 2
     
@@ -177,6 +179,47 @@ logCollection:
           - "too many open files"
           - "resource limit"
         severity: "HIGH"
+
+    # Temporal Analysis - validate workflow activity output statuses
+    # Reads the "status" field from each collected <Activity>_output.txt payload.
+    # Omit this whole block entirely to keep the defaults shown below.
+    temporalAnalysis:
+      enabled: true                    # false = skip validation; the report/console section is omitted
+
+      # Any "status" value NOT in this list is flagged as a failure.
+      # Matching is case-insensitive, so "completed_success" also matches.
+      # Keep this list as small as possible - every value you add here is a
+      # status that will silently PASS instead of being reported.
+      successStatuses:
+        - "COMPLETED_SUCCESS"
+        # Add more only if your environment legitimately returns them, e.g.:
+        # - "COMPLETED"                # bare completion without the _SUCCESS suffix
+        # - "COMPLETED_WITH_WARNINGS"  # treat warnings as acceptable
+        # - "SKIPPED"                  # activity intentionally bypassed
+        # - "NO_CHANGES_REQUIRED"      # no-op deployment
+
+      # Report activities listed in workflowActivitySets (below) that never ran.
+      # Set to false to silence the "ACTIVITIES THAT NEVER RAN" section.
+      reportMissingActivities: true
+
+      # Generate an interactive HTML flow console alongside the text report:
+      #   <report name>_temporal_flow.html
+      # Opens on the first faulted workflow. Left rail lists every workflow with a
+      # status LED and a segment strip; the main stage draws that workflow as a
+      # chain of activity cells (green = ok, red = fault, dashed amber = never
+      # scheduled) with the connecting spine broken after the first fault.
+      #   - the failure reason + device are printed under the failing cell
+      #   - hover a cell        -> payload preview
+      #   - click a cell        -> side drawer with output / input / events + copy
+      #   - "jump to fault"     -> scroll straight to the break
+      #   - / to search, arrows to walk the chain, enter to inspect, esc to close
+      # The file is self-contained (no internet needed) so it can be attached to a ticket.
+      htmlReport: true
+
+      # Per-payload size cap embedded in the HTML, in KB. Activity configs can be
+      # hundreds of KB - raising this makes the HTML much larger and slower to open.
+      # Anything trimmed is still available in full in the _activities/ files.
+      htmlMaxPayloadKB: 64
   
 
   # ┌─── Temporal Workflows - Collect workflow execution data ─────────────┐

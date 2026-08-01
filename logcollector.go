@@ -40,7 +40,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.7.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.7.1"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -12489,7 +12489,7 @@ func main() {
 	modeVersion := flag.Bool("version", false, "Collect only application version information")
 	modeDeviceLogs := flag.Bool("device-logs", false, "Collect only network device logs and diagnostics")
 	modeDatabase := flag.Bool("database", false, "Collect only database query results")
-	modeTemporal := flag.Bool("temporal", false, "Collect only Temporal workflow + schedule data (nothing else). Combine with --all to force collecting ALL activities for every workflow (ignores workflowActivitySets matching); without --all, activities follow workflowActivitySets configured in config.yaml")
+	modeTemporal := flag.Bool("temporal", false, "Collect Temporal workflow + schedule data (nothing else), then run log analysis on it (status validation, flow report, HTML) if logAnalysis.enabled in config.yaml. Combine with --all to force collecting ALL activities for every workflow (ignores workflowActivitySets matching); without --all, activities follow workflowActivitySets configured in config.yaml")
 
 	// Log collection configuration flags
 	logFileName := flag.String("log-name", "", "Name for the log collection (without extension)")
@@ -12523,7 +12523,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --version          Collect only application version information\n")
 		fmt.Fprintf(os.Stderr, "  --device-logs      Collect only network device logs and diagnostics\n")
 		fmt.Fprintf(os.Stderr, "  --database         Collect only database query results\n")
-		fmt.Fprintf(os.Stderr, "  --temporal         Collect only Temporal workflow + schedule data (add --all for ALL activities)\n")
+		fmt.Fprintf(os.Stderr, "  --temporal         Collect only Temporal workflow + schedule data, then analyze it (add --all for ALL activities)\n")
 		fmt.Fprintf(os.Stderr, "  --analyze <path>   Analyze local log files/directory (no SSH required)\n")
 		fmt.Fprintf(os.Stderr, "  --analyze-ai <path> AI-powered root cause analysis (launches GUI)\n")
 		fmt.Fprintf(os.Stderr, "  --gui              Launch web-based GUI control panel\n\n")
@@ -13447,6 +13447,16 @@ func main() {
 			}
 			logger.Info("Temporal data collection completed successfully!")
 			logger.Info("Archive saved to: %s", temporalArchivePath)
+
+			// --temporal only downloads; run the same log analytics pass (Temporal status
+			// validation, flow report, HTML) the main --all/--logs-only flow runs, so a
+			// standalone temporal run doesn't require a separate --analyze pass to get one.
+			if config.LogCollection.LogAnalysis.Enabled && strings.HasSuffix(temporalArchivePath, ".tar.gz") {
+				logger.Info("")
+				if err := analyzeDownloadedLogs(temporalArchivePath, *outputDir, config.LogCollection.LogAnalysis); err != nil {
+					logger.Warn("Log analysis failed for %s: %v", filepath.Base(temporalArchivePath), err)
+				}
+			}
 
 			// Attach to JIRA if requested
 			if *jiraIssueID != "" && temporalArchivePath != "" {

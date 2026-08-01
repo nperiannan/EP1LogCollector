@@ -8,7 +8,7 @@
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  ESSENTIALS - Change these values                                       │
 # └─────────────────────────────────────────────────────────────────────────┘
-configVersion: "2.7.0"  # LogCollector release this config was written/tested against (see appVersion in logcollector.go). Informational only - not validated at runtime.
+configVersion: "2.7.1"  # LogCollector release this config was written/tested against (see appVersion in logcollector.go). Informational only - not validated at runtime.
 username: nperiannan  # Enter your corp username (e.g. "nperiannan") ( Mandatory )
 environment: dl2r1                              # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.) ( Mandatory )
 env_login_id: "{username}@extremenetworks.com"  # XIQ login email — auto-resolves ownerID from accountdb (overrides static ownerID)
@@ -269,15 +269,29 @@ logCollection:
     #   ProvisionConfiguration            # may run multiple times (e.g. provision + rollback + re-provision)
     #   ComputeRollbackRecipe
     #   UpdateDeviceDeploymentStatus
+    #   UpdateDeviceSummaryIntent
     #   UpdateSiteSummariesForBatch
     workflowActivitySets:
+      # Full activity set confirmed via `temporal workflow show` on a real deploy-site batch
+      # workflow (2026-08-01) — was previously missing 8 of these 11, so several failure
+      # points (e.g. ComputeDeviceConfigurationConflict, PrepareDeviceRecipe) were silently
+      # never collected even though the shell script's "all activities" option showed them.
       deploy-site:
+        - ResetDeviceDeploymentSummary
+        - GetDeviceType
+        - BuildFeatureSchemaMap
         - GetConfiguration
+        - ComputeDeviceConfigurationConflict
+        - PersistDeviceConfigurationConflict
+        - PrepareDeviceRecipe
         - ProvisionConfiguration
+        - UpdateDeviceDeploymentStatus
+        - UpdateDeviceSummaryIntent
         - UpdateSiteSummariesForBatch
 
       deploy-device:
         - GetConfiguration
+        - PrepareDeviceRecipe
         - ProvisionConfiguration
         - UpdateDeviceDeploymentStatus
 

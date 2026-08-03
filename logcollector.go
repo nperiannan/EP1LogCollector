@@ -40,7 +40,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.7.1"   // Semantic version (set via -ldflags)
+	appVersion  = "2.8.0"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -2493,13 +2493,91 @@ func getAWSServerTime(awsClient *ssh.Client) (time.Time, error) {
 	return serverTime, nil
 }
 
+// startHeartbeat prints a periodic spinner + elapsed time to the console so a long silent
+// remote operation (e.g. archiving gigabytes of logs) doesn't look like the tool has hung.
+// Call the returned stop func once the operation finishes; it clears the spinner line.
+func startHeartbeat(message string) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		frames := []string{"|", "/", "-", "\\"}
+		ticker := time.NewTicker(700 * time.Millisecond)
+		defer ticker.Stop()
+		start := time.Now()
+		i := 0
+		for {
+			select {
+			case <-done:
+				fmt.Print("\r" + strings.Repeat(" ", len(message)+24) + "\r")
+				return
+			case <-ticker.C:
+				elapsed := time.Since(start).Round(time.Second)
+				fmt.Printf("\r  %s %s (%s elapsed)", frames[i%len(frames)], message, elapsed)
+				i++
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+// runWithHeartbeat runs fn and, only if it hasn't returned within delay, starts a spinner so
+// fast operations stay silent (no flicker) while slow ones visibly show progress instead of
+// leaving the terminal looking stuck. The spinner animation itself is console-only (it would be
+// unreadable noise in a text log file), but crossing the delay threshold IS recorded via
+// logger.Debug (start + total elapsed) so logger_info.txt still shows what ran long and for how
+// long - it just won't contain every intermediate frame.
+func runWithHeartbeat(message string, delay time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- fn() }()
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+	}
+
+	if logger != nil {
+		logger.Debug("Still running after %s: %s", delay.Round(time.Second), message)
+	}
+
+	stop := startHeartbeat(message)
+	err := <-done
+	stop()
+
+	if logger != nil {
+		logger.Debug("Finished after %s: %s", time.Since(start).Round(time.Second), message)
+	}
+	return err
+}
+
+// heartbeatLabel derives a short, single-line description of a remote command for the spinner
+// message, so the user sees roughly what's running instead of a generic "please wait".
+func heartbeatLabel(command string) string {
+	label := strings.Join(strings.Fields(command), " ")
+	const maxLen = 70
+	if len(label) > maxLen {
+		label = label[:maxLen] + "..."
+	}
+	return label
+}
+
 // executeCommandAsRoot executes a command as root user using sudo su -
 func executeCommandAsRoot(session *ssh.Session, command string) error {
 	// Wrap the command to run as root
 	rootCommand := fmt.Sprintf("sudo su - -c '%s'", command)
 	logger.Debug("Executing as root: %s", rootCommand)
 
-	output, err := session.CombinedOutput(rootCommand)
+	// Debounced spinner: silent for fast commands, shows progress once a command runs past
+	// 3s so the terminal never looks stuck during e.g. a large remote tar/archive step.
+	var output []byte
+	err := runWithHeartbeat(heartbeatLabel(command), 3*time.Second, func() error {
+		var cmdErr error
+		output, cmdErr = session.CombinedOutput(rootCommand)
+		return cmdErr
+	})
 	if err != nil {
 		logger.Debug("Root command failed: %s\nOutput: %s", rootCommand, string(output))
 		return fmt.Errorf("root command failed: %v\nOutput: %s", err, string(output))
@@ -4360,11 +4438,41 @@ type TemporalActivityIssue struct {
 // Pointer fields distinguish "absent from YAML" (nil, treated as enabled) from an explicit false,
 // so configs written before this block existed keep working unchanged.
 type TemporalAnalysisConfig struct {
-	Enabled                 *bool    `yaml:"enabled"`
-	SuccessStatuses         []string `yaml:"successStatuses"`
-	ReportMissingActivities *bool    `yaml:"reportMissingActivities"`
-	HTMLReport              *bool    `yaml:"htmlReport"`
-	HTMLMaxPayloadKB        int      `yaml:"htmlMaxPayloadKB"`
+	Enabled                 *bool                  `yaml:"enabled"`
+	SuccessStatuses         []string               `yaml:"successStatuses"`
+	ReportMissingActivities *bool                  `yaml:"reportMissingActivities"`
+	HTMLReport              *bool                  `yaml:"htmlReport"`
+	HTMLAutoOpen            *bool                  `yaml:"htmlAutoOpen"` // Open the generated HTML report in the default browser once it's written
+	HTMLMaxPayloadKB        int                    `yaml:"htmlMaxPayloadKB"`
+	JiraDefectLookup        JiraDefectLookupConfig `yaml:"jiraDefectLookup"` // Search JIRA for existing defects matching a failure's error message
+}
+
+// JiraDefectLookupConfig controls searching JIRA for pre-existing defects matching a failure's
+// error message, so the report can show "known defect XCP-123 (Open)" instead of the reader
+// filing a duplicate. Requires jira.baseUrl/email/apiToken to already be configured. Off by
+// default since it makes live network calls during report generation.
+type JiraDefectLookupConfig struct {
+	Enabled    *bool    `yaml:"enabled"`
+	Projects   []string `yaml:"projects"`   // JIRA project keys to search, e.g. ["XCP", "NVO"]
+	MaxResults int      `yaml:"maxResults"` // Max matching issues to show per error message (default 3)
+}
+
+func (c JiraDefectLookupConfig) isEnabled() bool {
+	return c.Enabled != nil && *c.Enabled
+}
+
+func (c JiraDefectLookupConfig) projectList() []string {
+	if len(c.Projects) == 0 {
+		return []string{"XCP", "NVO"}
+	}
+	return c.Projects
+}
+
+func (c JiraDefectLookupConfig) maxResultsOrDefault() int {
+	if c.MaxResults > 0 {
+		return c.MaxResults
+	}
+	return 3
 }
 
 func (c TemporalAnalysisConfig) isEnabled() bool {
@@ -4377,6 +4485,10 @@ func (c TemporalAnalysisConfig) shouldReportMissing() bool {
 
 func (c TemporalAnalysisConfig) wantsHTMLReport() bool {
 	return c.HTMLReport == nil || *c.HTMLReport
+}
+
+func (c TemporalAnalysisConfig) wantsHTMLAutoOpen() bool {
+	return c.HTMLAutoOpen == nil || *c.HTMLAutoOpen
 }
 
 // htmlPayloadLimitBytes caps how much of each activity payload is embedded in the HTML report.
@@ -4393,6 +4505,11 @@ func (c TemporalAnalysisConfig) htmlPayloadLimitBytes() int {
 // threading it positionally would be far more invasive than this. The zero value falls back to
 // the built-in defaults, so an unset value behaves exactly as before.
 var globalTemporalAnalysisConfig TemporalAnalysisConfig
+
+// globalJiraConfig lets the HTML flow report look up existing JIRA defects without threading
+// jira.baseUrl/email/apiToken through the analysis call chain. Set once from main() after the
+// config loads, same pattern as globalTemporalAnalysisConfig above.
+var globalJiraConfig JiraConfig
 
 // successStatusSet returns the configured success values lowercased, falling back to the strict
 // default of COMPLETED_SUCCESS only.
@@ -4612,6 +4729,210 @@ type flowHTMLBlock struct {
 	Input    string
 	Output   string
 	Detail   string
+	// Existing JIRA defects whose text matches Reason, so the reader knows not to file a
+	// duplicate. DefectsChecked distinguishes "looked, found none" from "lookup not run".
+	Defects        []JiraDefectMatch
+	DefectsChecked bool
+}
+
+// JiraDefectMatch is a candidate pre-existing defect found by searching JIRA for a failure's
+// error message text.
+type JiraDefectMatch struct {
+	Key         string
+	Status      string
+	StatusClass string // open | progress | done - drives the chip colour in the HTML report
+	Summary     string
+	URL         string
+}
+
+// jiraDefectLookupCache memoizes lookups per normalized error message for the lifetime of the
+// process, since the same fault reason commonly repeats across many workflows/steps in one
+// report and each lookup is a live JIRA API call.
+var jiraDefectLookupCache = struct {
+	sync.Mutex
+	m map[string][]JiraDefectMatch
+}{m: make(map[string][]JiraDefectMatch)}
+
+// findExistingJiraDefects searches JIRA (projects from cfg.projectList()) for issues whose text
+// contains the given error message, so the report can flag "known defect" instead of letting the
+// reader file a duplicate. Returns nil (no error) when lookup is disabled, the message is empty,
+// or the search fails - a failed lookup must never break report generation.
+func findExistingJiraDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, errorMessage string) []JiraDefectMatch {
+	if !cfg.isEnabled() {
+		return nil
+	}
+	text := strings.Join(strings.Fields(errorMessage), " ")
+	if text == "" {
+		return nil
+	}
+
+	cacheKey := strings.ToLower(text)
+	jiraDefectLookupCache.Lock()
+	if cached, ok := jiraDefectLookupCache.m[cacheKey]; ok {
+		jiraDefectLookupCache.Unlock()
+		return cached
+	}
+	jiraDefectLookupCache.Unlock()
+
+	matches, err := searchJiraForDefects(jiraConfig, cfg, text)
+	if err != nil {
+		if logger != nil {
+			logger.Debug("JIRA defect lookup skipped: %v", err)
+		}
+		matches = nil // cache the miss too so a persistent failure isn't retried per step
+	}
+
+	jiraDefectLookupCache.Lock()
+	jiraDefectLookupCache.m[cacheKey] = matches
+	jiraDefectLookupCache.Unlock()
+	return matches
+}
+
+// errorPhraseMarkers are common wrapper prefixes ("failed to X: reason: Y: error message: Z")
+// found in this codebase's error strings. The ROOT CAUSE text after the last one present is what
+// actually gets pasted into a Jira ticket - the outer wrapper (action/URL/HTTP status) is specific
+// to this run and won't appear in an existing defect's summary/description.
+var errorPhraseMarkers = []string{"error message:", "message:", "reason:"}
+
+// extractDistinctiveErrorPhrase strips a known wrapper prefix so the JQL search matches the
+// stable root-cause text instead of a one-off "Failed to X: Reason: POST http://..." preamble.
+func extractDistinctiveErrorPhrase(msg string) string {
+	lower := strings.ToLower(msg)
+	for _, marker := range errorPhraseMarkers {
+		if idx := strings.LastIndex(lower, marker); idx >= 0 {
+			return strings.TrimSpace(msg[idx+len(marker):])
+		}
+	}
+	return msg
+}
+
+// sanitizeErrorForJQL collapses whitespace, caps length (a very long literal phrase hurts recall
+// against JIRA's text index more than it helps), and escapes characters that are special inside a
+// double-quoted JQL string literal.
+func sanitizeErrorForJQL(msg string) string {
+	msg = strings.TrimSpace(extractDistinctiveErrorPhrase(msg))
+	const maxLen = 120
+	if len(msg) > maxLen {
+		msg = msg[:maxLen]
+	}
+	msg = strings.ReplaceAll(msg, `\`, `\\`)
+	msg = strings.ReplaceAll(msg, `"`, `\"`)
+	return msg
+}
+
+// jiraStatusClass buckets a JIRA status name into open/progress/done for chip colouring. Falls
+// back to "open" for anything unrecognized so an unresolved-looking defect is never hidden as done.
+func jiraStatusClass(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done", "closed", "resolved", "complete", "completed":
+		return "done"
+	case "in progress", "in review", "in-progress", "reviewing":
+		return "progress"
+	default:
+		return "open"
+	}
+}
+
+// searchJiraForDefects runs a JQL text search across cfg.projectList() for issues matching
+// errorMessage, using the same JIRA credentials as file attachment.
+func searchJiraForDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, errorMessage string) ([]JiraDefectMatch, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(jiraConfig.BaseURL), "/")
+	email := strings.TrimSpace(jiraConfig.Email)
+	if baseURL == "" || email == "" {
+		return nil, fmt.Errorf("JIRA baseUrl/email not configured")
+	}
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		return nil, fmt.Errorf("JIRA baseUrl %q is missing a scheme", baseURL)
+	}
+
+	phrase := sanitizeErrorForJQL(errorMessage)
+	if phrase == "" {
+		return nil, nil
+	}
+
+	apiToken, err := getJIRAApiToken(&jiraConfig, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve JIRA API token: %v", err)
+	}
+	apiToken = strings.TrimSpace(apiToken)
+	if apiToken == "" {
+		return nil, fmt.Errorf("JIRA API token not available")
+	}
+
+	projects := cfg.projectList()
+	// Deliberately no ORDER BY: an explicit sort (e.g. "updated DESC") overrides JIRA's default
+	// text-relevance ranking, which is what actually puts the best phrase match first. Without
+	// it, a recently-touched-but-unrelated issue can outrank the real match within maxResults.
+	jql := fmt.Sprintf(`project in (%s) AND text ~ "%s"`,
+		strings.Join(projects, ", "), phrase)
+
+	// Atlassian removed the legacy GET /rest/api/3/search endpoint (HTTP 410) in favor of
+	// POST /rest/api/3/search/jql, which takes the same JQL but as a JSON body.
+	apiURL := fmt.Sprintf("%s/rest/api/3/search/jql", baseURL)
+	reqBody, err := json.Marshal(struct {
+		JQL        string   `json:"jql"`
+		MaxResults int      `json:"maxResults"`
+		Fields     []string `json:"fields"`
+	}{JQL: jql, MaxResults: cfg.maxResultsOrDefault(), Fields: []string{"summary", "status"}})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", email, apiToken)))
+	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return fmt.Errorf("unexpected redirect to %s (check jira.baseUrl)", req.URL)
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("JIRA search returned %d: %s", resp.StatusCode, extractJiraErrorMessage(body))
+	}
+
+	var parsed struct {
+		Issues []struct {
+			Key    string `json:"key"`
+			Fields struct {
+				Summary string `json:"summary"`
+				Status  struct {
+					Name string `json:"name"`
+				} `json:"status"`
+			} `json:"fields"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse JIRA search response: %v", err)
+	}
+
+	matches := make([]JiraDefectMatch, 0, len(parsed.Issues))
+	for _, iss := range parsed.Issues {
+		matches = append(matches, JiraDefectMatch{
+			Key:         iss.Key,
+			Status:      iss.Fields.Status.Name,
+			StatusClass: jiraStatusClass(iss.Fields.Status.Name),
+			Summary:     iss.Fields.Summary,
+			URL:         fmt.Sprintf("%s/browse/%s", baseURL, iss.Key),
+		})
+	}
+	return matches, nil
 }
 
 type flowHTMLWorkflow struct {
@@ -4645,7 +4966,7 @@ type flowHTMLData struct {
 }
 
 // buildFlowHTMLData converts the analysis result into the view model used by the HTML template.
-func buildFlowHTMLData(temporal TemporalAnalysisResult, source, version string) flowHTMLData {
+func buildFlowHTMLData(temporal TemporalAnalysisResult, source, version string, taCfg TemporalAnalysisConfig) flowHTMLData {
 	data := flowHTMLData{
 		Generated:       time.Now().Format("2006-01-02 15:04:05"),
 		Source:          source,
@@ -4687,6 +5008,10 @@ func buildFlowHTMLData(temporal TemporalAnalysisResult, source, version string) 
 				block.State = "fail"
 			} else {
 				block.State = "ok"
+			}
+			if block.Reason != "" {
+				block.DefectsChecked = taCfg.JiraDefectLookup.isEnabled()
+				block.Defects = findExistingJiraDefects(globalJiraConfig, taCfg.JiraDefectLookup, block.Reason)
 			}
 			wf.RanCount++
 			wf.Blocks = append(wf.Blocks, block)
@@ -4929,6 +5254,19 @@ const temporalFlowHTMLTemplate = `<!DOCTYPE html>
            border:1px solid rgba(255,176,46,.35); border-radius:2px; padding:1px 7px; margin-bottom:6px; }
   .fault .msg { display:block; }
 
+  .defects { margin-top:9px; padding-top:9px; border-top:1px dashed rgba(224,86,109,.3);
+             display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .defects.none { border-top-color:var(--edge); }
+  .defhdr { font-size:9.5px; letter-spacing:.1em; color:var(--dim); white-space:normal; }
+  .defects.none .defhdr { font-style:italic; }
+  .defchip { display:inline-block; font-size:11px; font-weight:600; letter-spacing:.03em;
+             padding:3px 9px; border-radius:11px; text-decoration:none; white-space:nowrap;
+             border:1px solid var(--edge); transition:transform .12s, box-shadow .12s; }
+  .defchip:hover { transform:translateY(-1px); }
+  .defchip.open { color:var(--fail); border-color:rgba(224,86,109,.45); background:rgba(224,86,109,.08); }
+  .defchip.progress { color:var(--warn); border-color:rgba(255,176,46,.45); background:rgba(255,176,46,.08); }
+  .defchip.done { color:var(--ok); border-color:rgba(34,224,177,.45); background:rgba(34,224,177,.08); }
+
   .drawer { position:fixed; top:0; right:0; width:min(680px, 94vw); height:100%; z-index:40;
             background:linear-gradient(180deg,#060b13,#040709); border-left:1px solid var(--beam);
             box-shadow:-24px 0 60px rgba(0,0,0,.7); display:flex; flex-direction:column;
@@ -5043,6 +5381,18 @@ const temporalFlowHTMLTemplate = `<!DOCTYPE html>
         <div class="fault">
           {{if .Device}}<span class="dev">{{.Device}}</span>{{end}}
           <span class="msg">{{.Reason}}</span>
+          {{if .DefectsChecked}}
+          <div class="defects {{if not .Defects}}none{{end}}">
+            {{if .Defects}}
+            <span class="defhdr">KNOWN DEFECT{{if gt (len .Defects) 1}}S{{end}} - DO NOT FILE A DUPLICATE:</span>
+            {{range .Defects}}
+            <a class="defchip {{.StatusClass}}" href="{{.URL}}" target="_blank" rel="noopener noreferrer" title="{{.Summary}}">{{.Key}} &middot; {{.Status}}</a>
+            {{end}}
+            {{else}}
+            <span class="defhdr">No matching defect found in JIRA (XCP/NVO).</span>
+            {{end}}
+          </div>
+          {{end}}
         </div>
         {{end}}
         <div class="vault" hidden>
@@ -5320,12 +5670,20 @@ func writeTemporalFlowHTMLReport(reportPath, source string, temporal TemporalAna
 		return
 	}
 	htmlPath := strings.TrimSuffix(reportPath, filepath.Ext(reportPath)) + "_temporal_flow.html"
-	data := buildFlowHTMLData(temporal, filepath.Base(source), appVersion)
+	data := buildFlowHTMLData(temporal, filepath.Base(source), appVersion, taCfg)
 	if err := writeTemporalFlowHTML(htmlPath, data); err != nil {
 		logger.Warn("Failed to write Temporal flow HTML report: %v", err)
 		return
 	}
 	logger.Info("Temporal flow HTML report generated: %s", htmlPath)
+
+	if taCfg.wantsHTMLAutoOpen() {
+		if absPath, err := filepath.Abs(htmlPath); err == nil {
+			openBrowser(absPath)
+		} else {
+			openBrowser(htmlPath)
+		}
+	}
 }
 
 // TemporalMissingActivity records a configured activity that never appeared in a workflow's
@@ -12690,6 +13048,9 @@ func main() {
 		config = &Config{} // Use empty config if loading fails
 	}
 	globalTemporalAnalysisConfig = config.LogCollection.LogAnalysis.TemporalAnalysis
+	// globalJiraConfig is (re)assigned below, AFTER config.Jira.Email gets its {username}/
+	// {environment} template substitution - assigning it here would capture the literal
+	// unsubstituted placeholder and silently break the Credential Manager token lookup.
 
 	// If using config mode, read settings from config.yaml
 	if selectedMode == "config" {
@@ -12786,6 +13147,7 @@ func main() {
 		config.Jira.Email = strings.ReplaceAll(config.Jira.Email, "{environment}", config.Environment)
 		logger.Debug("JIRA email after template replacement: %s", config.Jira.Email)
 	}
+	globalJiraConfig = config.Jira
 
 	// Apply config defaults if flags weren't explicitly set
 	// We check if the flag values are still at their defaults
@@ -13148,8 +13510,17 @@ func main() {
 		defer bastionClient.Close()
 		logger.Info("Successfully connected to bastion")
 
-		// Save encrypted password if needed
+		// Save the freshly-confirmed-working password wherever it's missing/stale. This is what
+		// makes a re-prompt a ONE-TIME event: Windows Credential Manager is checked BEFORE
+		// config.yaml (see getBastionPassword), so if a stale/wrong password was already sitting
+		// in the keychain, only saving to config.yaml here would never fix that - every future
+		// run would keep pulling the same stale keychain entry and prompting again forever.
 		if passwordNeedsSaving && *password != "" {
+			if err := storeBastionPasswordInKeychain(*username, *bastionHost, *password, logger); err != nil {
+				logger.Debug("Could not refresh Windows Credential Manager entry: %v", err)
+			} else {
+				logger.Info("✓ Password refreshed in Windows Credential Manager for %s@%s", *username, *bastionHost)
+			}
 			if err := saveConfigWithEncryptedPassword(*configFile, config, *password); err != nil {
 				logger.Warn("Failed to save encrypted password: %v", err)
 			} else {

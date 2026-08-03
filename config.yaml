@@ -8,14 +8,14 @@
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  ESSENTIALS - Change these values                                       │
 # └─────────────────────────────────────────────────────────────────────────┘
-configVersion: "2.7.1"  # LogCollector release this config was written/tested against (see appVersion in logcollector.go). Informational only - not validated at runtime.
+configVersion: "2.8.0"  # LogCollector release this config was written/tested against (see appVersion in logcollector.go). Informational only - not validated at runtime.
 username: nperiannan  # Enter your corp username (e.g. "nperiannan") ( Mandatory )
 environment: dl2r1                              # Target environment (e.g. dl2r1, g2r1, ws3r1, etc.) ( Mandatory )
 env_login_id: "{username}@extremenetworks.com"  # XIQ login email — auto-resolves ownerID from accountdb (overrides static ownerID)
 ownerID: ""                                     # Tenant/Owner ID — auto-resolved from env_login_id, or set manually if email unavailable
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │  SSH CONNECTION                                                         │not
+# │  SSH CONNECTION                                                         │
 # └─────────────────────────────────────────────────────────────────────────┘
 bastion:
   host: 134.141.85.210   # Bastion host ip or hostname "usnh-awsgtwy-02.extremenetworks.com" or "usnc-awsgtwy-02.extremenetworks.com"
@@ -216,10 +216,24 @@ logCollection:
       # The file is self-contained (no internet needed) so it can be attached to a ticket.
       htmlReport: true
 
+      # Automatically open the generated HTML report in the default browser once it's written.
+      htmlAutoOpen: true
+
       # Per-payload size cap embedded in the HTML, in KB. Activity configs can be
       # hundreds of KB - raising this makes the HTML much larger and slower to open.
       # Anything trimmed is still available in full in the _activities/ files.
       htmlMaxPayloadKB: 64
+
+      # Search JIRA for an EXISTING defect matching a failure's error message, so the HTML
+      # report can show "known defect XCP-123 (Open)" next to the fault instead of someone
+      # filing a duplicate. Uses the jira.baseUrl/email/apiToken below (JQL text search).
+      # Off by default: it makes a live JIRA API call per unique error message.
+      jiraDefectLookup:
+        enabled: true
+        projects:                       # JIRA project keys to search
+          - "XCP"
+          - "NVO"
+        maxResults: 3                  # Max matching issues shown per error message
   
 
   # ┌─── Temporal Workflows - Collect workflow execution data ─────────────┐

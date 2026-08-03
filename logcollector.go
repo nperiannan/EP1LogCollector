@@ -40,7 +40,7 @@ import (
 
 // Build-time version information injected via -ldflags
 var (
-	appVersion  = "2.8.0"   // Semantic version (set via -ldflags)
+	appVersion  = "2.8.1"   // Semantic version (set via -ldflags)
 	buildNumber = "dev"     // Auto-incrementing build number (set via -ldflags)
 	buildDate   = "unknown" // Build timestamp (set via -ldflags)
 )
@@ -4730,9 +4730,14 @@ type flowHTMLBlock struct {
 	Output   string
 	Detail   string
 	// Existing JIRA defects whose text matches Reason, so the reader knows not to file a
-	// duplicate. DefectsChecked distinguishes "looked, found none" from "lookup not run".
+	// duplicate. DefectsChecked distinguishes "looked, found none" from "lookup not run",
+	// DefectsExact a verified phrase hit from a weaker keyword guess, and DefectQuery records
+	// what was actually searched so a questionable match can be audited from the report itself.
 	Defects        []JiraDefectMatch
 	DefectsChecked bool
+	DefectsExact   bool
+	DefectsFailed  bool
+	DefectQuery    string
 }
 
 // JiraDefectMatch is a candidate pre-existing defect found by searching JIRA for a failure's
@@ -4745,25 +4750,35 @@ type JiraDefectMatch struct {
 	URL         string
 }
 
+// jiraDefectLookupResult is one memoized lookup. Exact means the matches came from the
+// exact-phrase query and can safely be called duplicates; without it they are keyword guesses
+// that a human still has to confirm.
+type jiraDefectLookupResult struct {
+	Matches []JiraDefectMatch
+	Exact   bool
+	Failed  bool
+	Query   string
+}
+
 // jiraDefectLookupCache memoizes lookups per normalized error message for the lifetime of the
 // process, since the same fault reason commonly repeats across many workflows/steps in one
 // report and each lookup is a live JIRA API call.
 var jiraDefectLookupCache = struct {
 	sync.Mutex
-	m map[string][]JiraDefectMatch
-}{m: make(map[string][]JiraDefectMatch)}
+	m map[string]jiraDefectLookupResult
+}{m: make(map[string]jiraDefectLookupResult)}
 
 // findExistingJiraDefects searches JIRA (projects from cfg.projectList()) for issues whose text
-// contains the given error message, so the report can flag "known defect" instead of letting the
-// reader file a duplicate. Returns nil (no error) when lookup is disabled, the message is empty,
+// matches the given error message, so the report can flag "known defect" instead of letting the
+// reader file a duplicate. Returns an empty result when lookup is disabled, the message is empty,
 // or the search fails - a failed lookup must never break report generation.
-func findExistingJiraDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, errorMessage string) []JiraDefectMatch {
+func findExistingJiraDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, errorMessage string) jiraDefectLookupResult {
 	if !cfg.isEnabled() {
-		return nil
+		return jiraDefectLookupResult{}
 	}
 	text := strings.Join(strings.Fields(errorMessage), " ")
 	if text == "" {
-		return nil
+		return jiraDefectLookupResult{}
 	}
 
 	cacheKey := strings.ToLower(text)
@@ -4774,18 +4789,20 @@ func findExistingJiraDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, 
 	}
 	jiraDefectLookupCache.Unlock()
 
-	matches, err := searchJiraForDefects(jiraConfig, cfg, text)
+	result, err := searchJiraForDefects(jiraConfig, cfg, text)
 	if err != nil {
 		if logger != nil {
 			logger.Debug("JIRA defect lookup skipped: %v", err)
 		}
-		matches = nil // cache the miss too so a persistent failure isn't retried per step
+		// Cache the failure too so a persistent error isn't retried per step, but keep it
+		// distinguishable from a genuine "no defect exists" answer.
+		result = jiraDefectLookupResult{Failed: true, Query: result.Query}
 	}
 
 	jiraDefectLookupCache.Lock()
-	jiraDefectLookupCache.m[cacheKey] = matches
+	jiraDefectLookupCache.m[cacheKey] = result
 	jiraDefectLookupCache.Unlock()
-	return matches
+	return result
 }
 
 // errorPhraseMarkers are common wrapper prefixes ("failed to X: reason: Y: error message: Z")
@@ -4806,18 +4823,121 @@ func extractDistinctiveErrorPhrase(msg string) string {
 	return msg
 }
 
-// sanitizeErrorForJQL collapses whitespace, caps length (a very long literal phrase hurts recall
-// against JIRA's text index more than it helps), and escapes characters that are special inside a
-// double-quoted JQL string literal.
-func sanitizeErrorForJQL(msg string) string {
-	msg = strings.TrimSpace(extractDistinctiveErrorPhrase(msg))
+// luceneSpecialReplacer blanks the characters that break or distort JIRA's Lucene text query.
+// Every one of them is also a tokenizer separator, so removing them cannot change which issues
+// match - it only keeps the query parseable and removes the need to escape anything.
+var luceneSpecialReplacer = strings.NewReplacer(
+	`\`, " ", `"`, " ", `'`, " ", `+`, " ", `-`, " ", `&`, " ", `|`, " ", `!`, " ",
+	`(`, " ", `)`, " ", `{`, " ", `}`, " ", `[`, " ", `]`, " ", `^`, " ", `~`, " ",
+	`*`, " ", `?`, " ", `:`, " ", `/`, " ",
+)
+
+// jiraSearchPhrase reduces a raw error string to the word sequence used for both JIRA queries:
+// the root-cause tail, stripped of query-syntax characters, and capped at a whole word (a very
+// long literal hurts recall, and a truncated half-word can never phrase-match).
+func jiraSearchPhrase(msg string) string {
+	msg = luceneSpecialReplacer.Replace(extractDistinctiveErrorPhrase(msg))
+	msg = strings.Join(strings.Fields(msg), " ")
 	const maxLen = 120
 	if len(msg) > maxLen {
 		msg = msg[:maxLen]
+		if cut := strings.LastIndex(msg, " "); cut > 0 {
+			msg = msg[:cut]
+		}
 	}
-	msg = strings.ReplaceAll(msg, `\`, `\\`)
-	msg = strings.ReplaceAll(msg, `"`, `\"`)
-	return msg
+	return strings.TrimSpace(msg)
+}
+
+// errorStopWords are words that appear in almost any sentence and so must not count toward the
+// keyword-overlap score. Deliberately limited to grammatical filler: pruning domain words like
+// "already"/"exists" would leave only the nouns, and any issue mentioning the same component
+// would then look like a match.
+var errorStopWords = map[string]bool{
+	"the": true, "an": true, "and": true, "or": true, "of": true, "to": true, "in": true,
+	"on": true, "at": true, "for": true, "is": true, "are": true, "was": true, "were": true,
+	"be": true, "been": true, "it": true, "its": true, "this": true, "that": true,
+	"with": true, "from": true, "by": true, "as": true, "not": true, "no": true,
+	"if": true, "then": true, "there": true,
+}
+
+// errorTokens lowercases and splits text into alphanumeric words, dropping single characters.
+func errorTokens(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	})
+}
+
+// distinctiveErrorTokens is the deduplicated, stop-word-free vocabulary of an error phrase - the
+// set a candidate issue is scored against.
+func distinctiveErrorTokens(phrase string) []string {
+	seen := make(map[string]bool)
+	tokens := make([]string, 0, 8)
+	for _, t := range errorTokens(phrase) {
+		if len(t) < 2 || errorStopWords[t] || seen[t] {
+			continue
+		}
+		seen[t] = true
+		tokens = append(tokens, t)
+	}
+	return tokens
+}
+
+// keywordOverlap is the share of an error's distinctive words present in a candidate issue's
+// own text. Whole-word comparison, so "server" cannot be satisfied by "serverless".
+func keywordOverlap(keywords []string, text string) float64 {
+	if len(keywords) == 0 {
+		return 0
+	}
+	have := make(map[string]bool)
+	for _, t := range errorTokens(text) {
+		have[t] = true
+	}
+	hits := 0
+	for _, k := range keywords {
+		if have[k] {
+			hits++
+		}
+	}
+	return float64(hits) / float64(len(keywords))
+}
+
+// adfPlainText flattens a JIRA description into searchable text. Cloud's v3 API returns rich
+// text as an Atlassian Document Format node tree rather than a string, so the description has to
+// be walked - and it has to be searched, because the root-cause text of a defect is far more
+// often in the description than in the summary.
+func adfPlainText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var plain string
+	if err := json.Unmarshal(raw, &plain); err == nil {
+		return plain
+	}
+	var doc interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	var walk func(node interface{}, depth int)
+	walk = func(node interface{}, depth int) {
+		if depth > 32 {
+			return
+		}
+		switch v := node.(type) {
+		case map[string]interface{}:
+			if text, ok := v["text"].(string); ok {
+				sb.WriteString(text)
+				sb.WriteByte(' ')
+			}
+			walk(v["content"], depth+1)
+		case []interface{}:
+			for _, item := range v {
+				walk(item, depth+1)
+			}
+		}
+	}
+	walk(doc, 0)
+	return sb.String()
 }
 
 // jiraStatusClass buckets a JIRA status name into open/progress/done for chip colouring. Falls
@@ -4833,39 +4953,104 @@ func jiraStatusClass(status string) string {
 	}
 }
 
-// searchJiraForDefects runs a JQL text search across cfg.projectList() for issues matching
-// errorMessage, using the same JIRA credentials as file attachment.
-func searchJiraForDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, errorMessage string) ([]JiraDefectMatch, error) {
+// minKeywordOverlap is the share of an error's distinctive words a candidate must contain before
+// a fallback (non-phrase) match is worth showing. JIRA's text search returns relevance-ranked
+// results with no notion of "good enough", so without a floor it happily returns the three
+// least-bad issues in the project for an error that has no existing defect at all.
+const minKeywordOverlap = 0.6
+
+// jiraIssueCandidate pairs a search hit with the text it is verified against.
+type jiraIssueCandidate struct {
+	Match      JiraDefectMatch
+	SearchText string // summary + description, the fields a root cause is actually written into
+}
+
+// searchJiraForDefects looks for a pre-existing defect matching errorMessage in two tiers: an
+// exact-phrase query, whose hits JIRA has already proven contain the phrase, and - only if that
+// finds nothing - a keyword query whose hits are re-verified here against each issue's own
+// summary and description before being shown.
+func searchJiraForDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, errorMessage string) (jiraDefectLookupResult, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(jiraConfig.BaseURL), "/")
 	email := strings.TrimSpace(jiraConfig.Email)
 	if baseURL == "" || email == "" {
-		return nil, fmt.Errorf("JIRA baseUrl/email not configured")
+		return jiraDefectLookupResult{}, fmt.Errorf("JIRA baseUrl/email not configured")
 	}
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-		return nil, fmt.Errorf("JIRA baseUrl %q is missing a scheme", baseURL)
+		return jiraDefectLookupResult{}, fmt.Errorf("JIRA baseUrl %q is missing a scheme", baseURL)
 	}
 
-	phrase := sanitizeErrorForJQL(errorMessage)
+	phrase := jiraSearchPhrase(errorMessage)
 	if phrase == "" {
-		return nil, nil
+		return jiraDefectLookupResult{}, nil
 	}
 
 	apiToken, err := getJIRAApiToken(&jiraConfig, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve JIRA API token: %v", err)
+		return jiraDefectLookupResult{}, fmt.Errorf("failed to retrieve JIRA API token: %v", err)
 	}
 	apiToken = strings.TrimSpace(apiToken)
 	if apiToken == "" {
-		return nil, fmt.Errorf("JIRA API token not available")
+		return jiraDefectLookupResult{}, fmt.Errorf("JIRA API token not available")
 	}
 
-	projects := cfg.projectList()
-	// Deliberately no ORDER BY: an explicit sort (e.g. "updated DESC") overrides JIRA's default
-	// text-relevance ranking, which is what actually puts the best phrase match first. Without
-	// it, a recently-touched-but-unrelated issue can outrank the real match within maxResults.
-	jql := fmt.Sprintf(`project in (%s) AND text ~ "%s"`,
-		strings.Join(projects, ", "), phrase)
+	projects := strings.Join(cfg.projectList(), ", ")
+	limit := cfg.maxResultsOrDefault()
+	// Recorded verbatim in the report so a reader can judge a match without reading this code.
+	query := fmt.Sprintf("%s for phrase %q", projects, phrase)
 
+	// Tier 1: exact phrase (nested quotes are JQL's phrase syntax). JIRA matches it server-side
+	// across summary, description AND comments, so a hit here needs no further verification -
+	// which is also how a defect that only mentions the error in a comment still gets found.
+	// Deliberately no ORDER BY: an explicit sort overrides the text-relevance ranking that puts
+	// the best match first.
+	exactJQL := fmt.Sprintf(`project in (%s) AND text ~ "\"%s\""`, projects, phrase)
+	exactHits, err := jiraJQLSearch(baseURL, email, apiToken, exactJQL, limit)
+	if err != nil {
+		// A rejected phrase query must not cost us the fallback.
+		if logger != nil {
+			logger.Debug("JIRA exact-phrase defect search failed, falling back to keywords: %v", err)
+		}
+	} else if len(exactHits) > 0 {
+		return jiraDefectLookupResult{Matches: candidateMatches(exactHits, limit), Exact: true, Query: query}, nil
+	}
+
+	// Tier 2: keyword match. Anything below two distinctive words is too generic to attribute to
+	// a specific defect, so no guess is better than a wrong one.
+	keywords := distinctiveErrorTokens(phrase)
+	if len(keywords) < 2 {
+		return jiraDefectLookupResult{Query: query}, nil
+	}
+	overFetch := limit * 4
+	if overFetch > 20 {
+		overFetch = 20
+	}
+	looseJQL := fmt.Sprintf(`project in (%s) AND text ~ "%s"`, projects, phrase)
+	looseHits, err := jiraJQLSearch(baseURL, email, apiToken, looseJQL, overFetch)
+	if err != nil {
+		return jiraDefectLookupResult{Query: query}, err
+	}
+	verified := make([]jiraIssueCandidate, 0, len(looseHits))
+	for _, hit := range looseHits {
+		if keywordOverlap(keywords, hit.SearchText) >= minKeywordOverlap {
+			verified = append(verified, hit)
+		}
+	}
+	return jiraDefectLookupResult{Matches: candidateMatches(verified, limit), Query: query}, nil
+}
+
+func candidateMatches(candidates []jiraIssueCandidate, limit int) []JiraDefectMatch {
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	matches := make([]JiraDefectMatch, 0, len(candidates))
+	for _, c := range candidates {
+		matches = append(matches, c.Match)
+	}
+	return matches
+}
+
+// jiraJQLSearch runs one JQL search using the same JIRA credentials as file attachment.
+func jiraJQLSearch(baseURL, email, apiToken, jql string, maxResults int) ([]jiraIssueCandidate, error) {
 	// Atlassian removed the legacy GET /rest/api/3/search endpoint (HTTP 410) in favor of
 	// POST /rest/api/3/search/jql, which takes the same JQL but as a JSON body.
 	apiURL := fmt.Sprintf("%s/rest/api/3/search/jql", baseURL)
@@ -4873,7 +5058,7 @@ func searchJiraForDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, err
 		JQL        string   `json:"jql"`
 		MaxResults int      `json:"maxResults"`
 		Fields     []string `json:"fields"`
-	}{JQL: jql, MaxResults: cfg.maxResultsOrDefault(), Fields: []string{"summary", "status"}})
+	}{JQL: jql, MaxResults: maxResults, Fields: []string{"summary", "status", "description"}})
 	if err != nil {
 		return nil, err
 	}
@@ -4911,8 +5096,9 @@ func searchJiraForDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, err
 		Issues []struct {
 			Key    string `json:"key"`
 			Fields struct {
-				Summary string `json:"summary"`
-				Status  struct {
+				Summary     string          `json:"summary"`
+				Description json.RawMessage `json:"description"`
+				Status      struct {
 					Name string `json:"name"`
 				} `json:"status"`
 			} `json:"fields"`
@@ -4922,17 +5108,20 @@ func searchJiraForDefects(jiraConfig JiraConfig, cfg JiraDefectLookupConfig, err
 		return nil, fmt.Errorf("failed to parse JIRA search response: %v", err)
 	}
 
-	matches := make([]JiraDefectMatch, 0, len(parsed.Issues))
+	candidates := make([]jiraIssueCandidate, 0, len(parsed.Issues))
 	for _, iss := range parsed.Issues {
-		matches = append(matches, JiraDefectMatch{
-			Key:         iss.Key,
-			Status:      iss.Fields.Status.Name,
-			StatusClass: jiraStatusClass(iss.Fields.Status.Name),
-			Summary:     iss.Fields.Summary,
-			URL:         fmt.Sprintf("%s/browse/%s", baseURL, iss.Key),
+		candidates = append(candidates, jiraIssueCandidate{
+			Match: JiraDefectMatch{
+				Key:         iss.Key,
+				Status:      iss.Fields.Status.Name,
+				StatusClass: jiraStatusClass(iss.Fields.Status.Name),
+				Summary:     iss.Fields.Summary,
+				URL:         fmt.Sprintf("%s/browse/%s", baseURL, iss.Key),
+			},
+			SearchText: iss.Fields.Summary + " " + adfPlainText(iss.Fields.Description),
 		})
 	}
-	return matches, nil
+	return candidates, nil
 }
 
 type flowHTMLWorkflow struct {
@@ -5011,7 +5200,11 @@ func buildFlowHTMLData(temporal TemporalAnalysisResult, source, version string, 
 			}
 			if block.Reason != "" {
 				block.DefectsChecked = taCfg.JiraDefectLookup.isEnabled()
-				block.Defects = findExistingJiraDefects(globalJiraConfig, taCfg.JiraDefectLookup, block.Reason)
+				lookup := findExistingJiraDefects(globalJiraConfig, taCfg.JiraDefectLookup, block.Reason)
+				block.Defects = lookup.Matches
+				block.DefectsExact = lookup.Exact
+				block.DefectsFailed = lookup.Failed
+				block.DefectQuery = lookup.Query
 			}
 			wf.RanCount++
 			wf.Blocks = append(wf.Blocks, block)
@@ -5257,8 +5450,12 @@ const temporalFlowHTMLTemplate = `<!DOCTYPE html>
   .defects { margin-top:9px; padding-top:9px; border-top:1px dashed rgba(224,86,109,.3);
              display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
   .defects.none { border-top-color:var(--edge); }
+  .defects.weak { border-top-color:rgba(255,176,46,.35); }
   .defhdr { font-size:9.5px; letter-spacing:.1em; color:var(--dim); white-space:normal; }
   .defects.none .defhdr { font-style:italic; }
+  .defects.weak .defhdr { color:var(--warn); }
+  .defq { flex-basis:100%; font-size:9.5px; letter-spacing:.04em; color:var(--dim); opacity:.7;
+          white-space:normal; overflow-wrap:anywhere; }
   .defchip { display:inline-block; font-size:11px; font-weight:600; letter-spacing:.03em;
              padding:3px 9px; border-radius:11px; text-decoration:none; white-space:nowrap;
              border:1px solid var(--edge); transition:transform .12s, box-shadow .12s; }
@@ -5382,15 +5579,22 @@ const temporalFlowHTMLTemplate = `<!DOCTYPE html>
           {{if .Device}}<span class="dev">{{.Device}}</span>{{end}}
           <span class="msg">{{.Reason}}</span>
           {{if .DefectsChecked}}
-          <div class="defects {{if not .Defects}}none{{end}}">
-            {{if .Defects}}
-            <span class="defhdr">KNOWN DEFECT{{if gt (len .Defects) 1}}S{{end}} - DO NOT FILE A DUPLICATE:</span>
-            {{range .Defects}}
-            <a class="defchip {{.StatusClass}}" href="{{.URL}}" target="_blank" rel="noopener noreferrer" title="{{.Summary}}">{{.Key}} &middot; {{.Status}}</a>
-            {{end}}
+          <div class="defects{{if not .Defects}} none{{end}}{{if and .Defects (not .DefectsExact)}} weak{{end}}">
+            {{if .DefectsFailed}}
+            <span class="defhdr">JIRA defect lookup failed - see the collector log.</span>
+            {{else if .Defects}}
+              {{if .DefectsExact}}
+              <span class="defhdr">KNOWN DEFECT{{if gt (len .Defects) 1}}S{{end}} - DO NOT FILE A DUPLICATE:</span>
+              {{else}}
+              <span class="defhdr">POSSIBLY RELATED - CONFIRM BEFORE TREATING AS A DUPLICATE:</span>
+              {{end}}
+              {{range .Defects}}
+              <a class="defchip {{.StatusClass}}" href="{{.URL}}" target="_blank" rel="noopener noreferrer" title="{{.Summary}}">{{.Key}} &middot; {{.Status}}</a>
+              {{end}}
             {{else}}
-            <span class="defhdr">No matching defect found in JIRA (XCP/NVO).</span>
+            <span class="defhdr">No matching defect found in JIRA.</span>
             {{end}}
+            {{if .DefectQuery}}<span class="defq">searched {{.DefectQuery}}</span>{{end}}
           </div>
           {{end}}
         </div>
